@@ -35,3 +35,7 @@ dist/
 
 # clangd index
 .cache/
+
+# benchmark datasets and outputs
+benchmarks/data/
+benchmarks/results/

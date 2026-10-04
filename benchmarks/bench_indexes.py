@@ -1,0 +1,171 @@
+"""Recall vs QPS benchmark for FlatIndex, IVFIndex and IVFIndex+PQ on SIFT.
+
+Run from the repo root after a Release build:
+    PYTHONPATH=build python3 benchmarks/bench_indexes.py                  # siftsmall
+    PYTHONPATH=build python3 benchmarks/bench_indexes.py --dataset sift   # SIFT1M
+
+Datasets go in benchmarks/data/<name>/ (see ftp://ftp.irisa.fr/local/texmex/corpus/).
+Everything is single-threaded.
+"""
+
+import argparse
+import csv
+import math
+import time
+from pathlib import Path
+
+import numpy as np
+
+import vecengine as ve
+
+BENCH_DIR = Path(__file__).parent
+DATA_DIR = BENCH_DIR / "data"
+RESULTS_DIR = BENCH_DIR / "results"
+K = 10
+NPROBES = [1, 2, 4, 8, 16, 32, 64, 128]
+PQ_SUBSPACES = [8, 16, 32]
+REFINE_K_FACTORS = [4, 16]  # re-rank k * k_factor ADC candidates with exact distances
+
+
+def read_vecs(path: Path, dtype) -> np.ndarray:
+    # .fvecs/.ivecs: each row is an int32 dim followed by dim 4-byte values.
+    raw = np.fromfile(path, dtype=np.int32)
+    dim = raw[0]
+    return np.ascontiguousarray(raw.reshape(-1, dim + 1)[:, 1:].view(dtype))
+
+
+def load_dataset(name: str):
+    d = DATA_DIR / name
+    base = read_vecs(d / f"{name}_base.fvecs", np.float32)
+    learn = read_vecs(d / f"{name}_learn.fvecs", np.float32)
+    queries = read_vecs(d / f"{name}_query.fvecs", np.float32)
+    gt = read_vecs(d / f"{name}_groundtruth.ivecs", np.int32)
+    return base, learn, queries, gt
+
+
+def recall_at_k(ids_per_query, gt: np.ndarray, k: int) -> float:
+    hits = sum(len(set(ids[:k]) & set(gt[i, :k].tolist())) for i, ids in enumerate(ids_per_query))
+    return hits / (len(ids_per_query) * k)
+
+
+def time_queries(index, queries: np.ndarray, k: int):
+    index.batch_query(queries[: min(10, len(queries))], k)  # warm-up
+    start = time.perf_counter()
+    results = index.batch_query(queries, k)
+    elapsed = time.perf_counter() - start
+    return [ids for ids, _ in results], len(queries) / elapsed
+
+
+def build_ivf(dim, nlist, base, learn, pq_m=None):
+    # With PQ, vectors are added through a RefineIndex so one build serves both
+    # the plain PQ rows (query idx) and the re-ranked rows (query refine).
+    idx = ve.IVFIndex(dim, nlist)
+    if pq_m is not None:
+        idx.enable_pq(pq_m)
+    start = time.perf_counter()
+    idx.train(learn)
+    train_s = time.perf_counter() - start
+    refine = ve.RefineIndex(idx) if pq_m is not None else None
+    start = time.perf_counter()
+    (refine or idx).add(base)
+    add_s = time.perf_counter() - start
+    return idx, refine, train_s, add_s
+
+
+def run(dataset: str, max_queries: int | None):
+    base, learn, queries, gt = load_dataset(dataset)
+    if max_queries:
+        queries, gt = queries[:max_queries], gt[:max_queries]
+    n, dim = base.shape
+    nlist = min(65535, max(100, round(math.sqrt(n))))
+    print(f"{dataset}: base {base.shape}, learn {learn.shape}, queries {queries.shape}, nlist {nlist}\n")
+
+    rows = []
+
+    def record(name, params, ids, qps, bytes_per_vec, train_s=0.0, add_s=0.0):
+        r = recall_at_k(ids, gt, K)
+        rows.append(dict(index=name, params=params, recall=r, qps=qps,
+                         bytes_per_vec=bytes_per_vec, train_s=train_s, add_s=add_s))
+        print(f"  {name:<18} {params:<14} recall@{K} {r:.3f}   {qps:>9.0f} qps   {bytes_per_vec:>4} B/vec")
+
+    print("Flat")
+    flat = ve.FlatIndex(dim)
+    start = time.perf_counter()
+    flat.add(base)
+    add_s = time.perf_counter() - start
+    ids, qps = time_queries(flat, queries, K)
+    record("Flat", "-", ids, qps, dim * 4, add_s=add_s)
+
+    configs = [("IVF", None)] + [(f"IVF-PQ{m}", m) for m in PQ_SUBSPACES]
+    for name, m in configs:
+        idx, refine, train_s, add_s = build_ivf(dim, nlist, base, learn, m)
+        print(f"{name}  (train {train_s:.1f}s, add {add_s:.1f}s)")
+        bytes_per_vec = (dim * 4 if m is None else m) + 4  # + uint32 id
+        modes = [("", None)] if m is None else [("-ADC", ve.PQDistance.ADC), ("-SDC", ve.PQDistance.SDC)]
+        for suffix, mode in modes:
+            label = name + suffix
+            if mode is not None:
+                idx.pq_distance = mode
+            for nprobe in (p for p in NPROBES if p <= nlist):
+                idx.nprobe = nprobe
+                ids, qps = time_queries(idx, queries, K)
+                record(label, f"nprobe={nprobe}", ids, qps, bytes_per_vec, train_s, add_s)
+        if refine is not None:
+            idx.pq_distance = ve.PQDistance.ADC
+            for kf in REFINE_K_FACTORS:
+                refine.k_factor = kf
+                for nprobe in (p for p in NPROBES if p <= nlist):
+                    idx.nprobe = nprobe
+                    ids, qps = time_queries(refine, queries, K)
+                    record(f"{name}-ADC+R{kf}", f"nprobe={nprobe}", ids, qps,
+                           bytes_per_vec + dim * 4, train_s, add_s)
+        print()
+
+    return rows
+
+
+def write_csv(rows, path: Path):
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+
+
+def plot(rows, path: Path, title: str):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    for name in dict.fromkeys(r["index"] for r in rows):
+        pts = [(r["recall"], r["qps"]) for r in rows if r["index"] == name]  # nprobe order
+        xs, ys = zip(*pts)
+        ax.plot(xs, ys, marker="o", markersize=3 if len(pts) > 1 else 6, label=name)
+    ax.set_yscale("log")
+    ax.set_xlabel(f"recall@{K}")
+    ax.set_ylabel("queries / second (single thread, log)")
+    ax.set_title(title)
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", default="siftsmall", help="siftsmall or sift")
+    parser.add_argument("--max-queries", type=int, default=None, help="use only the first N queries")
+    args = parser.parse_args()
+
+    rows = run(args.dataset, args.max_queries)
+
+    RESULTS_DIR.mkdir(exist_ok=True)
+    csv_path = RESULTS_DIR / f"{args.dataset}.csv"
+    png_path = RESULTS_DIR / f"{args.dataset}.png"
+    write_csv(rows, csv_path)
+    plot(rows, png_path, f"{args.dataset}: recall vs QPS")
+    print(f"wrote {csv_path} and {png_path}")
+
+
+if __name__ == "__main__":
+    main()

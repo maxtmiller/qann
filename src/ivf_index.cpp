@@ -24,6 +24,11 @@ IVFIndex::IVFIndex(size_t dim, size_t nlist, size_t nprobe): dim_(dim), nlist_(n
     coarse_centroids_.reserve(dim_ * nlist_);
 }
 
+void IVFIndex::set_nprobe(size_t nprobe) {
+    if (nprobe == 0 || nprobe > nlist_) throw std::invalid_argument("nprobe must be in [1, nlist]");
+    nprobe_ = nprobe;
+}
+
 void IVFIndex::enable_pq(size_t num_subspaces, size_t centroids_per_subspace) {
     if (n_total_ > 0 || trained_)
         throw std::logic_error("enable_pq must be called before train()/add()");

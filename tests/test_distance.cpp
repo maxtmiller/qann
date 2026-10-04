@@ -5,10 +5,12 @@
 #include "vecengine/flat_index.hpp"
 #include "vecengine/ivf_index.hpp"
 #include "vecengine/pq.hpp"
+#include "vecengine/refine_index.hpp"
 
 #include <cmath>
 #include <vector>
 #include <random>
+#include <algorithm>
 
 using Catch::Matchers::WithinAbs;
 using Catch::Matchers::WithinRel;
@@ -346,6 +348,101 @@ TEST_CASE("IVFIndex+PQ: recall vs FlatIndex, ADC beats SDC", "[ivf][pq]") {
     REQUIRE(adc > 0.5);
     REQUIRE(sdc > 0.3);
     REQUIRE(adc > sdc);
+}
+
+// ---------------------------------------------------------------------------
+// RefineIndex
+// ---------------------------------------------------------------------------
+
+TEST_CASE("RefineIndex: constructor rejects non-empty base and zero k_factor", "[refine]") {
+    vecengine::FlatIndex base(3);
+    REQUIRE_THROWS_AS(vecengine::RefineIndex(base, 0), std::invalid_argument);
+    REQUIRE_NOTHROW(vecengine::RefineIndex(base, 1));
+
+    std::vector<float> v = {1.0f, 2.0f, 3.0f};
+    base.add(v);
+    REQUIRE_THROWS_AS(vecengine::RefineIndex(base, 10), std::invalid_argument);
+}
+
+TEST_CASE("RefineIndex: k_factor 1 keeps base IDs with exact distances", "[refine]") {
+    const size_t dim = 32, n = 3000, k = 10;
+    auto data = random_vectors(n, dim, /*seed=*/21);
+
+    vecengine::IVFIndex base(dim, 100, 20);
+    base.enable_pq(8, 64);
+    base.train(data, n, 10);
+    vecengine::RefineIndex refine(base, 1);
+    for (size_t i = 0; i < n; ++i)
+        refine.add(std::span<const float>(data.data() + i * dim, dim));
+    REQUIRE(refine.size() == n);
+    REQUIRE(base.size() == n);
+
+    std::span<const float> query(data.data() + 5 * dim, dim);
+    auto base_res = base.query(query, k);
+    auto refined = refine.query(query, k);
+    REQUIRE(refined.size() == base_res.size());
+
+    std::vector<size_t> base_ids, refined_ids;
+    for (const auto& r : base_res) base_ids.push_back(r.index);
+    for (const auto& r : refined) refined_ids.push_back(r.index);
+    std::sort(base_ids.begin(), base_ids.end());
+    std::sort(refined_ids.begin(), refined_ids.end());
+    REQUIRE(base_ids == refined_ids);
+
+    for (size_t i = 0; i < refined.size(); ++i) {
+        float exact = vecengine::l2_distance(query.data(), data.data() + refined[i].index * dim, dim);
+        REQUIRE_THAT(refined[i].distance, WithinAbs(exact, kEps));
+        if (i > 0) REQUIRE(refined[i].distance >= refined[i - 1].distance);
+    }
+}
+
+TEST_CASE("RefineIndex: larger k_factor raises recall over the PQ base", "[refine][pq]") {
+    const size_t dim = 32, n = 5000, k = 10, num_queries = 100;
+    auto data = random_vectors(n, dim, /*seed=*/42);
+
+    vecengine::FlatIndex flat(dim);
+    vecengine::IVFIndex base(dim, 100, 20);
+    base.enable_pq(8, 256);
+    base.train(data, n, 15);
+    vecengine::RefineIndex refine(base, 1);
+    for (size_t i = 0; i < n; ++i) {
+        std::span<const float> v(data.data() + i * dim, dim);
+        flat.add(v);
+        refine.add(v);
+    }
+
+    auto recall = [&](const vecengine::Index& idx) {
+        size_t hits = 0;
+        for (size_t q = 0; q < num_queries; ++q) {
+            std::span<const float> query(data.data() + q * 37 * dim, dim);
+            auto truth = flat.query(query, k);
+            for (const auto& r : idx.query(query, k))
+                for (const auto& t : truth)
+                    if (r.index == t.index) { ++hits; break; }
+        }
+        return static_cast<double>(hits) / (num_queries * k);
+    };
+
+    double base_recall = recall(base);
+    refine.set_k_factor(10);
+    double refined_recall = recall(refine);
+
+    REQUIRE(refined_recall > base_recall + 0.1);
+    REQUIRE(refined_recall > 0.75);
+}
+
+TEST_CASE("RefineIndex: k * k_factor larger than the index returns all vectors", "[refine]") {
+    vecengine::FlatIndex base(2);
+    vecengine::RefineIndex refine(base, 100);
+    std::vector<float> a = {0.0f, 0.0f}, b = {1.0f, 0.0f}, c = {5.0f, 0.0f};
+    refine.add(a);
+    refine.add(b);
+    refine.add(c);
+
+    auto res = refine.query(a, 2);
+    REQUIRE(res.size() == 2);
+    REQUIRE(res[0].index == 0);
+    REQUIRE(res[1].index == 1);
 }
 
 #if defined(__AVX2__)

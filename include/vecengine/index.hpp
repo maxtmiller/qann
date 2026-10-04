@@ -18,6 +18,10 @@ struct Neighbor {
 // Common interface every index type implements.
 // FlatIndex is exact brute-force; future types (IVF, HNSW) trade
 // exactness for speed at scale but share this same surface.
+//
+// Invariant: add() assigns IDs in insertion order starting at 0, and
+// Neighbor::index is that ID. RefineIndex relies on this to map a base
+// index's results back to its own copy of the raw vectors.
 class Index {
 public:
     virtual ~Index() = default;

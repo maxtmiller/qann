@@ -61,6 +61,7 @@ add_library(vecengine_core STATIC
   src/ivf_index.cpp
   src/pq.cpp
   src/kmeans.cpp
+  src/refine_index.cpp
   src/index_factory.cpp
 )
 

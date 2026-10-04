@@ -31,6 +31,9 @@ public:
     // in InvertedList::codes instead of raw floats in InvertedList::vecs.
     void enable_pq(size_t num_subspaces, size_t centroids_per_subspace = 256);
 
+    size_t nprobe() const noexcept { return nprobe_; }
+    void set_nprobe(size_t nprobe);
+
     PQDistance pq_distance() const noexcept { return pq_distance_; }
     void set_pq_distance(PQDistance mode) noexcept { pq_distance_ = mode; }
 

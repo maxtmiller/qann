@@ -9,6 +9,7 @@
 #include "vecengine/flat_index.hpp"
 #include "vecengine/ivf_index.hpp"
 #include "vecengine/pq.hpp"
+#include "vecengine/refine_index.hpp"
 #include "vecengine/index_factory.hpp"
 
 namespace nb = nanobind;
@@ -180,9 +181,25 @@ NB_MODULE(vecengine, m) {
         .def("enable_pq", &vecengine::IVFIndex::enable_pq,
              nb::arg("num_subspaces"), nb::arg("centroids_per_subspace") = 256,
              "Enable PQ compression of residuals. Call before train()/add().")
+        .def_prop_rw("nprobe", &vecengine::IVFIndex::nprobe, &vecengine::IVFIndex::set_nprobe,
+                     "Number of clusters scanned per query; can be changed after training")
         .def_prop_rw("pq_distance", &vecengine::IVFIndex::pq_distance, &vecengine::IVFIndex::set_pq_distance,
                      "How queries score PQ codes: PQDistance.ADC (default, more accurate) or PQDistance.SDC")
         .def("add", &index_add, nb::arg("data"), "Add matrix of vectors to index")
+        .def("query", &index_query, nb::arg("query"), nb::arg("k"), "Query k-NN for a query vector; returns (indices, distances)")
+        .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), "Query k-NN for multiple query vectors; returns list of (indices, distances)")
+        .def("size", &vecengine::Index::size, "Get number of indexed vectors")
+        .def("dim", &vecengine::Index::dim, "Get vector dimension");
+
+    // Holds `base` by reference; keep_alive ties base's lifetime to the
+    // RefineIndex so Python can't free it first.
+    nb::class_<vecengine::RefineIndex, vecengine::Index>(m, "RefineIndex")
+        .def(nb::init<vecengine::Index&, std::size_t>(), nb::arg("base"), nb::arg("k_factor") = 10,
+             nb::keep_alive<1, 2>(),
+             "Re-rank an empty, trained approximate index with exact distances. Add vectors through this wrapper.")
+        .def_prop_rw("k_factor", &vecengine::RefineIndex::k_factor, &vecengine::RefineIndex::set_k_factor,
+                     "Candidates fetched from base per result (k * k_factor)")
+        .def("add", &index_add, nb::arg("data"), "Add matrix of vectors to base and raw storage")
         .def("query", &index_query, nb::arg("query"), nb::arg("k"), "Query k-NN for a query vector; returns (indices, distances)")
         .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), "Query k-NN for multiple query vectors; returns list of (indices, distances)")
         .def("size", &vecengine::Index::size, "Get number of indexed vectors")
