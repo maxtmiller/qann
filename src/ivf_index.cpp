@@ -83,6 +83,10 @@ vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
         }
     }
 
+    // intialize vars for pq, reuse allocated memory for adc table
+    const size_t m = pq_enabled() ? pq_->num_subspaces() : 0;
+    vector<float> table(pq_enabled() ? m * pq_->centroids_per_subspace() : 0);
+
     // find top-k vectors from the inverted lists associated with the nprobe closest coarse centroids
     const size_t n1 = maxCentroidHeap.size();
     std::priority_queue<pair<float, size_t>, vector<pair<float, size_t>>, std::less<pair<float, size_t>>> maxVectorHeap;
@@ -120,9 +124,8 @@ vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
         }
 
         // calculate distance with ADC or SDC
-        const size_t m = pq_->num_subspaces();
         if (pq_distance_ == PQDistance::ADC) {
-            vector<float> table = pq_->compute_adc_table(residual);
+            pq_->compute_adc_table(residual, table);
             for (size_t j = 0; j < listSize; ++j) {
                 span<const uint8_t> code(list.codes.data() + j * m, m);
                 push(pq_->distance_adc(table, code), j);

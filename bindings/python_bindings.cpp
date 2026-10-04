@@ -126,7 +126,9 @@ static std::vector<uint8_t> pq_encode(const vecengine::PQCodebook &self, FloatVe
 static std::vector<float> pq_compute_adc_table(const vecengine::PQCodebook &self, FloatVector query) {
     if (query.shape(0) != self.dim())
         throw std::invalid_argument("query dimension does not match codebook dimension");
-    return self.compute_adc_table(as_span(query));
+    std::vector<float> table(self.num_subspaces() * self.centroids_per_subspace());
+    self.compute_adc_table(as_span(query), table);
+    return table;
 }
 
 static float pq_distance_adc(const vecengine::PQCodebook &self, FloatVector table, ByteVector code) {

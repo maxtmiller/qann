@@ -268,14 +268,57 @@ TEST_CASE("PQCodebook: ADC is exact when vectors are centroids", "[pq][adc]") {
     pq.train(data, K, 10);
 
     auto query = random_vectors(1, dim, /*seed=*/6);
-    auto table = pq.compute_adc_table(query);
-    REQUIRE(table.size() == m * K);
+    std::vector<float> table(m * K);
+    pq.compute_adc_table(query, table);
 
     for (size_t i = 0; i < K; ++i) {
         const float* x = data.data() + i * dim;
         auto code = pq.encode(std::span<const float>(x, dim));
         float exact = vecengine::l2_distance(query.data(), x, dim);
         REQUIRE_THAT(pq.distance_adc(table, code), WithinAbs(exact, kEps));
+    }
+}
+
+// The ADC table must hold the plain per-subspace distance from each query
+// slice to each centroid, whatever internal layout builds it.
+TEST_CASE("PQCodebook: ADC table matches per-subspace l2_distance", "[pq][adc]") {
+    const size_t dim = 16, m = 4, K = 16, sub = dim / m;
+    auto data = random_vectors(K, dim, /*seed=*/13);
+    vecengine::PQCodebook pq(dim, m, K);
+    pq.train(data, K, 10);  // n == K: every training point is a centroid
+
+    auto query = random_vectors(1, dim, /*seed=*/14);
+    std::vector<float> table(m * K);
+    pq.compute_adc_table(query, table);
+
+    // Centroid ids aren't exposed, so check that each training point's code
+    // indexes the exact distance from the query slice to that point's slice.
+    for (size_t p = 0; p < K; ++p) {
+        const float* x = data.data() + p * dim;
+        auto code = pq.encode(std::span<const float>(x, dim));
+        for (size_t s = 0; s < m; ++s) {
+            float exact = vecengine::l2_distance(query.data() + s * sub, x + s * sub, sub);
+            REQUIRE_THAT(table[s * K + code[s]], WithinAbs(exact, kEps));
+        }
+    }
+}
+
+// SDC entries must equal ADC entries when the query is itself a centroid.
+TEST_CASE("PQCodebook: SDC table matches centroid-pair distances", "[pq][sdc]") {
+    const size_t dim = 16, m = 4, K = 16;
+    auto data = random_vectors(K, dim, /*seed=*/15);
+    vecengine::PQCodebook pq(dim, m, K);
+    pq.train(data, K, 10);
+
+    for (size_t a = 0; a < K; ++a) {
+        std::span<const float> va(data.data() + a * dim, dim);
+        auto code_a = pq.encode(va);
+        std::vector<float> table(m * K);
+        pq.compute_adc_table(va, table);
+        for (size_t b = 0; b < K; ++b) {
+            auto code_b = pq.encode(std::span<const float>(data.data() + b * dim, dim));
+            REQUIRE_THAT(pq.distance_sdc(code_a, code_b), WithinAbs(pq.distance_adc(table, code_b), kEps));
+        }
     }
 }
 
@@ -298,7 +341,8 @@ TEST_CASE("PQCodebook: ADC approximates true distance better than SDC", "[pq][ad
     pq.train(data, n, 15);
 
     auto query = random_vectors(1, dim, /*seed=*/12);
-    auto table = pq.compute_adc_table(query);
+    std::vector<float> table(m * K);
+    pq.compute_adc_table(query, table);
     auto query_code = pq.encode(query);
 
     double adc_err = 0.0, sdc_err = 0.0;

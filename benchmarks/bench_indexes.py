@@ -48,12 +48,15 @@ def recall_at_k(ids_per_query, gt: np.ndarray, k: int) -> float:
     return hits / (len(ids_per_query) * k)
 
 
-def time_queries(index, queries: np.ndarray, k: int):
-    index.batch_query(queries[: min(10, len(queries))], k)  # warm-up
-    start = time.perf_counter()
-    results = index.batch_query(queries, k)
-    elapsed = time.perf_counter() - start
-    return [ids for ids, _ in results], len(queries) / elapsed
+def time_queries(index, queries: np.ndarray, k: int, repeats: int = 3):
+    # Best of `repeats` full passes: the first pass after a build or setting
+    # change pays cold caches, so a short warm-up alone undercounts QPS.
+    best = math.inf
+    for _ in range(repeats):
+        start = time.perf_counter()
+        results = index.batch_query(queries, k)
+        best = min(best, time.perf_counter() - start)
+    return [ids for ids, _ in results], len(queries) / best
 
 
 def build_ivf(dim, nlist, base, learn, pq_m=None):

@@ -72,6 +72,13 @@ target_include_directories(vecengine_core PUBLIC
 
 target_compile_features(vecengine_core PUBLIC cxx_std_20)
 
+# Accelerate's cblas_sgemm runs on Apple's matrix unit; k-means assignment uses
+# it when available. PUBLIC link: anything linking the static lib needs it too.
+if(APPLE)
+  target_link_libraries(vecengine_core PUBLIC "-framework Accelerate")
+  target_compile_definitions(vecengine_core PRIVATE VECENGINE_USE_ACCELERATE ACCELERATE_NEW_LAPACK)
+endif()
+
 # ---------------------------------------------------------------------------
 # Unit tests (Catch2 v3)
 # ---------------------------------------------------------------------------

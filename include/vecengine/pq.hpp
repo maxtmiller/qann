@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <vector>
 #include <span>
+#include <cassert>
 
 namespace vecengine {
 
@@ -36,11 +37,22 @@ public:
     // subspace. Returns num_subspaces_ * centroids_per_subspace_ floats,
     // table[s * K + c]. Build once per query (per probed list in IVF) and
     // reuse it for every code scanned.
-    vector<float> compute_adc_table(span<const float> query) const;
+    void compute_adc_table(span<const float> query, span<float> out) const;
 
     // ADC step 2: query stays full-precision; only `code` is quantized.
     // Sums table[s * K + code[s]] over subspaces - lookups only, no float math.
-    float distance_adc(span<const float> table, span<const uint8_t> code) const;
+    float distance_adc(span<const float> table, span<const uint8_t> code) const {
+        assert(table.size() == num_subspaces_ * centroids_per_subspace_);
+        assert(code.size() == num_subspaces_);
+
+        // Same shape as distance_sdc, indexing table[s * K + code[s]].
+        float sum = 0.0f;
+        for (size_t i = 0; i < num_subspaces_; ++i) {
+            sum += table[(i * centroids_per_subspace_) + code[i]];
+        }
+
+        return sum;
+    }
 
     // SDC: both sides are quantized. Looks up precomputed centroid-pair
     // distances in sdc_table_ built once during train() - no float math.
@@ -57,6 +69,7 @@ private:
     size_t centroids_per_subspace_; // num of centroids per subspace
 
     vector<float> centroids_; // m * k * sub_dim_, row-major per subspace
+    vector<float> centroids_t_; // m * sub_dim_ * k, contiguous over centroids for the ADC/SDC table loops
     vector<float> sdc_table_; // m * k * k, built once in train()
 };
 
