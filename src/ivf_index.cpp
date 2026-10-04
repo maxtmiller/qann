@@ -1,0 +1,186 @@
+#include "vecengine/ivf_index.hpp"
+#include "vecengine/distance.hpp"
+#include "vecengine/pq.hpp"
+#include "kmeans.hpp"
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+#include <span>
+#include <cassert>
+#include <queue>
+#include <utility>
+#include <stdexcept>
+
+
+namespace vecengine {
+
+using std::size_t;
+using std::vector;
+using std::span;
+using std::pair;
+
+IVFIndex::IVFIndex(size_t dim, size_t nlist, size_t nprobe): dim_(dim), nlist_(nlist), nprobe_(nprobe)  {
+    if (nlist < 100 || nlist > 65535) throw std::invalid_argument("nlist must be in [100, 65535]");
+    coarse_centroids_.reserve(dim_ * nlist_);
+}
+
+void IVFIndex::enable_pq(size_t num_subspaces, size_t centroids_per_subspace) {
+    if (n_total_ > 0 || trained_)
+        throw std::logic_error("enable_pq must be called before train()/add()");
+    pq_ = std::make_unique<PQCodebook>(dim_, num_subspaces, centroids_per_subspace);
+}
+
+void IVFIndex::add(span<const float> vec) {
+    assert(vec.size() == dim_);
+    if (!trained_) throw std::logic_error("train() has not be run yet");
+
+    // add a vector to the inverted list of the closest coarse centroid
+    size_t closest_index = vecengine::detail::nearest_centroid(vec.data(), coarse_centroids_.data(), nlist_, dim_);
+
+    uint16_t cluster_id = static_cast<uint16_t>(closest_index);
+    uint32_t new_id = n_total_++;
+
+    InvertedList& list = data_[cluster_id];
+    
+    list.ids.emplace_back(new_id);
+
+    // adds quantized vectors if pq enabled else full dimensional vectors 
+    if (pq_enabled()) {
+        vector<float> residual(dim_);
+        const float* centroid_ptr = coarse_centroids_.data() + cluster_id * dim_;
+        for (size_t i = 0; i < dim_; ++i) {
+            residual[i] = vec[i] - centroid_ptr[i];
+        }
+
+        auto code = pq_->encode(residual);
+        list.codes.insert(list.codes.end(), code.begin(), code.end());
+    } else {
+        list.vecs.insert(list.vecs.end(), vec.begin(), vec.end());
+    }
+}
+
+vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
+    assert(vec.size() == dim_);
+    assert(k <= n_total_);
+    if (!trained_) throw std::logic_error("train() has not be run yet");
+
+    // find the closest nprobe coarse centroids
+    std::priority_queue<pair<float, uint16_t>, vector<pair<float, uint16_t>>, std::less<pair<float, uint16_t>>> maxCentroidHeap;
+    for (size_t i = 0; i < nlist_; ++i) {
+        const float* centroid_ptr = coarse_centroids_.data() + i * dim_;
+        float dist = l2_distance(vec.data(), centroid_ptr, dim_);
+        
+        if (maxCentroidHeap.size() < nprobe_) {
+            maxCentroidHeap.emplace(dist, i);
+        } else if (dist < maxCentroidHeap.top().first) {
+            maxCentroidHeap.pop();
+            maxCentroidHeap.emplace(dist, static_cast<uint16_t>(i));
+        }
+    }
+
+    // find top-k vectors from the inverted lists associated with the nprobe closest coarse centroids
+    const size_t n1 = maxCentroidHeap.size();
+    std::priority_queue<pair<float, size_t>, vector<pair<float, size_t>>, std::less<pair<float, size_t>>> maxVectorHeap;
+    for (size_t i = 0; i < n1; ++i) {
+        auto it = data_.find(maxCentroidHeap.top().second);
+        maxCentroidHeap.pop();
+        if (it == data_.end()) continue;
+
+        const InvertedList& list = it->second;
+        size_t listSize = list.ids.size();
+
+        // lamdba function for adding to heap
+        auto push = [&](float dist, size_t j) {
+            if (maxVectorHeap.size() < k) {
+                maxVectorHeap.emplace(dist, list.ids[j]);
+            } else if (dist < maxVectorHeap.top().first) {
+                maxVectorHeap.pop();
+                maxVectorHeap.emplace(dist, list.ids[j]);
+            }
+        };
+
+        if (!pq_enabled()) {
+            for (size_t j = 0; j < listSize; ++j) {
+                const float* start = list.vecs.data() + j * dim_;
+                push(l2_distance(vec.data(), start, dim_), j);
+            }
+            continue;
+        }
+
+        // calculates residuals 
+        vector<float> residual(dim_);
+        const float* centroid_ptr = coarse_centroids_.data() + it->first * dim_;
+        for (size_t l = 0; l < dim_; ++l) {
+            residual[l] = vec[l] - centroid_ptr[l];
+        }
+
+        // calculate distance with ADC or SDC
+        const size_t m = pq_->num_subspaces();
+        if (pq_distance_ == PQDistance::ADC) {
+            vector<float> table = pq_->compute_adc_table(residual);
+            for (size_t j = 0; j < listSize; ++j) {
+                span<const uint8_t> code(list.codes.data() + j * m, m);
+                push(pq_->distance_adc(table, code), j);
+            }
+        } else {
+            vector<uint8_t> query_code = pq_->encode(residual);
+            for (size_t j = 0; j < listSize; ++j) {
+                span<const uint8_t> code(list.codes.data() + j * m, m);
+                push(pq_->distance_sdc(query_code, code), j);
+            }
+        }
+    }
+
+    // add top-k vectors to results array
+    const size_t n2 = maxVectorHeap.size();
+    vector<Neighbor> results(n2);
+    for (int i = static_cast<int>(n2) - 1; i >= 0; --i) {
+        auto [dist, idx] = maxVectorHeap.top();
+        results[i] = {idx,dist};
+        maxVectorHeap.pop();
+    }
+
+    return results;
+}
+
+vector<vector<Neighbor>> IVFIndex::query_batch(span<const float> queries, size_t num_queries, size_t k) const {
+    assert(queries.size() == num_queries * dim_);
+
+    vector<vector<Neighbor>> results;
+    results.reserve(num_queries);
+    for (size_t i = 0; i < num_queries; ++i) {
+        span<const float> row(queries.data() + i * dim_, dim_);
+        results.emplace_back(query(row, k));
+    }
+
+    return results;
+}
+
+void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_iters) {
+    if (n_total_ > 0) throw std::logic_error("train() cannot be called after add()");
+    if (trained_) throw std::logic_error("train() has already been called");
+    if (num_vectors < nlist_) throw std::invalid_argument("training set must have at least nlist vectors");
+
+    // run kmeans
+    auto res = vecengine::detail::kmeans(vectors.data(), num_vectors, dim_, dim_, nlist_, max_iters);
+    coarse_centroids_ = std::move(res.centroids);
+
+    // calculate residuals and run kmeans again on each subspace
+    const vector<uint32_t>& assignments = res.assignments;
+    if (pq_enabled()) {
+        vector<float> residuals(num_vectors * dim_);
+        for (size_t i = 0; i < num_vectors; ++i) {
+            const float* centroid_ptr = coarse_centroids_.data() + assignments[i] * dim_;
+            const float* vec_ptr = vectors.data() + i * dim_;
+            for (size_t j = 0; j < dim_; ++j) {
+                residuals[i * dim_ +j] = vec_ptr[j] - centroid_ptr[j];
+            }
+        }
+
+        pq_->train(residuals, num_vectors, max_iters);
+    }
+    trained_ = true;
+}
+
+
+}
