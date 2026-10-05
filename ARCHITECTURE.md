@@ -259,7 +259,7 @@ refine = qann.RefineIndex(ivf, k_factor=10)   # optional; wrap before adding
 refine.add(x)                          # adds to ivf too
 ivf.nprobe = 32                        # tune after training
 ivf.pq_distance = qann.PQDistance.ADC    # default ADC
-ids, dists = refine.query(x[:1], 10)
+ids, dists = refine.query(x[0], 10)      # (10,) arrays
 ids, dists = refine.batch_query(x[:5], 10)  # (5, 10) arrays
 
 pq = qann.PQCodebook(128, 16)
