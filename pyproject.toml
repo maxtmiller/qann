@@ -1,0 +1,25 @@
+[build-system]
+requires = ["scikit-build-core>=0.10"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "vecengine"
+version = "0.1.0"
+description = "C++ vector search engine (Flat, IVF, PQ, re-ranking) with Python bindings"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Maximilian Miller" }]
+requires-python = ">=3.9"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+bench = ["matplotlib"]
+
+[tool.scikit-build]
+minimum-version = "0.10"
+cmake.build-type = "Release"
+build.targets = ["vecengine_py"]
+wheel.packages = []
+
+[tool.scikit-build.cmake.define]
+VECENGINE_BUILD_TESTS = "OFF"
