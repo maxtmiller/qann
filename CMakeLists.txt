@@ -168,4 +168,7 @@ set_target_properties(vecengine_py PROPERTIES
 # `import qann` finds it.
 if(SKBUILD)
   install(TARGETS vecengine_py LIBRARY DESTINATION .)
+  target_compile_definitions(vecengine_py PRIVATE QANN_VERSION="${SKBUILD_PROJECT_VERSION_FULL}")
+else()
+  target_compile_definitions(vecengine_py PRIVATE QANN_VERSION="dev")
 endif()

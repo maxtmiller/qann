@@ -4,16 +4,34 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "qann"
-version = "0.1.0"
+version = "0.1.0a1"
 description = "QANN: Quantized Approximate Nearest Neighbors. C++ vector search (Flat, IVF, PQ, re-ranking) with Python bindings"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Maximilian Miller" }]
 requires-python = ">=3.9"
 dependencies = ["numpy"]
+keywords = ["ann", "vector search", "nearest neighbors", "product quantization", "ivf"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+
+[project.urls]
+Homepage = "https://github.com/maxtmiller/qann"
+Source = "https://github.com/maxtmiller/qann"
+Issues = "https://github.com/maxtmiller/qann/issues"
 
 [project.optional-dependencies]
 bench = ["matplotlib"]
+test = ["pytest"]
 
 [tool.scikit-build]
 minimum-version = "0.10"
@@ -23,3 +41,16 @@ wheel.packages = []
 
 [tool.scikit-build.cmake.define]
 VECENGINE_BUILD_TESTS = "OFF"
+
+[tool.cibuildwheel]
+# nanobind v1.9.2 predates CPython 3.14; free-threaded builds are not supported.
+build = "cp39-* cp310-* cp311-* cp312-* cp313-*"
+skip = "*-musllinux_*"
+test-requires = ["pytest", "numpy"]
+test-command = "pytest {project}/tests"
+
+[tool.cibuildwheel.linux]
+before-all = "dnf install -y --enablerepo=powertools openblas-devel"
+
+[tool.cibuildwheel.macos.environment]
+MACOSX_DEPLOYMENT_TARGET = "11.0"
