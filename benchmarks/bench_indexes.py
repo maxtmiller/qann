@@ -10,7 +10,8 @@ row with a fixed seed; --check fails if any row's recall drops below it.
     PYTHONPATH=build python3 benchmarks/bench_indexes.py --check benchmarks/baseline_siftsmall.json
 
 Datasets go in benchmarks/data/<name>/ (see ftp://ftp.irisa.fr/local/texmex/corpus/).
-batch_query and PQ training run on all cores (detail::parallel_for); add uses add_batch.
+batch_query and PQ training run on all cores by default (detail::parallel_for);
+--threads N limits that (--threads 1 is fully serial). add uses add_batch.
 """
 
 import argparse
@@ -141,7 +142,7 @@ def write_csv(rows, path: Path):
         w.writerows(rows)
 
 
-def plot(rows, path: Path, title: str):
+def plot(rows, path: Path, title: str, threads: int):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -153,7 +154,7 @@ def plot(rows, path: Path, title: str):
         ax.plot(xs, ys, marker="o", markersize=3 if len(pts) > 1 else 6, label=name)
     ax.set_yscale("log")
     ax.set_xlabel(f"recall@{K}")
-    ax.set_ylabel("queries / second (all cores, log)")
+    ax.set_ylabel(f"queries / second ({threads} threads, log)")
     ax.set_title(title)
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=8)
@@ -197,6 +198,7 @@ def main():
     parser.add_argument("--write-baseline", type=Path, help="save per-row recall to this JSON (requires --seed)")
     parser.add_argument("--check", type=Path, help="fail if recall drops below this baseline JSON (uses its dataset and seed)")
     parser.add_argument("--tolerance", type=float, default=0.02, help="allowed recall drop for --check")
+    parser.add_argument("--threads", type=int, default=0, help="threads for vecengine's parallel work; 0 = one per core")
     args = parser.parse_args()
 
     baseline = None
@@ -206,6 +208,8 @@ def main():
     if args.write_baseline and args.seed is None:
         parser.error("--write-baseline requires --seed")
 
+    ve.set_num_threads(args.threads)
+    print(f"threads: {ve.num_threads()}")
     rows = run(args.dataset, args.max_queries, args.seed)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -218,7 +222,7 @@ def main():
         sys.exit(0 if check_baseline(rows, baseline, args.tolerance) else 1)
 
     png_path = args.out_dir / f"{args.dataset}.png"
-    plot(rows, png_path, f"{args.dataset}: recall vs QPS")
+    plot(rows, png_path, f"{args.dataset}: recall vs QPS", ve.num_threads())
     print(f"wrote {png_path}")
 
 

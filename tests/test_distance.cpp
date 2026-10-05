@@ -8,11 +8,13 @@
 #include "vecengine/refine_index.hpp"
 #include "kmeans.hpp"
 #include "parallel.hpp"
+#include "vecengine/threads.hpp"
 
 #include <atomic>
 #include <cmath>
 #include <set>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <random>
@@ -219,6 +221,34 @@ TEST_CASE("parallel_for: visits every index exactly once", "[parallel]") {
         std::vector<std::atomic<int>> hits(n);
         vecengine::detail::parallel_for(n, [&](size_t i) { hits[i].fetch_add(1); });
         for (size_t i = 0; i < n; ++i) REQUIRE(hits[i].load() == 1);
+    }
+}
+
+// Records which thread ran each index. The setting is global, so it is reset
+// to the default (0) even if an assertion fails.
+TEST_CASE("parallel_for: respects set_num_threads", "[parallel]") {
+    struct Reset { ~Reset() { vecengine::set_num_threads(0); } } reset;
+    const size_t n = 1000;
+    std::vector<std::thread::id> ran_on(n);
+    auto record = [&](size_t i) { ran_on[i] = std::this_thread::get_id(); };
+
+    SECTION("1 thread runs everything on the caller") {
+        vecengine::set_num_threads(1);
+        REQUIRE(vecengine::num_threads() == 1);
+        vecengine::detail::parallel_for(n, record);
+        for (const auto& id : ran_on) REQUIRE(id == std::this_thread::get_id());
+    }
+
+    SECTION("3 threads use at most 3 distinct threads") {
+        vecengine::set_num_threads(3);
+        vecengine::detail::parallel_for(n, record);
+        std::set<std::thread::id> distinct(ran_on.begin(), ran_on.end());
+        REQUIRE(distinct.size() <= 3);
+    }
+
+    SECTION("0 resolves to at least one thread") {
+        vecengine::set_num_threads(0);
+        REQUIRE(vecengine::num_threads() >= 1);
     }
 }
 

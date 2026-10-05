@@ -66,6 +66,7 @@ endif()
 add_library(vecengine_core STATIC
   src/distance.cpp
   src/index.cpp
+  src/threads.cpp
   src/flat_index.cpp
   src/ivf_index.cpp
   src/pq.cpp

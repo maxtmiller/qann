@@ -158,7 +158,9 @@ Defaults in `src/index.cpp`: `add_batch` calls `add` per row; `query_batch` call
 
 ### `src/parallel.hpp`: `parallel_for` (`vecengine::detail`)
 
-`parallel_for(n, fn)` calls `fn(i)` once for each `i` in `[0, n)` on up to `hardware_concurrency()` `std::thread`s, the caller being one of them. Workers take the next index from a shared atomic counter, so uneven per-item cost (IVF list sizes, M-series performance vs efficiency cores) doesn't leave threads idle. The first exception thrown by `fn` stops the other workers and is rethrown on the caller after all join. Threads are created per call; at batch and training granularity that cost is negligible, so there is no pool. Don't nest it: `fn` must not call `parallel_for` itself.
+`parallel_for(n, fn)` calls `fn(i)` once for each `i` in `[0, n)` on up to `num_threads()` `std::thread`s, the caller being one of them. With one thread (or `n <= 1`) it is a plain loop on the caller: no atomics, no threads, exceptions propagate directly. Workers take the next index from a shared atomic counter, so uneven per-item cost (IVF list sizes, M-series performance vs efficiency cores) doesn't leave threads idle. The first exception thrown by `fn` stops the other workers and is rethrown on the caller after all join. Threads are created per call; at batch and training granularity that cost is negligible, so there is no pool. Don't nest it: `fn` must not call `parallel_for` itself.
+
+**Thread count** (`include/vecengine/threads.hpp`, `src/threads.cpp`): `set_num_threads(n)` sets one process-wide count in a relaxed `std::atomic`, safe to change while other threads query. `0` (the default) means one thread per core; `num_threads()` resolves `0` to `hardware_concurrency()` (at least 1) on every read without writing it back. It does not cap the BLAS library's own threads inside `sgemm`; use `VECLIB_MAXIMUM_THREADS` / `OPENBLAS_NUM_THREADS` for those.
 
 ### `flat_index.hpp`: `FlatIndex`
 
@@ -207,6 +209,7 @@ Recall@10 (overlap of the returned top 10 with the true top 10), QPS on all core
 ```bash
 PYTHONPATH=build python3 benchmarks/bench_indexes.py                    # siftsmall (10k)
 PYTHONPATH=build python3 benchmarks/bench_indexes.py --check benchmarks/baseline_siftsmall.json
+PYTHONPATH=build python3 benchmarks/bench_indexes.py --threads 1       # single-threaded (default 0 = all cores)
 python3 benchmarks/compare.py [ref] [--dataset sift] [--rounds N]       # ref (default HEAD) vs working tree
 PYTHONPATH=build python3 benchmarks/bench_indexes.py --dataset sift     # SIFT1M
 PYTHONPATH=build python3 benchmarks/bench_indexes.py --max-queries 1000
@@ -261,7 +264,7 @@ pq.distance_adc(table, code)
 
 `RefineIndex` holds its base by reference; `keep_alive` keeps the Python base object alive as long as the wrapper exists.
 
-Also exposed: `FlatIndex`, `IndexType`, `IndexOptions`, `make_index`, and row-wise `l2_distance(a, b)` / `cosine_distance(a, b)`.
+Also exposed: `FlatIndex`, `IndexType`, `IndexOptions`, `make_index`, `set_num_threads(n)` / `num_threads()`, and row-wise `l2_distance(a, b)` / `cosine_distance(a, b)`.
 
 Results are NumPy arrays that take ownership of the C++ buffer (no copy): IDs are `int64`, distances `float32`, codes `uint8`. `query` returns 1D arrays with one entry per result. `batch_query` returns `(num_queries, k)` arrays; a row with fewer than `k` results is padded with ID `-1` and distance `inf`.
 
@@ -291,7 +294,6 @@ pip install .               # builds the Python module into a wheel (no C++ test
 
 ## Not Yet Implemented
 
-- **Thread count setting**: `parallel_for` always uses every core; there is no knob for single-thread measurements or limiting CPU use.
 - **IVF-PQ precomputed tables**: FAISS-style decomposition to avoid building an ADC table per probed list.
 - **HNSW**: graph index; slot reserved in `IndexType`.
 - **Persistence**: no save/load of trained indexes.

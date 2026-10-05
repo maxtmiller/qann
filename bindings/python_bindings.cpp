@@ -14,6 +14,7 @@
 #include "vecengine/pq.hpp"
 #include "vecengine/refine_index.hpp"
 #include "vecengine/index_factory.hpp"
+#include "vecengine/threads.hpp"
 
 namespace nb = nanobind;
 
@@ -173,6 +174,12 @@ NB_MODULE(vecengine, m) {
 
     m.def("cosine_distance", &batch_cosine, nb::arg("a"), nb::arg("b"),
           "Cosine distance between rows of two (M, D) float32 arrays.");
+
+    m.def("set_num_threads", &vecengine::set_num_threads, nb::arg("n"),
+          "Threads for batch queries, batch adds and PQ training; 0 = one per core (default). "
+          "Does not limit BLAS's own threads (VECLIB_MAXIMUM_THREADS / OPENBLAS_NUM_THREADS).");
+    m.def("num_threads", &vecengine::num_threads,
+          "Thread count parallel work will use (resolves the 0 default to the core count).");
 
     nb::class_<vecengine::Index>(m, "Index");
 

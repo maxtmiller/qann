@@ -155,8 +155,7 @@ void reseed_empty_clusters(const float* data, size_t n, size_t stride, size_t di
     }
 }
 
-KMeansResult kmeans(const float* data, size_t n, size_t stride, size_t d, size_t k, size_t max_iters,
-                    std::optional<uint32_t> seed) {
+KMeansResult kmeans(const float* data, size_t n, size_t stride, size_t d, size_t k, size_t max_iters, std::optional<uint32_t> seed) {
     if (n < k) throw std::invalid_argument("kmeans: need at least k points");
 
     std::mt19937 rng(seed ? *seed : std::random_device{}());

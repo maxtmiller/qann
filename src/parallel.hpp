@@ -1,5 +1,7 @@
 #pragma once
 
+#include "vecengine/threads.hpp"
+
 #include <atomic>
 #include <thread>
 #include <vector>
@@ -14,10 +16,11 @@ using std::size_t;
 template <class F>
 void parallel_for(size_t n, F&& fn) {
 
-    if (n == 1) fn(0);
-    if (n <= 1) return;
-
-    size_t num_threads = std::max(std::min(n, static_cast<size_t>(std::thread::hardware_concurrency())), size_t{1});
+    size_t threads = std::min(n, vecengine::num_threads());
+    if (threads <= 1) {
+        for (size_t i = 0; i < n; ++i) fn(i);
+        return;
+    }
 
     std::atomic<size_t> next{0};
     std::exception_ptr err = nullptr;
@@ -46,8 +49,8 @@ void parallel_for(size_t n, F&& fn) {
     };
 
     std::vector<std::thread> workers;
-    workers.reserve(num_threads - 1);
-    for (size_t t = 0; t < num_threads - 1; ++t) {
+    workers.reserve(threads - 1);
+    for (size_t t = 0; t < threads - 1; ++t) {
         workers.emplace_back(worker);
     }
     worker();
