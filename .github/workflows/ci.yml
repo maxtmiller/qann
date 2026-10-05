@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu exercises the find_package(BLAS) path with OpenBLAS;
+        # macos-14 (arm64) uses Accelerate like local development.
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install OpenBLAS
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      - name: Install Python dependencies
+        run: python -m pip install numpy
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE="$(which python)"
+
+      - name: Build
+        run: cmake --build build -j 4
+
+      - name: C++ tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Cache siftsmall
+        if: runner.os == 'macOS'
+        id: sift-cache
+        uses: actions/cache@v4
+        with:
+          path: benchmarks/data/siftsmall
+          key: siftsmall-v1
+
+      - name: Download siftsmall
+        if: runner.os == 'macOS' && steps.sift-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p benchmarks/data
+          curl --retry 5 --retry-delay 10 -fsSL ftp://ftp.irisa.fr/local/texmex/corpus/siftsmall.tar.gz \
+            | tar -xz -C benchmarks/data
+
+      # The baseline was recorded with Accelerate on Apple Silicon, so the
+      # gate runs on macOS only; OpenBLAS can round differently and shift
+      # k-means results.
+      - name: Recall regression gate (siftsmall)
+        if: runner.os == 'macOS'
+        env:
+          PYTHONPATH: build
+        run: python benchmarks/bench_indexes.py --check benchmarks/baseline_siftsmall.json
