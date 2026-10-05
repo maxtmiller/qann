@@ -10,7 +10,7 @@ QaNN (**Q**uantized **N**earest **N**eighbors) is a Python library for fast near
 pip install qann
 ```
 
-Wheels are published for Linux (x86_64, aarch64) and macOS (Apple Silicon, Intel) on Python 3.9 to 3.13. x86_64 builds require AVX2 and FMA. To build from source instead, run `pip install .` in a checkout; this needs CMake 3.20+, a C++20 compiler and, on Linux, OpenBLAS (optional but much faster training).
+Wheels are published for Linux (x86_64, aarch64) and macOS (Apple Silicon, Intel) on Python 3.10 to 3.14. x86_64 builds require AVX2 and FMA. To build from source instead, run `pip install .` in a checkout; this needs CMake 3.20+, a C++20 compiler and, on Linux, OpenBLAS (optional but much faster training).
 
 ## Quick start
 

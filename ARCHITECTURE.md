@@ -287,7 +287,7 @@ pip install .               # builds the Python module into a wheel (no C++ test
 ./build/bench_vecengine
 ```
 
-- Dependencies come from FetchContent: Catch2 v3.5.3, Google Benchmark v1.8.3, nanobind v1.9.2.
+- Dependencies come from FetchContent: Catch2 v3.5.3, Google Benchmark v1.8.3, nanobind v3.1.0.
 - BLAS for k-means (`VECENGINE_USE_BLAS`): on Apple, `vecengine_core` links `-framework Accelerate` (PUBLIC, so tests and the Python module link it too). Elsewhere `find_package(BLAS)` plus a `cblas.h` search (also under `include/openblas`); on Debian/Ubuntu `apt install libopenblas-dev`. Configure prints which one it used, or that it fell back to the per-point scan. OpenBLAS runs its own threads inside `sgemm`; if PQ training (which calls it from every `parallel_for` worker) oversubscribes, set `OPENBLAS_NUM_THREADS=1`.
 - Packaging: `pyproject.toml` uses scikit-build-core, builds only `vecengine_py` with `VECENGINE_BUILD_TESTS=OFF` (skips fetching Catch2 and Google Benchmark), and installs the module at the wheel root. Runtime dependency: NumPy.
 - `-mavx2 -mfma` are only added on x86 so arm64 builds never see unsupported flags.
