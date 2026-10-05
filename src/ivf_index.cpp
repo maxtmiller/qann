@@ -4,6 +4,7 @@
 #include "kmeans.hpp"
 #include "parallel.hpp"
 #include "profile.hpp"
+#include "topk.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -131,10 +132,10 @@ vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
     const size_t m = pq_enabled() ? pq_->num_subspaces() : 0;
     vector<float> table(pq_enabled() ? m * pq_->centroids_per_subspace() : 0);
     vector<float> dists;
+    detail::TopK top(k);
 
     // find top-k vectors from the inverted lists associated with the nprobe closest coarse centroids
     const size_t n1 = maxCentroidHeap.size();
-    std::priority_queue<pair<float, size_t>, vector<pair<float, size_t>>, std::less<pair<float, size_t>>> maxVectorHeap;
     for (size_t i = 0; i < n1; ++i) {
         auto it = data_.find(maxCentroidHeap.top().second);
         maxCentroidHeap.pop();
@@ -146,12 +147,7 @@ vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
 
         // lamdba function for adding to heap
         auto push = [&](float dist, size_t j) {
-            if (maxVectorHeap.size() < k) {
-                maxVectorHeap.emplace(dist, list.ids[j]);
-            } else if (dist < maxVectorHeap.top().first) {
-                maxVectorHeap.pop();
-                maxVectorHeap.emplace(dist, list.ids[j]);
-            }
+            if (dist < top.threshold()) top.push(dist, list.ids[j]);
         };
 
         if (!pq_enabled()) {
@@ -178,11 +174,8 @@ vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
             VECENGINE_PROF_STOP(t_table, kProfTable);
             VECENGINE_PROF_START(t_scan);
             pq_->distances_adc(table, list.codes.data(), listSize, dists.data());
-            float worst = maxVectorHeap.size() < k ? INFINITY : maxVectorHeap.top().first;
             for (size_t j = 0; j < listSize; ++j) {
-                if (dists[j] >= worst) continue;
                 push(dists[j], j);
-                worst = maxVectorHeap.size() < k ? INFINITY : maxVectorHeap.top().first;
             }
             VECENGINE_PROF_STOP(t_scan, kProfCodeScan);
         } else {
@@ -195,14 +188,7 @@ vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
     }
 
     VECENGINE_PROF_START(t_drain);
-    // add top-k vectors to results array
-    const size_t n2 = maxVectorHeap.size();
-    vector<Neighbor> results(n2);
-    for (int i = static_cast<int>(n2) - 1; i >= 0; --i) {
-        auto [dist, idx] = maxVectorHeap.top();
-        results[i] = {idx,dist};
-        maxVectorHeap.pop();
-    }
+    vector<Neighbor> results = top.take_sorted();
     VECENGINE_PROF_STOP(t_drain, kProfDrain);
 
     return results;

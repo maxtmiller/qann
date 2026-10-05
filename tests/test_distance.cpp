@@ -8,6 +8,7 @@
 #include "vecengine/refine_index.hpp"
 #include "kmeans.hpp"
 #include "parallel.hpp"
+#include "topk.hpp"
 #include "vecengine/threads.hpp"
 
 #include <atomic>
@@ -210,6 +211,37 @@ TEST_CASE("kmeans: same seed gives identical results", "[kmeans]") {
     auto b = vecengine::detail::kmeans(data.data(), n, dim, dim, k, 10, 1234u);
     REQUIRE(a.centroids == b.centroids);
     REQUIRE(a.assignments == b.assignments);
+}
+
+// ---------------------------------------------------------------------------
+// TopK
+// ---------------------------------------------------------------------------
+
+// Compares against a full sort for k below, near and above n, so both the
+// compaction path (buffer hits 2k) and the never-full path run.
+TEST_CASE("TopK: matches a full sort", "[topk]") {
+    std::mt19937 rng(7);
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    for (size_t k : {size_t{1}, size_t{5}, size_t{160}, size_t{3000}}) {
+        for (size_t n : {size_t{0}, size_t{1}, size_t{7}, size_t{1000}, size_t{2000}}) {
+            std::vector<std::pair<float, size_t>> all;
+            vecengine::detail::TopK top(k);
+            for (size_t i = 0; i < n; ++i) {
+                float d = dist(rng);
+                all.emplace_back(d, i);
+                if (d < top.threshold()) top.push(d, i);
+            }
+            std::sort(all.begin(), all.end());
+            all.resize(std::min(k, n));
+
+            auto got = top.take_sorted();
+            REQUIRE(got.size() == all.size());
+            for (size_t i = 0; i < all.size(); ++i) {
+                REQUIRE(got[i].index == all[i].second);
+                REQUIRE(got[i].distance == all[i].first);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
