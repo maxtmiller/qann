@@ -220,19 +220,26 @@ PYTHONPATH=build python3 benchmarks/bench_indexes.py --max-queries 1000
 
 Datasets come from `ftp://ftp.irisa.fr/local/texmex/corpus/` (`siftsmall.tar.gz`, `sift.tar.gz`), extracted into `benchmarks/data/`.
 
-**SIFT1M findings** (Apple M3, single thread, before the ADC table and k-means speedups):
+**SIFT1M findings** (Apple M3, 4 performance + 4 efficiency cores, `nlist = 1000`, 10k queries, seed 1, idle machine):
 
-| recall@10 | Plain IVF | Best IVF + PQ + re-ranking |
-|---|---|---|
-| ~0.92 | 3.3k QPS (`nprobe = 16`) | 3.1k (m = 16, R16) |
-| ~0.97 | 1.76k (`nprobe = 32`) | 1.79k (m = 16, R16) |
+Thread scaling at `nprobe = 16` (`set_num_threads`):
 
-- Plain IVF reaches 0.98 recall at 25× Flat's QPS.
-- PQ alone plateaus at 0.38 / 0.56 / 0.72 recall for m = 8 / 16 / 32; re-ranking lifts m = 16 to 0.99 and m = 32 to 0.999.
+| threads | Plain IVF (recall 0.93) | IVF + PQ16 (0.56) | IVF + PQ16 + R16 (0.93) |
+|---|---|---|---|
+| 1 | 3.3k QPS | 5.7k | 3.6k |
+| 2 | 6.4k (1.9×) | 11.0k (1.9×) | 7.4k (2.0×) |
+| 4 | 7.6k (2.3×) | 19.2k (3.4×) | 13.3k (3.7×) |
+| 8 | 10.6k (3.2×) | 24.5k (4.3×) | 18.0k (4.9×) |
+
+- Plain IVF stalls between 2 and 4 threads while PQ keeps scaling: IVF streams 512-byte raw vectors and is limited by memory bandwidth, PQ scans 16-byte codes. The efficiency cores add 25 to 40% on top of 4 threads.
+- On all cores, IVF + PQ16 + re-ranking is 1.7× faster than plain IVF at the same 0.93 recall. Single-threaded, plain IVF was faster; PQ's smaller scan wins once bandwidth is the bottleneck.
+- Plain IVF on all cores: 10.2k QPS at 0.93 recall (`nprobe = 16`), 5.3k at 0.98 (`nprobe = 32`), 2.6k at 0.995 (`nprobe = 64`); Flat is 196 QPS.
+- PQ alone plateaus at 0.38 / 0.57 / 0.73 recall for m = 8 / 16 / 32; re-ranking lifts m = 16 to 0.99 and m = 32 to 0.999.
 - SDC recall *falls* as `nprobe` grows, because more candidates expose its query-side quantization error.
-- Without re-ranking, PQ's advantage is memory (12 to 36 bytes per vector vs 516), not speed.
 
-**Training times** on SIFT1M after `assign_nearest`: IVF 37 s → 3.3 s, IVF + PQ16 55 s → 14.7 s.
+**Build times** on all cores: IVF trains in 2.5 s and adds 1M vectors in 1.3 s (`add_batch`); IVF + PQ16 trains in 3.4 s (8.6 s on one thread) and adds in 3.0 s. Before `assign_nearest`, IVF training took 37 s and IVF + PQ16 55 s.
+
+The PQ rows of `benchmarks/results/sift.csv` from this run are ~20% low: other jobs loaded the machine during its second half. The thread-scaling numbers above come from a separate clean run.
 
 ---
 
