@@ -1,8 +1,8 @@
-# vecengine: Architecture & File Reference
+# QANN: Architecture & File Reference
 
 ## Overview
 
-`vecengine` is a C++20 vector search library with a Python extension module built on nanobind. It has three layers:
+QANN (Quantized Approximate Nearest Neighbors) is a C++20 vector search library with a Python extension module, `qann`, built on nanobind. The C++ API lives in namespace `vecengine` under `include/vecengine/`. It has three layers:
 
 1. **Distance kernels**: squared L2 and cosine distance with scalar, AVX2+FMA and ARM NEON paths, selected at compile time.
 2. **Quantization and clustering**: a shared k-means helper (BLAS-accelerated when a CBLAS is available) and a Product Quantization (PQ) codebook.
@@ -248,21 +248,21 @@ The PQ rows of `benchmarks/results/sift.csv` from this run are ~20% low: other j
 Inputs are float32 C-contiguous NumPy arrays, passed zero-copy as `nb::ndarray` (`FloatMatrix` 2D, `FloatVector` 1D, `ByteVector` uint8 1D). Wrappers validate shapes and raise `ValueError` so mismatched input never reaches C++ in Release builds, where asserts are off.
 
 ```python
-import numpy as np, vecengine as ve
+import numpy as np, qann
 
 x = np.random.rand(10_000, 128).astype(np.float32)
 
-ivf = ve.IVFIndex(128, nlist=100, nprobe=10)
+ivf = qann.IVFIndex(128, nlist=100, nprobe=10)
 ivf.enable_pq(16)                      # optional; before train/add
 ivf.train(x)
-refine = ve.RefineIndex(ivf, k_factor=10)   # optional; wrap before adding
+refine = qann.RefineIndex(ivf, k_factor=10)   # optional; wrap before adding
 refine.add(x)                          # adds to ivf too
 ivf.nprobe = 32                        # tune after training
-ivf.pq_distance = ve.PQDistance.ADC    # default ADC
+ivf.pq_distance = qann.PQDistance.ADC    # default ADC
 ids, dists = refine.query(x[:1], 10)
 ids, dists = refine.batch_query(x[:5], 10)  # (5, 10) arrays
 
-pq = ve.PQCodebook(128, 16)
+pq = qann.PQCodebook(128, 16)
 pq.train(x)
 code = pq.encode(x[0])                 # (16,) uint8
 table = pq.compute_adc_table(x[1])     # (16 * 256,) float32

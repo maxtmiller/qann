@@ -116,7 +116,7 @@ def main():
     print("building working tree")
     sh(["cmake", "--build", str(REPO / "build"), "--target", "vecengine_py", "-j"], stdout=subprocess.DEVNULL)
 
-    with tempfile.TemporaryDirectory(prefix="vecengine-compare-") as tmp:
+    with tempfile.TemporaryDirectory(prefix="qann-compare-") as tmp:
         tmp = Path(tmp)
         base_root = tmp / "base"
         base_root.mkdir()

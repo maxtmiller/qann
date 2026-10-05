@@ -3,9 +3,9 @@ requires = ["scikit-build-core>=0.10"]
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "vecengine"
+name = "qann"
 version = "0.1.0"
-description = "C++ vector search engine (Flat, IVF, PQ, re-ranking) with Python bindings"
+description = "QANN: Quantized Approximate Nearest Neighbors. C++ vector search (Flat, IVF, PQ, re-ranking) with Python bindings"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Maximilian Miller" }]

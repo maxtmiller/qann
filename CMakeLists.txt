@@ -161,11 +161,11 @@ nanobind_add_module(vecengine_py
 target_link_libraries(vecengine_py PRIVATE vecengine_core)
 
 set_target_properties(vecengine_py PROPERTIES
-  OUTPUT_NAME "vecengine"
+  OUTPUT_NAME "qann"
 )
 
 # scikit-build-core sets SKBUILD; the module goes at the wheel root so
-# `import vecengine` finds it.
+# `import qann` finds it.
 if(SKBUILD)
   install(TARGETS vecengine_py LIBRARY DESTINATION .)
 endif()

@@ -24,7 +24,7 @@ from pathlib import Path
 
 import numpy as np
 
-import vecengine as ve
+import qann
 
 BENCH_DIR = Path(__file__).parent
 DATA_DIR = BENCH_DIR / "data"
@@ -70,13 +70,13 @@ def time_queries(index, queries: np.ndarray, k: int, repeats: int = 3):
 def build_ivf(dim, nlist, base, learn, pq_m=None, seed=None):
     # With PQ, vectors are added through a RefineIndex so one build serves both
     # the plain PQ rows (query idx) and the re-ranked rows (query refine).
-    idx = ve.IVFIndex(dim, nlist)
+    idx = qann.IVFIndex(dim, nlist)
     if pq_m is not None:
         idx.enable_pq(pq_m)
     start = time.perf_counter()
     idx.train(learn, seed=seed)
     train_s = time.perf_counter() - start
-    refine = ve.RefineIndex(idx) if pq_m is not None else None
+    refine = qann.RefineIndex(idx) if pq_m is not None else None
     start = time.perf_counter()
     (refine or idx).add(base)
     add_s = time.perf_counter() - start
@@ -100,7 +100,7 @@ def run(dataset: str, max_queries: int | None, seed: int | None = None):
         print(f"  {name:<18} {params:<14} recall@{K} {r:.3f}   {qps:>9.0f} qps   {bytes_per_vec:>4} B/vec")
 
     print("Flat")
-    flat = ve.FlatIndex(dim)
+    flat = qann.FlatIndex(dim)
     start = time.perf_counter()
     flat.add(base)
     add_s = time.perf_counter() - start
@@ -112,7 +112,7 @@ def run(dataset: str, max_queries: int | None, seed: int | None = None):
         idx, refine, train_s, add_s = build_ivf(dim, nlist, base, learn, m, seed)
         print(f"{name}  (train {train_s:.1f}s, add {add_s:.1f}s)")
         bytes_per_vec = (dim * 4 if m is None else m) + 4  # + uint32 id
-        modes = [("", None)] if m is None else [("-ADC", ve.PQDistance.ADC), ("-SDC", ve.PQDistance.SDC)]
+        modes = [("", None)] if m is None else [("-ADC", qann.PQDistance.ADC), ("-SDC", qann.PQDistance.SDC)]
         for suffix, mode in modes:
             label = name + suffix
             if mode is not None:
@@ -122,7 +122,7 @@ def run(dataset: str, max_queries: int | None, seed: int | None = None):
                 ids, qps = time_queries(idx, queries, K)
                 record(label, f"nprobe={nprobe}", ids, qps, bytes_per_vec, train_s, add_s)
         if refine is not None:
-            idx.pq_distance = ve.PQDistance.ADC
+            idx.pq_distance = qann.PQDistance.ADC
             for kf in REFINE_K_FACTORS:
                 refine.k_factor = kf
                 for nprobe in (p for p in NPROBES if p <= nlist):
@@ -198,7 +198,7 @@ def main():
     parser.add_argument("--write-baseline", type=Path, help="save per-row recall to this JSON (requires --seed)")
     parser.add_argument("--check", type=Path, help="fail if recall drops below this baseline JSON (uses its dataset and seed)")
     parser.add_argument("--tolerance", type=float, default=0.02, help="allowed recall drop for --check")
-    parser.add_argument("--threads", type=int, default=0, help="threads for vecengine's parallel work; 0 = one per core")
+    parser.add_argument("--threads", type=int, default=0, help="threads for qann's parallel work; 0 = one per core")
     args = parser.parse_args()
 
     baseline = None
@@ -208,8 +208,8 @@ def main():
     if args.write_baseline and args.seed is None:
         parser.error("--write-baseline requires --seed")
 
-    ve.set_num_threads(args.threads)
-    print(f"threads: {ve.num_threads()}")
+    qann.set_num_threads(args.threads)
+    print(f"threads: {qann.num_threads()}")
     rows = run(args.dataset, args.max_queries, args.seed)
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
@@ -222,7 +222,7 @@ def main():
         sys.exit(0 if check_baseline(rows, baseline, args.tolerance) else 1)
 
     png_path = args.out_dir / f"{args.dataset}.png"
-    plot(rows, png_path, f"{args.dataset}: recall vs QPS", ve.num_threads())
+    plot(rows, png_path, f"{args.dataset}: recall vs QPS", qann.num_threads())
     print(f"wrote {png_path}")
 
 

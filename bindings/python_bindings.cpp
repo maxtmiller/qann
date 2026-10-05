@@ -166,8 +166,8 @@ static vecengine::Index* make_index_py(vecengine::IndexType type, std::size_t di
     return vecengine::make_index(type, dim, opts).release();
 }
 
-NB_MODULE(vecengine, m) {
-    m.doc() = "vecengine: high-performance vector distance routines";
+NB_MODULE(qann, m) {
+    m.doc() = "qann: Quantized Approximate Nearest Neighbors (Flat, IVF, PQ, re-ranking)";
 
     m.def("l2_distance", &batch_l2, nb::arg("a"), nb::arg("b"),
           "Squared L2 distance between rows of two (M, D) float32 arrays.");
