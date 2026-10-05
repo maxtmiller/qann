@@ -1,6 +1,6 @@
-# QANN
+# QaNN
 
-QANN (**Q**uantized  **N**earest **N**eighbors) is a C++20 vector search library (Flat, IVF, product quantization, exact re-ranking) with Python bindings.
+QaNN (**Q**uantized  **N**earest **N**eighbors) is a C++20 vector search library (Flat, IVF, product quantization, exact re-ranking) with Python bindings.
 
 ```bash
 pip install .
