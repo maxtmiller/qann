@@ -4,8 +4,8 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "qann"
-version = "0.1.0a1"
-description = "QANN: Quantized Approximate Nearest Neighbors. C++ vector search (Flat, IVF, PQ, re-ranking) with Python bindings"
+version = "0.1.0a2"
+description = "Fast nearest-neighbor vector search for Python: exact, IVF and product-quantized indexes with exact re-ranking, implemented in C++"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Maximilian Miller" }]

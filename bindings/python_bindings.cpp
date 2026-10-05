@@ -80,11 +80,11 @@ static void index_add(vecengine::Index &self, FloatMatrix data) {
 // Query k-NN for a single vector; returns (indices, distances) as 1D arrays
 // with one entry per result (int64, float32).
 static std::pair<NumpyArray<int64_t>, NumpyArray<float>>
-index_query(const vecengine::Index &self, FloatMatrix query, std::size_t k) {
-    if (query.shape(1) != self.dim())
+index_query(const vecengine::Index &self, FloatVector query, std::size_t k) {
+    if (query.shape(0) != self.dim())
         throw std::invalid_argument("query dimension does not match index dimension");
 
-    auto results = self.query(std::span<const float>(query.data(), query.shape(1)), k);
+    auto results = self.query(as_span(query), k);
 
     const std::size_t n = results.size();
     std::vector<int64_t> indices(n);
@@ -187,7 +187,7 @@ NB_MODULE(qann, m) {
     nb::class_<vecengine::FlatIndex, vecengine::Index>(m, "FlatIndex")
         .def(nb::init<std::size_t>(), nb::arg("dim"), "Construct FlatIndex with vector dimension")
         .def("add", &index_add, nb::arg("data"), "Add matrix of vectors to index")
-        .def("query", &index_query, nb::arg("query"), nb::arg("k"), "Query k-NN for a query vector; returns (indices, distances)")
+        .def("query", &index_query, nb::arg("query"), nb::arg("k"), "Query k-NN for a (dim,) vector; returns 1D (indices, distances)")
         .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), "Query k-NN for each row; returns (indices, distances) arrays of shape (num_queries, k), padded with -1 / inf")
         .def("size", &vecengine::Index::size, "Get number of indexed vectors")
         .def("dim", &vecengine::Index::dim, "Get vector dimension");
@@ -209,7 +209,7 @@ NB_MODULE(qann, m) {
         .def_prop_rw("pq_distance", &vecengine::IVFIndex::pq_distance, &vecengine::IVFIndex::set_pq_distance,
                      "How queries score PQ codes: PQDistance.ADC (default, more accurate) or PQDistance.SDC")
         .def("add", &index_add, nb::arg("data"), "Add matrix of vectors to index")
-        .def("query", &index_query, nb::arg("query"), nb::arg("k"), "Query k-NN for a query vector; returns (indices, distances)")
+        .def("query", &index_query, nb::arg("query"), nb::arg("k"), "Query k-NN for a (dim,) vector; returns 1D (indices, distances)")
         .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), "Query k-NN for each row; returns (indices, distances) arrays of shape (num_queries, k), padded with -1 / inf")
         .def("size", &vecengine::Index::size, "Get number of indexed vectors")
         .def("dim", &vecengine::Index::dim, "Get vector dimension");
@@ -223,7 +223,7 @@ NB_MODULE(qann, m) {
         .def_prop_rw("k_factor", &vecengine::RefineIndex::k_factor, &vecengine::RefineIndex::set_k_factor,
                      "Candidates fetched from base per result (k * k_factor)")
         .def("add", &index_add, nb::arg("data"), "Add matrix of vectors to base and raw storage")
-        .def("query", &index_query, nb::arg("query"), nb::arg("k"), "Query k-NN for a query vector; returns (indices, distances)")
+        .def("query", &index_query, nb::arg("query"), nb::arg("k"), "Query k-NN for a (dim,) vector; returns 1D (indices, distances)")
         .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), "Query k-NN for each row; returns (indices, distances) arrays of shape (num_queries, k), padded with -1 / inf")
         .def("size", &vecengine::Index::size, "Get number of indexed vectors")
         .def("dim", &vecengine::Index::dim, "Get vector dimension");

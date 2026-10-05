@@ -24,6 +24,16 @@ def test_flat_finds_self(data):
     np.testing.assert_allclose(dists[:, 0], 0, atol=1e-4)
 
 
+def test_query_takes_1d_vector(data):
+    index = qann.FlatIndex(32)
+    index.add(data)
+    ids, dists = index.query(data[3], 5)
+    assert ids.shape == (5,) and dists.shape == (5,)
+    assert ids[0] == 3
+    with pytest.raises(TypeError):
+        index.query(data[3:4], 5)
+
+
 def test_ivf_pq_refine_finds_self(data):
     ivf = qann.IVFIndex(32, nlist=100, nprobe=20)
     ivf.enable_pq(8)
