@@ -4,13 +4,20 @@ Run from the repo root after a Release build:
     PYTHONPATH=build python3 benchmarks/bench_indexes.py                  # siftsmall
     PYTHONPATH=build python3 benchmarks/bench_indexes.py --dataset sift   # SIFT1M
 
+Recall regression gate (used by CI): --write-baseline saves recall for every
+row with a fixed seed; --check fails if any row's recall drops below it.
+    PYTHONPATH=build python3 benchmarks/bench_indexes.py --seed 1 --write-baseline benchmarks/baseline_siftsmall.json
+    PYTHONPATH=build python3 benchmarks/bench_indexes.py --check benchmarks/baseline_siftsmall.json
+
 Datasets go in benchmarks/data/<name>/ (see ftp://ftp.irisa.fr/local/texmex/corpus/).
-Everything is single-threaded.
+batch_query and PQ training run on all cores (detail::parallel_for); add uses add_batch.
 """
 
 import argparse
 import csv
+import json
 import math
+import sys
 import time
 from pathlib import Path
 
@@ -44,7 +51,7 @@ def load_dataset(name: str):
 
 
 def recall_at_k(ids_per_query, gt: np.ndarray, k: int) -> float:
-    hits = sum(len(set(ids[:k]) & set(gt[i, :k].tolist())) for i, ids in enumerate(ids_per_query))
+    hits = sum(len(set(ids[:k].tolist()) & set(gt[i, :k].tolist())) for i, ids in enumerate(ids_per_query))
     return hits / (len(ids_per_query) * k)
 
 
@@ -54,19 +61,19 @@ def time_queries(index, queries: np.ndarray, k: int, repeats: int = 3):
     best = math.inf
     for _ in range(repeats):
         start = time.perf_counter()
-        results = index.batch_query(queries, k)
+        ids, _ = index.batch_query(queries, k)
         best = min(best, time.perf_counter() - start)
-    return [ids for ids, _ in results], len(queries) / best
+    return ids, len(queries) / best
 
 
-def build_ivf(dim, nlist, base, learn, pq_m=None):
+def build_ivf(dim, nlist, base, learn, pq_m=None, seed=None):
     # With PQ, vectors are added through a RefineIndex so one build serves both
     # the plain PQ rows (query idx) and the re-ranked rows (query refine).
     idx = ve.IVFIndex(dim, nlist)
     if pq_m is not None:
         idx.enable_pq(pq_m)
     start = time.perf_counter()
-    idx.train(learn)
+    idx.train(learn, seed=seed)
     train_s = time.perf_counter() - start
     refine = ve.RefineIndex(idx) if pq_m is not None else None
     start = time.perf_counter()
@@ -75,7 +82,7 @@ def build_ivf(dim, nlist, base, learn, pq_m=None):
     return idx, refine, train_s, add_s
 
 
-def run(dataset: str, max_queries: int | None):
+def run(dataset: str, max_queries: int | None, seed: int | None = None):
     base, learn, queries, gt = load_dataset(dataset)
     if max_queries:
         queries, gt = queries[:max_queries], gt[:max_queries]
@@ -101,7 +108,7 @@ def run(dataset: str, max_queries: int | None):
 
     configs = [("IVF", None)] + [(f"IVF-PQ{m}", m) for m in PQ_SUBSPACES]
     for name, m in configs:
-        idx, refine, train_s, add_s = build_ivf(dim, nlist, base, learn, m)
+        idx, refine, train_s, add_s = build_ivf(dim, nlist, base, learn, m, seed)
         print(f"{name}  (train {train_s:.1f}s, add {add_s:.1f}s)")
         bytes_per_vec = (dim * 4 if m is None else m) + 4  # + uint32 id
         modes = [("", None)] if m is None else [("-ADC", ve.PQDistance.ADC), ("-SDC", ve.PQDistance.SDC)]
@@ -146,7 +153,7 @@ def plot(rows, path: Path, title: str):
         ax.plot(xs, ys, marker="o", markersize=3 if len(pts) > 1 else 6, label=name)
     ax.set_yscale("log")
     ax.set_xlabel(f"recall@{K}")
-    ax.set_ylabel("queries / second (single thread, log)")
+    ax.set_ylabel("queries / second (all cores, log)")
     ax.set_title(title)
     ax.grid(True, which="both", alpha=0.3)
     ax.legend(fontsize=8)
@@ -154,20 +161,65 @@ def plot(rows, path: Path, title: str):
     fig.savefig(path, dpi=150)
 
 
+def row_key(r) -> str:
+    return f"{r['index']} {r['params']}"
+
+
+def write_baseline(rows, path: Path, dataset: str, seed: int):
+    recall = {row_key(r): round(r["recall"], 4) for r in rows}
+    path.write_text(json.dumps({"dataset": dataset, "seed": seed, "recall": recall}, indent=2) + "\n")
+    print(f"wrote baseline {path}")
+
+
+def check_baseline(rows, baseline: dict, tolerance: float) -> bool:
+    current = {row_key(r): r["recall"] for r in rows}
+    failures = []
+    for key, expected in baseline["recall"].items():
+        got = current.get(key)
+        if got is None:
+            failures.append(f"  {key}: missing from this run")
+        elif got < expected - tolerance:
+            failures.append(f"  {key}: recall {got:.4f} < baseline {expected:.4f} - {tolerance}")
+    if failures:
+        print(f"recall regression ({len(failures)} rows):")
+        print("\n".join(failures))
+        return False
+    print(f"recall check passed: {len(baseline['recall'])} rows within {tolerance} of baseline")
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="siftsmall", help="siftsmall or sift")
     parser.add_argument("--max-queries", type=int, default=None, help="use only the first N queries")
+    parser.add_argument("--seed", type=int, default=None, help="seed k-means for reproducible recall")
+    parser.add_argument("--out-dir", type=Path, default=RESULTS_DIR, help="where to write the CSV and plot")
+    parser.add_argument("--write-baseline", type=Path, help="save per-row recall to this JSON (requires --seed)")
+    parser.add_argument("--check", type=Path, help="fail if recall drops below this baseline JSON (uses its dataset and seed)")
+    parser.add_argument("--tolerance", type=float, default=0.02, help="allowed recall drop for --check")
     args = parser.parse_args()
 
-    rows = run(args.dataset, args.max_queries)
+    baseline = None
+    if args.check:
+        baseline = json.loads(args.check.read_text())
+        args.dataset, args.seed = baseline["dataset"], baseline["seed"]
+    if args.write_baseline and args.seed is None:
+        parser.error("--write-baseline requires --seed")
 
-    RESULTS_DIR.mkdir(exist_ok=True)
-    csv_path = RESULTS_DIR / f"{args.dataset}.csv"
-    png_path = RESULTS_DIR / f"{args.dataset}.png"
+    rows = run(args.dataset, args.max_queries, args.seed)
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = args.out_dir / f"{args.dataset}.csv"
     write_csv(rows, csv_path)
+    print(f"wrote {csv_path}")
+    if args.write_baseline:
+        write_baseline(rows, args.write_baseline, args.dataset, args.seed)
+    if baseline is not None:
+        sys.exit(0 if check_baseline(rows, baseline, args.tolerance) else 1)
+
+    png_path = args.out_dir / f"{args.dataset}.png"
     plot(rows, png_path, f"{args.dataset}: recall vs QPS")
-    print(f"wrote {csv_path} and {png_path}")
+    print(f"wrote {png_path}")
 
 
 if __name__ == "__main__":

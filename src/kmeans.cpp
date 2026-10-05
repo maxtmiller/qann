@@ -10,19 +10,25 @@
 #include <algorithm>
 #include <numeric>
 #include <utility>
+#include <queue>
 
-#ifdef VECENGINE_USE_ACCELERATE
+#ifdef VECENGINE_USE_BLAS
+#ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>
+#endif
 #endif
 
 namespace vecengine::detail {
 
 using std::size_t;
 using std::vector;
+using std::pair;
 
 
 void assign_nearest(const float* data, size_t n, size_t stride, const float* centroids, size_t k, size_t d, uint32_t* out) {
-    #ifdef VECENGINE_USE_ACCELERATE
+    #ifdef VECENGINE_USE_BLAS
         // Compute norm_sq[c] = ||c||^2 for each centroid
         std::vector<float> cent_norms(k, 0.0f);
         for (size_t i = 0; i < k; ++i) {
@@ -35,7 +41,7 @@ void assign_nearest(const float* data, size_t n, size_t stride, const float* cen
         }
 
         // Scratchpad buffer for block matrix multiplication
-        constexpr size_t B = 1024; // Block size
+        constexpr size_t B = 1024;
         std::vector<float> dots(B * k);
 
         // Process in blocks of B points
@@ -43,7 +49,6 @@ void assign_nearest(const float* data, size_t n, size_t stride, const float* cen
             size_t b = std::min(B, n - i);
 
             // Compute dots = data_block * centroids^T
-            // Result matrix 'dots' has dimensions (b x k)
             cblas_sgemm(
                 CblasRowMajor, CblasNoTrans, CblasTrans,
                 static_cast<int>(b), static_cast<int>(k), static_cast<int>(d),
@@ -93,11 +98,68 @@ size_t nearest_centroid(const float* point, const float* centroids, size_t k, si
     return closest.second;
 }
 
-KMeansResult kmeans(const float* data, size_t n, size_t stride, size_t d, size_t k, size_t max_iters) {
+void reseed_empty_clusters(const float* data, size_t n, size_t stride, size_t dim, float* centroids, size_t k, const std::vector<uint32_t>& assignments, std::vector<size_t>& cluster_sizes) {
+    
+    // track indicies of empty clusters
+    std::vector<size_t> empty_clusters;
+    for (size_t i = 0; i < k; ++i) {
+        if (cluster_sizes[i] == 0) {
+            empty_clusters.emplace_back(i);
+        }
+    }
+    if (empty_clusters.empty()) return;
+
+    // get empty_clusters.size() furthest vectors
+    size_t empty_num = empty_clusters.size();
+    std::priority_queue<pair<float, size_t>, std::vector<pair<float, size_t>>, std::greater<pair<float, size_t>>> minHeapVectors;
+    for (size_t i = 0; i < n; ++i) {
+        float dist = l2_distance(data + i * stride, centroids + assignments[i] * dim, dim);
+        if (dist < 1e-6f) continue;
+
+        if (minHeapVectors.size() < empty_num) {
+            minHeapVectors.emplace(dist, i);
+        } else if (dist > minHeapVectors.top().first) {
+            minHeapVectors.pop();
+            minHeapVectors.emplace(dist, i);
+        }
+    }
+
+    // update empty centroids with furthest vectors; fallback to picking a vector from largest cluster
+    for (size_t i = 0; i < empty_num; ++i) {
+        if (!minHeapVectors.empty()) {
+            auto [distance, index] = minHeapVectors.top();
+            minHeapVectors.pop();
+            std::copy_n(data + index * stride, dim, centroids + empty_clusters[i] * dim);
+        } else {
+            // find largest cluster
+            size_t largest_c = std::distance(
+                cluster_sizes.begin(),
+                std::max_element(cluster_sizes.begin(), cluster_sizes.end())
+            );
+
+            // get pointer to largest cluster centroid and empty cluster centroid
+            const float eps = 1.0f / 1024.0f;
+            float* src = centroids + largest_c * dim;
+            float* dst = centroids + empty_clusters[i] * dim;
+
+            // push both clusters away from each other
+            for (size_t j = 0; j < dim; ++j) {
+                dst[j] = src[j] * (1.0f + eps);
+                src[j] *= (1.0f - eps);
+            }
+
+            // update cluster sizes so next empty cluster chooses largest cluster after split
+            cluster_sizes[empty_clusters[i]] = cluster_sizes[largest_c] / 2;
+            cluster_sizes[largest_c] -= cluster_sizes[empty_clusters[i]];
+        }
+    }
+}
+
+KMeansResult kmeans(const float* data, size_t n, size_t stride, size_t d, size_t k, size_t max_iters,
+                    std::optional<uint32_t> seed) {
     if (n < k) throw std::invalid_argument("kmeans: need at least k points");
 
-    std::random_device rd;
-    std::mt19937 rng(rd());
+    std::mt19937 rng(seed ? *seed : std::random_device{}());
 
     vector<size_t> indices(n);
     std::iota(indices.begin(), indices.end(), 0);
@@ -151,26 +213,11 @@ KMeansResult kmeans(const float* data, size_t n, size_t stride, size_t d, size_t
                 for (size_t l = 0; l < d; ++l) {
                     sum_ptr[l] /= count;
                 }
-            } else {
-                size_t worst_vec_idx = 0;
-                float max_loss = -1.0f;
-
-                // assign empty centroid with vector furthest away from all other vectors
-                for (size_t l = 0; l < n; ++l) {
-                    uint32_t current_cluster = assignments[l];
-                    const float* vec_ptr = data + (l * stride);
-                    const float* centroid_ptr = test_centroids.data() + (current_cluster * d);
-                    
-                    float dist = l2_distance(vec_ptr, centroid_ptr, d);
-                    if (dist > max_loss && dist > 1e-6f) {
-                        max_loss = dist;
-                        worst_vec_idx = l;
-                    }
-                }
-
-                std::copy_n(data + worst_vec_idx * stride, d, new_centroids.data() + (j * d));
             }
         }
+
+        // reseed empty clusters with furthest vectors
+        reseed_empty_clusters(data, n, stride, d, new_centroids.data(), k, assignments, count_vector);
 
         test_centroids = std::move(new_centroids);
     }

@@ -1,8 +1,11 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <nanobind/stl/vector.h>
+#include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
 
+#include <cstdint>
+#include <limits>
 #include <span>
 
 #include "vecengine/distance.hpp"
@@ -22,9 +25,21 @@ using ByteVector = nb::ndarray<uint8_t, nb::ndim<1>, nb::c_contig, nb::device::c
 static std::span<const float> as_span(FloatVector v) { return {v.data(), v.shape(0)}; }
 static std::span<const uint8_t> as_span(ByteVector v) { return {v.data(), v.shape(0)}; }
 
+template <class T>
+using NumpyArray = nb::ndarray<nb::numpy, T>;
+
+// Moves v into a NumPy array of the given shape without copying; the
+// capsule frees the vector when Python drops the array.
+template <class T>
+static NumpyArray<T> to_numpy(std::vector<T> v, std::initializer_list<std::size_t> shape) {
+    auto* owned = new std::vector<T>(std::move(v));
+    nb::capsule owner(owned, [](void* p) noexcept { delete static_cast<std::vector<T>*>(p); });
+    return NumpyArray<T>(owned->data(), shape, owner);
+}
+
 // Compute pairwise L2 distances between rows of two matrices (M x D each).
-// Returns a length-M vector of squared L2 distances.
-static std::vector<float> batch_l2(FloatMatrix a, FloatMatrix b) {
+// Returns a length-M array of squared L2 distances.
+static NumpyArray<float> batch_l2(FloatMatrix a, FloatMatrix b) {
     if (a.shape(0) != b.shape(0) || a.shape(1) != b.shape(1))
         throw std::invalid_argument("a and b must have the same shape");
 
@@ -35,11 +50,11 @@ static std::vector<float> batch_l2(FloatMatrix a, FloatMatrix b) {
     for (std::size_t i = 0; i < M; ++i)
         out[i] = vecengine::l2_distance(a.data() + i * D, b.data() + i * D, D);
 
-    return out;
+    return to_numpy(std::move(out), {M});
 }
 
 // Compute pairwise cosine distances between rows of two matrices (M x D each).
-static std::vector<float> batch_cosine(FloatMatrix a, FloatMatrix b) {
+static NumpyArray<float> batch_cosine(FloatMatrix a, FloatMatrix b) {
     if (a.shape(0) != b.shape(0) || a.shape(1) != b.shape(1))
         throw std::invalid_argument("a and b must have the same shape");
 
@@ -50,7 +65,7 @@ static std::vector<float> batch_cosine(FloatMatrix a, FloatMatrix b) {
     for (std::size_t i = 0; i < M; ++i)
         out[i] = vecengine::cosine_distance(a.data() + i * D, b.data() + i * D, D);
 
-    return out;
+    return to_numpy(std::move(out), {M});
 }
 
 // Add all rows of a (N x dim) matrix to the index.
@@ -58,77 +73,75 @@ static void index_add(vecengine::Index &self, FloatMatrix data) {
     if (data.shape(1) != self.dim())
         throw std::invalid_argument("vector dimension does not match index dimension");
 
-    const std::size_t N = data.shape(0);
-    const std::size_t D = data.shape(1);
-    for (std::size_t i = 0; i < N; ++i)
-        self.add(std::span<const float>(data.data() + i * D, D));
+    self.add_batch(std::span<const float>(data.data(), data.size()), data.shape(0));
 }
 
-// Query k-NN for a single vector; returns (indices, distances).
-static std::pair<std::vector<std::size_t>, std::vector<float>>
+// Query k-NN for a single vector; returns (indices, distances) as 1D arrays
+// with one entry per result (int64, float32).
+static std::pair<NumpyArray<int64_t>, NumpyArray<float>>
 index_query(const vecengine::Index &self, FloatMatrix query, std::size_t k) {
     if (query.shape(1) != self.dim())
         throw std::invalid_argument("query dimension does not match index dimension");
 
     auto results = self.query(std::span<const float>(query.data(), query.shape(1)), k);
 
-    std::vector<std::size_t> indices(results.size());
-    std::vector<float> distances(results.size());
-    for (std::size_t i = 0; i < results.size(); ++i) {
-        indices[i] = results[i].index;
+    const std::size_t n = results.size();
+    std::vector<int64_t> indices(n);
+    std::vector<float> distances(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        indices[i] = static_cast<int64_t>(results[i].index);
         distances[i] = results[i].distance;
     }
-    return {indices, distances};
+    return {to_numpy(std::move(indices), {n}), to_numpy(std::move(distances), {n})};
 }
 
-// Query k-NN for a single vector; returns (indices, distances).
-static std::vector<std::pair<std::vector<std::size_t>, std::vector<float>>>
+// Query k-NN for each row; returns (indices, distances) as (num_queries, k)
+// arrays. Rows with fewer than k results are padded with -1 / inf.
+static std::pair<NumpyArray<int64_t>, NumpyArray<float>>
 index_batch_query(const vecengine::Index &self, FloatMatrix query, std::size_t k) {
     if (query.shape(1) != self.dim())
         throw std::invalid_argument("query dimension does not match index dimension");
 
     const std::size_t num_queries = query.shape(0);
     auto results = self.query_batch(std::span<const float>(query.data(), query.size()), num_queries, k);
-    
-    std::vector<std::pair<std::vector<std::size_t>, std::vector<float>>> batch;
-    batch.reserve(num_queries);
-    for (std::size_t i = 0; i < results.size(); ++i) {
-        std::vector<std::size_t> indices(results[i].size());
-        std::vector<float> distances(results[i].size());
+
+    std::vector<int64_t> indices(num_queries * k, -1);
+    std::vector<float> distances(num_queries * k, std::numeric_limits<float>::infinity());
+    for (std::size_t i = 0; i < num_queries; ++i) {
         for (std::size_t j = 0; j < results[i].size(); ++j) {
-            indices[j] = results[i][j].index;
-            distances[j] = results[i][j].distance;
+            indices[i * k + j] = static_cast<int64_t>(results[i][j].index);
+            distances[i * k + j] = results[i][j].distance;
         }
-        batch.emplace_back(indices, distances);
     }
-    return batch;
+    return {to_numpy(std::move(indices), {num_queries, k}), to_numpy(std::move(distances), {num_queries, k})};
 }
 
 // Train an IVFIndex's coarse centroids from a (N x dim) matrix of sample vectors.
-static void ivf_train(vecengine::IVFIndex &self, FloatMatrix data, std::size_t max_iters) {
+static void ivf_train(vecengine::IVFIndex &self, FloatMatrix data, std::size_t max_iters, std::optional<uint32_t> seed) {
     if (data.shape(1) != self.dim())
         throw std::invalid_argument("training vector dimension does not match index dimension");
-    self.train(std::span<const float>(data.data(), data.size()), data.shape(0), max_iters);
+    self.train(std::span<const float>(data.data(), data.size()), data.shape(0), max_iters, seed);
 }
 
-static void pq_train(vecengine::PQCodebook &self, FloatMatrix data, std::size_t max_iters) {
+static void pq_train(vecengine::PQCodebook &self, FloatMatrix data, std::size_t max_iters, std::optional<uint32_t> seed) {
     if (data.shape(1) != self.dim())
         throw std::invalid_argument("training vector dimension does not match codebook dimension");
-    self.train(std::span<const float>(data.data(), data.size()), data.shape(0), max_iters);
+    self.train(std::span<const float>(data.data(), data.size()), data.shape(0), max_iters, seed);
 }
 
-static std::vector<uint8_t> pq_encode(const vecengine::PQCodebook &self, FloatVector vec) {
+static NumpyArray<uint8_t> pq_encode(const vecengine::PQCodebook &self, FloatVector vec) {
     if (vec.shape(0) != self.dim())
         throw std::invalid_argument("vector dimension does not match codebook dimension");
-    return self.encode(as_span(vec));
+    return to_numpy(self.encode(as_span(vec)), {self.num_subspaces()});
 }
 
-static std::vector<float> pq_compute_adc_table(const vecengine::PQCodebook &self, FloatVector query) {
+static NumpyArray<float> pq_compute_adc_table(const vecengine::PQCodebook &self, FloatVector query) {
     if (query.shape(0) != self.dim())
         throw std::invalid_argument("query dimension does not match codebook dimension");
-    std::vector<float> table(self.num_subspaces() * self.centroids_per_subspace());
+    const std::size_t size = self.num_subspaces() * self.centroids_per_subspace();
+    std::vector<float> table(size);
     self.compute_adc_table(as_span(query), table);
-    return table;
+    return to_numpy(std::move(table), {size});
 }
 
 static float pq_distance_adc(const vecengine::PQCodebook &self, FloatVector table, ByteVector code) {
@@ -167,7 +180,7 @@ NB_MODULE(vecengine, m) {
         .def(nb::init<std::size_t>(), nb::arg("dim"), "Construct FlatIndex with vector dimension")
         .def("add", &index_add, nb::arg("data"), "Add matrix of vectors to index")
         .def("query", &index_query, nb::arg("query"), nb::arg("k"), "Query k-NN for a query vector; returns (indices, distances)")
-        .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), "Query k-NN for multiple query vectors; returns list of (indices, distances)")
+        .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), "Query k-NN for each row; returns (indices, distances) arrays of shape (num_queries, k), padded with -1 / inf")
         .def("size", &vecengine::Index::size, "Get number of indexed vectors")
         .def("dim", &vecengine::Index::dim, "Get vector dimension");
 
@@ -178,7 +191,7 @@ NB_MODULE(vecengine, m) {
     nb::class_<vecengine::IVFIndex, vecengine::Index>(m, "IVFIndex")
         .def(nb::init<std::size_t, std::size_t, std::size_t>(), nb::arg("dim"), nb::arg("nlist"), nb::arg("nprobe") = 10,
              "Construct IVFIndex with vector dimension, number of coarse clusters, and search breadth")
-        .def("train", &ivf_train, nb::arg("data"), nb::arg("max_iters") = 25,
+        .def("train", &ivf_train, nb::arg("data"), nb::arg("max_iters") = 25, nb::arg("seed") = nb::none(),
              "Run k-means over sample vectors to compute coarse centroids")
         .def("enable_pq", &vecengine::IVFIndex::enable_pq,
              nb::arg("num_subspaces"), nb::arg("centroids_per_subspace") = 256,
@@ -189,7 +202,7 @@ NB_MODULE(vecengine, m) {
                      "How queries score PQ codes: PQDistance.ADC (default, more accurate) or PQDistance.SDC")
         .def("add", &index_add, nb::arg("data"), "Add matrix of vectors to index")
         .def("query", &index_query, nb::arg("query"), nb::arg("k"), "Query k-NN for a query vector; returns (indices, distances)")
-        .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), "Query k-NN for multiple query vectors; returns list of (indices, distances)")
+        .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), "Query k-NN for each row; returns (indices, distances) arrays of shape (num_queries, k), padded with -1 / inf")
         .def("size", &vecengine::Index::size, "Get number of indexed vectors")
         .def("dim", &vecengine::Index::dim, "Get vector dimension");
 
@@ -203,7 +216,7 @@ NB_MODULE(vecengine, m) {
                      "Candidates fetched from base per result (k * k_factor)")
         .def("add", &index_add, nb::arg("data"), "Add matrix of vectors to base and raw storage")
         .def("query", &index_query, nb::arg("query"), nb::arg("k"), "Query k-NN for a query vector; returns (indices, distances)")
-        .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), "Query k-NN for multiple query vectors; returns list of (indices, distances)")
+        .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), "Query k-NN for each row; returns (indices, distances) arrays of shape (num_queries, k), padded with -1 / inf")
         .def("size", &vecengine::Index::size, "Get number of indexed vectors")
         .def("dim", &vecengine::Index::dim, "Get vector dimension");
 
@@ -223,7 +236,7 @@ NB_MODULE(vecengine, m) {
         .def(nb::init<std::size_t, std::size_t, std::size_t>(),
              nb::arg("dim"), nb::arg("num_subspaces"), nb::arg("centroids_per_subspace") = 256,
              "Construct a PQ codebook; dim must be divisible by num_subspaces")
-        .def("train", &pq_train, nb::arg("data"), nb::arg("max_iters") = 25,
+        .def("train", &pq_train, nb::arg("data"), nb::arg("max_iters") = 25, nb::arg("seed") = nb::none(),
              "Run per-subspace k-means over (N, dim) float32 vectors and build the SDC table")
         .def("encode", &pq_encode, nb::arg("vec"), "Encode a (dim,) vector into num_subspaces uint8 codes")
         .def("compute_adc_table", &pq_compute_adc_table, nb::arg("query"),

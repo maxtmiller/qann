@@ -10,6 +10,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ---------------------------------------------------------------------------
 include(FetchContent)
 
+# Off for Python wheel builds (pyproject.toml) so they skip fetching and
+# compiling Catch2 and Google Benchmark.
+option(VECENGINE_BUILD_TESTS "Build C++ tests and microbenchmarks" ON)
+
 FetchContent_Declare(
   Catch2
   GIT_REPOSITORY https://github.com/catchorg/Catch2.git
@@ -33,7 +37,11 @@ FetchContent_Declare(
   GIT_TAG        v1.9.2
 )
 
-FetchContent_MakeAvailable(Catch2 benchmark nanobind)
+if(VECENGINE_BUILD_TESTS)
+  FetchContent_MakeAvailable(Catch2 benchmark nanobind)
+else()
+  FetchContent_MakeAvailable(nanobind)
+endif()
 
 # ---------------------------------------------------------------------------
 # Compiler flags
@@ -57,6 +65,7 @@ endif()
 # ---------------------------------------------------------------------------
 add_library(vecengine_core STATIC
   src/distance.cpp
+  src/index.cpp
   src/flat_index.cpp
   src/ivf_index.cpp
   src/pq.cpp
@@ -72,13 +81,27 @@ target_include_directories(vecengine_core PUBLIC
 
 target_compile_features(vecengine_core PUBLIC cxx_std_20)
 
-# Accelerate's cblas_sgemm runs on Apple's matrix unit; k-means assignment uses
-# it when available. PUBLIC link: anything linking the static lib needs it too.
+# k-means assignment uses cblas_sgemm when available: Accelerate on Apple (runs
+# on the matrix unit), otherwise any BLAS that ships cblas.h (e.g. OpenBLAS).
+# Without one it falls back to a scalar scan. PUBLIC link: anything linking the
+# static lib needs it too.
 if(APPLE)
   target_link_libraries(vecengine_core PUBLIC "-framework Accelerate")
-  target_compile_definitions(vecengine_core PRIVATE VECENGINE_USE_ACCELERATE ACCELERATE_NEW_LAPACK)
+  target_compile_definitions(vecengine_core PRIVATE VECENGINE_USE_BLAS ACCELERATE_NEW_LAPACK)
+else()
+  find_package(BLAS)
+  find_path(CBLAS_INCLUDE_DIR cblas.h PATH_SUFFIXES openblas)
+  if(BLAS_FOUND AND CBLAS_INCLUDE_DIR)
+    message(STATUS "vecengine: using BLAS (${BLAS_LIBRARIES}) with ${CBLAS_INCLUDE_DIR}/cblas.h")
+    target_link_libraries(vecengine_core PUBLIC BLAS::BLAS)
+    target_include_directories(vecengine_core PRIVATE ${CBLAS_INCLUDE_DIR})
+    target_compile_definitions(vecengine_core PRIVATE VECENGINE_USE_BLAS)
+  else()
+    message(STATUS "vecengine: no BLAS with cblas.h found; k-means assignment uses the scalar fallback")
+  endif()
 endif()
 
+if(VECENGINE_BUILD_TESTS)
 # ---------------------------------------------------------------------------
 # Unit tests (Catch2 v3)
 # ---------------------------------------------------------------------------
@@ -90,6 +113,9 @@ target_link_libraries(test_vecengine PRIVATE
   vecengine_core
   Catch2::Catch2WithMain
 )
+
+# Lets tests reach internal headers like parallel.hpp.
+target_include_directories(test_vecengine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 include(CTest)
 include(Catch)
@@ -106,6 +132,7 @@ target_link_libraries(bench_vecengine PRIVATE
   vecengine_core
   benchmark::benchmark
 )
+endif()
 
 # ---------------------------------------------------------------------------
 # Python bindings (nanobind)
@@ -121,3 +148,9 @@ target_link_libraries(vecengine_py PRIVATE vecengine_core)
 set_target_properties(vecengine_py PROPERTIES
   OUTPUT_NAME "vecengine"
 )
+
+# scikit-build-core sets SKBUILD; the module goes at the wheel root so
+# `import vecengine` finds it.
+if(SKBUILD)
+  install(TARGETS vecengine_py LIBRARY DESTINATION .)
+endif()

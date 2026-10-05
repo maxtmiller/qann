@@ -49,18 +49,4 @@ vector<Neighbor> FlatIndex::query(span<const float> vec, size_t k) const {
     return results;
 }
 
-vector<vector<Neighbor>> FlatIndex::query_batch(span<const float> queries, size_t num_queries, size_t k) const {
-    assert(queries.size() == num_queries * dim_);
-
-    vector<vector<Neighbor>> results;
-    results.reserve(num_queries);
-    for (size_t i = 0; i < num_queries; ++i) {
-        span<const float> row(queries.data() + i * dim_, dim_);
-        results.emplace_back(query(row, k));
-    }
-
-    return results;
-}
-
-
 }

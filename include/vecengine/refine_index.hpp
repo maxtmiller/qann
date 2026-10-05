@@ -25,8 +25,8 @@ public:
     explicit RefineIndex(Index& base, size_t k_factor = 10);
 
     void add(span<const float> vec) override;
+    void add_batch(span<const float> vecs, size_t n) override;
     vector<Neighbor> query(span<const float> vec, size_t k) const override;
-    vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k) const override;
 
     size_t size() const noexcept override { return count_; }
     size_t dim() const noexcept override { return base_.dim(); }

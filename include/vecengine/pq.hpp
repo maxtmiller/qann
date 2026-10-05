@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <vector>
 #include <span>
 #include <cassert>
@@ -28,7 +29,9 @@ public:
 
     // Runs k-means independently within each subspace to learn centroids_,
     // then (always) builds sdc_table_ from the resulting centroids.
-    void train(span<const float> vectors, size_t num_vectors, size_t max_iters = 25);
+    // A seed makes training reproducible; subspace i uses seed + i.
+    void train(span<const float> vectors, size_t num_vectors, size_t max_iters = 25,
+               std::optional<uint32_t> seed = std::nullopt);
 
     // Encodes one full vector into num_subspaces_ codes (one byte each).
     vector<uint8_t> encode(span<const float> vec) const;

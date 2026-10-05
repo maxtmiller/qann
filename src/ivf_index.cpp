@@ -2,6 +2,8 @@
 #include "vecengine/distance.hpp"
 #include "vecengine/pq.hpp"
 #include "kmeans.hpp"
+#include "parallel.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -61,6 +63,44 @@ void IVFIndex::add(span<const float> vec) {
         list.codes.insert(list.codes.end(), code.begin(), code.end());
     } else {
         list.vecs.insert(list.vecs.end(), vec.begin(), vec.end());
+    }
+}
+
+void IVFIndex::add_batch(span<const float> vecs, size_t n) {
+    assert(vecs.size() == n * dim());
+    if (!trained_) throw std::logic_error("train() has not be run yet");
+
+    vector<uint32_t> assign(n);
+    detail::assign_nearest(vecs.data(), n, dim_, coarse_centroids_.data(), nlist_, dim_, assign.data());
+
+    const bool use_pq = pq_enabled();
+    const size_t code_bytes = use_pq ? pq_->num_subspaces() : 0;
+    
+    vector<uint8_t> codes(use_pq ? n * code_bytes : 0);
+
+    if (use_pq) {
+        detail::parallel_for(n, [&](size_t i) {
+            const float* src_vec = vecs.data() + i * dim_;
+            const float* centroid = coarse_centroids_.data() + assign[i] * dim_;
+
+            vector<float> residual(dim_);
+            for (size_t d = 0; d < dim_; ++d) residual[d] = src_vec[d] - centroid[d];
+
+            auto code = pq_->encode(residual);
+            std::copy_n(code.data(), code_bytes, codes.data() + i * code_bytes);
+        });
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        InvertedList& list = data_[static_cast<uint16_t>(assign[i])];
+        list.ids.push_back(n_total_++);
+
+        if (use_pq) {
+            list.codes.insert(list.codes.end(), codes.begin() + i * code_bytes, codes.begin() + (i + 1) * code_bytes);
+        } else {
+            const float* src = vecs.data() + i * dim_;
+            list.vecs.insert(list.vecs.end(), src, src + dim_);
+        }
     }
 }
 
@@ -151,26 +191,13 @@ vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
     return results;
 }
 
-vector<vector<Neighbor>> IVFIndex::query_batch(span<const float> queries, size_t num_queries, size_t k) const {
-    assert(queries.size() == num_queries * dim_);
-
-    vector<vector<Neighbor>> results;
-    results.reserve(num_queries);
-    for (size_t i = 0; i < num_queries; ++i) {
-        span<const float> row(queries.data() + i * dim_, dim_);
-        results.emplace_back(query(row, k));
-    }
-
-    return results;
-}
-
-void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_iters) {
+void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_iters, std::optional<uint32_t> seed) {
     if (n_total_ > 0) throw std::logic_error("train() cannot be called after add()");
     if (trained_) throw std::logic_error("train() has already been called");
     if (num_vectors < nlist_) throw std::invalid_argument("training set must have at least nlist vectors");
 
     // run kmeans
-    auto res = vecengine::detail::kmeans(vectors.data(), num_vectors, dim_, dim_, nlist_, max_iters);
+    auto res = vecengine::detail::kmeans(vectors.data(), num_vectors, dim_, dim_, nlist_, max_iters, seed);
     coarse_centroids_ = std::move(res.centroids);
 
     // calculate residuals and run kmeans again on each subspace
@@ -185,7 +212,7 @@ void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_i
             }
         }
 
-        pq_->train(residuals, num_vectors, max_iters);
+        pq_->train(residuals, num_vectors, max_iters, seed ? std::optional<uint32_t>(*seed + 1) : std::nullopt);
     }
     trained_ = true;
 }

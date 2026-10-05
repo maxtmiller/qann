@@ -6,8 +6,14 @@
 #include "vecengine/ivf_index.hpp"
 #include "vecengine/pq.hpp"
 #include "vecengine/refine_index.hpp"
+#include "kmeans.hpp"
+#include "parallel.hpp"
 
+#include <atomic>
 #include <cmath>
+#include <set>
+#include <stdexcept>
+#include <utility>
 #include <vector>
 #include <random>
 #include <algorithm>
@@ -145,6 +151,85 @@ TEST_CASE("FlatIndex: query_batch preserves query order", "[index][batch]") {
     REQUIRE(batch_res[1][0].index == 0); // a is closest to second query (a itself)
 }
 
+// ---------------------------------------------------------------------------
+// k-means empty-cluster reseeding
+// ---------------------------------------------------------------------------
+
+// Points are rows of 4 floats; clustering uses the 2-float slice at offset 2
+// (stride 4, dim 2), like a PQ subspace. Columns 0-1 hold 999 so reading
+// with the wrong stride or offset would show up in the reseeded centroids.
+static std::vector<float> strided_points(const std::vector<std::pair<float, float>>& slices) {
+    std::vector<float> data;
+    for (auto [x, y] : slices) data.insert(data.end(), {999.0f, 999.0f, x, y});
+    return data;
+}
+
+TEST_CASE("reseed_empty_clusters: empty clusters get the furthest distinct points", "[kmeans]") {
+    auto data = strided_points({{0, 0}, {1, 0}, {10, 0}, {0, 20}, {0.5f, 0}, {0, 0}});
+    std::vector<float> centroids = {0, 0,  -1, -1,  -1, -1};
+    std::vector<uint32_t> assignments(6, 0);
+    std::vector<size_t> sizes = {6, 0, 0};
+
+    vecengine::detail::reseed_empty_clusters(data.data() + 2, 6, 4, 2, centroids.data(), 3, assignments, sizes);
+
+    // The two furthest points from centroid 0 are (0, 20) and (10, 0).
+    std::set<std::pair<float, float>> reseeded = {{centroids[2], centroids[3]}, {centroids[4], centroids[5]}};
+    REQUIRE(reseeded == std::set<std::pair<float, float>>{{10, 0}, {0, 20}});
+    REQUIRE(centroids[0] == 0.0f);
+    REQUIRE(centroids[1] == 0.0f);
+}
+
+TEST_CASE("reseed_empty_clusters: splits the largest cluster when no point is off-centroid", "[kmeans]") {
+    auto data = strided_points({{3, 4}, {3, 4}, {3, 4}, {3, 4}, {3, 4}, {3, 4}});
+    std::vector<float> centroids = {3, 4,  -1, -1,  -1, -1};
+    std::vector<uint32_t> assignments(6, 0);
+    std::vector<size_t> sizes = {6, 0, 0};
+
+    vecengine::detail::reseed_empty_clusters(data.data() + 2, 6, 4, 2, centroids.data(), 3, assignments, sizes);
+
+    // Sizes are split, not invented, and no cluster is left empty.
+    REQUIRE(sizes[0] + sizes[1] + sizes[2] == 6);
+    for (size_t s : sizes) REQUIRE(s > 0);
+
+    // Every centroid stays within 1% of (3, 4), and all three are distinct.
+    for (size_t c = 0; c < 3; ++c) {
+        REQUIRE_THAT(centroids[c * 2], WithinRel(3.0f, 0.01f));
+        REQUIRE_THAT(centroids[c * 2 + 1], WithinRel(4.0f, 0.01f));
+    }
+    std::set<std::pair<float, float>> distinct = {
+        {centroids[0], centroids[1]}, {centroids[2], centroids[3]}, {centroids[4], centroids[5]}};
+    REQUIRE(distinct.size() == 3);
+}
+
+TEST_CASE("kmeans: same seed gives identical results", "[kmeans]") {
+    const size_t n = 2000, dim = 16, k = 32;
+    auto data = random_vectors(n, dim, /*seed=*/11);
+    auto a = vecengine::detail::kmeans(data.data(), n, dim, dim, k, 10, 1234u);
+    auto b = vecengine::detail::kmeans(data.data(), n, dim, dim, k, 10, 1234u);
+    REQUIRE(a.centroids == b.centroids);
+    REQUIRE(a.assignments == b.assignments);
+}
+
+// ---------------------------------------------------------------------------
+// parallel_for
+// ---------------------------------------------------------------------------
+
+TEST_CASE("parallel_for: visits every index exactly once", "[parallel]") {
+    for (size_t n : {size_t{0}, size_t{1}, size_t{10000}}) {
+        std::vector<std::atomic<int>> hits(n);
+        vecengine::detail::parallel_for(n, [&](size_t i) { hits[i].fetch_add(1); });
+        for (size_t i = 0; i < n; ++i) REQUIRE(hits[i].load() == 1);
+    }
+}
+
+TEST_CASE("parallel_for: rethrows an exception from fn", "[parallel]") {
+    REQUIRE_THROWS_AS(
+        vecengine::detail::parallel_for(1000, [](size_t i) {
+            if (i == 500) throw std::runtime_error("boom");
+        }),
+        std::runtime_error);
+}
+
 
 // ---------------------------------------------------------------------------
 // IVFIndex
@@ -227,6 +312,71 @@ TEST_CASE("IVFIndex: query_batch matches per-query results", "[ivf][batch]") {
         REQUIRE(batch_res[1][i].index == expected_1[i].index);
         REQUIRE_THAT(batch_res[1][i].distance, WithinAbs(expected_1[i].distance, kEps));
     }
+}
+
+// nprobe == nlist scans every list, so results must match FlatIndex exactly
+// if add_batch stored every vector under the right ID. The first 10 vectors
+// go through add() to check that add_batch continues the ID sequence.
+TEST_CASE("IVFIndex: add_batch matches FlatIndex with exhaustive probing", "[ivf][batch]") {
+    const size_t dim = 16, n = 1000, nlist = 100, k = 10, head = 10;
+    auto data = random_vectors(n, dim, /*seed=*/5);
+
+    vecengine::FlatIndex flat(dim);
+    flat.add_batch(data, n);
+
+    vecengine::IVFIndex idx(dim, nlist, nlist);
+    idx.train(data, n, 10);
+    for (size_t i = 0; i < head; ++i)
+        idx.add(std::span<const float>(data.data() + i * dim, dim));
+    idx.add_batch(std::span<const float>(data.data() + head * dim, (n - head) * dim), n - head);
+    REQUIRE(idx.size() == n);
+
+    for (size_t q = 0; q < n; q += 97) {
+        std::span<const float> query(data.data() + q * dim, dim);
+        auto expected = flat.query(query, k);
+        auto got = idx.query(query, k);
+        REQUIRE(got.size() == expected.size());
+        for (size_t i = 0; i < k; ++i) {
+            REQUIRE(got[i].index == expected[i].index);
+            REQUIRE_THAT(got[i].distance, WithinAbs(expected[i].distance, kEps));
+        }
+    }
+}
+
+// Same data and thresholds as the IVFIndex+PQ recall test, built through
+// RefineIndex::add_batch so both the PQ encode path and Refine's raw-vector
+// copy are exercised. Scrambled IDs would drop recall to near zero.
+TEST_CASE("IVFIndex+PQ: add_batch through RefineIndex keeps recall", "[ivf][pq][refine][batch]") {
+    const size_t dim = 32, n = 5000, k = 10, num_queries = 100;
+    auto data = random_vectors(n, dim, /*seed=*/42);
+
+    vecengine::FlatIndex flat(dim);
+    flat.add_batch(data, n);
+
+    vecengine::IVFIndex base(dim, 100, 20);
+    base.enable_pq(8, 256);
+    base.train(data, n, 15);
+    vecengine::RefineIndex refine(base, 10);
+    refine.add_batch(data, n);
+    REQUIRE(base.size() == n);
+    REQUIRE(refine.size() == n);
+
+    auto recall = [&](const vecengine::Index& idx) {
+        size_t hits = 0;
+        for (size_t q = 0; q < num_queries; ++q) {
+            std::span<const float> query(data.data() + q * 37 * dim, dim);
+            auto truth = flat.query(query, k);
+            for (const auto& r : idx.query(query, k))
+                for (const auto& t : truth)
+                    if (r.index == t.index) { ++hits; break; }
+        }
+        return static_cast<double>(hits) / (num_queries * k);
+    };
+
+    double pq = recall(base);
+    double refined = recall(refine);
+    REQUIRE(pq > 0.5);
+    REQUIRE(refined > pq);
 }
 
 // ---------------------------------------------------------------------------

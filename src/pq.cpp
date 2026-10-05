@@ -1,4 +1,5 @@
 #include "kmeans.hpp"
+#include "parallel.hpp"
 #include "vecengine/pq.hpp"
 #include "vecengine/distance.hpp"
 
@@ -26,16 +27,17 @@ PQCodebook::PQCodebook(size_t dim, size_t num_subspaces, size_t centroids_per_su
     centroids_t_.resize(num_subspaces_ * centroids_per_subspace_ * sub_dim_);
 }
 
-void PQCodebook::train(span<const float> vectors, size_t num_vectors, size_t max_iters) {
+void PQCodebook::train(span<const float> vectors, size_t num_vectors, size_t max_iters, std::optional<uint32_t> seed) {
     assert(vectors.size() == num_vectors * dim_);
     if (num_vectors < centroids_per_subspace_) throw std::invalid_argument("training set must have at least centroids_per_subspace_ vectors");
 
     // run kmeans on each subspace
-    for (size_t i = 0; i < num_subspaces_; ++i) {
-        auto res = vecengine::detail::kmeans(vectors.data() + i*sub_dim_, num_vectors, dim_, sub_dim_, centroids_per_subspace_, max_iters);
+    detail::parallel_for(num_subspaces_, [&](size_t i) {
+        auto sub_seed = seed ? std::optional<uint32_t>(*seed + static_cast<uint32_t>(i)) : std::nullopt;
+        auto res = vecengine::detail::kmeans(vectors.data() + i*sub_dim_, num_vectors, dim_, sub_dim_, centroids_per_subspace_, max_iters, sub_seed);
         float* dst = centroids_.data() + i * centroids_per_subspace_ * sub_dim_;
         std::copy_n(res.centroids.data(), res.centroids.size(), dst);
-    }
+    });
 
     for (size_t i = 0; i < num_subspaces_; ++i) {
         for (size_t j = 0; j < sub_dim_; ++j) {

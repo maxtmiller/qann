@@ -36,6 +36,12 @@ void RefineIndex::add(span<const float> vec) {
 
 }
 
+void RefineIndex::add_batch(span<const float> vecs, size_t n) {
+    base_.add_batch(vecs, n);
+    data_.insert(data_.end(), vecs.begin(), vecs.end());
+    count_ += n;
+}
+
 vector<Neighbor> RefineIndex::query(span<const float> vec, size_t k) const {
     assert(vec.size() == dim());
 
@@ -57,19 +63,6 @@ vector<Neighbor> RefineIndex::query(span<const float> vec, size_t k) const {
         auto [distance, index] = maxHeap.top();
         results[i] = {index, distance};
         maxHeap.pop();
-    }
-
-    return results;
-}
-
-vector<vector<Neighbor>> RefineIndex::query_batch(span<const float> queries, size_t num_queries, size_t k) const {
-    assert(queries.size() == num_queries * dim());
-
-    vector<vector<Neighbor>> results;
-    results.reserve(num_queries);
-    for (size_t i = 0; i < num_queries; ++i) {
-        span<const float> row(queries.data() + i * dim(), dim());
-        results.emplace_back(query(row, k));
     }
 
     return results;

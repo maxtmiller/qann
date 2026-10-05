@@ -8,6 +8,7 @@
 #include <vector>
 #include <span>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 
 namespace vecengine {
@@ -38,10 +39,13 @@ public:
     void set_pq_distance(PQDistance mode) noexcept { pq_distance_ = mode; }
 
     void add(span<const float> vec) override;
+    void add_batch(span<const float> vecs, size_t n) override;
     vector<Neighbor> query(span<const float> vec, size_t k) const override;
-    vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k) const override;
 
-    void train(span<const float> vectors, size_t num_vectors, size_t max_iters = 25);
+    // A seed makes training reproducible: coarse k-means uses seed, the PQ
+    // codebook (if enabled) uses seed + 1 onward.
+    void train(span<const float> vectors, size_t num_vectors, size_t max_iters = 25,
+               std::optional<uint32_t> seed = std::nullopt);
 
     size_t size() const noexcept override { return n_total_; }
     size_t dim() const noexcept override { return dim_; }
