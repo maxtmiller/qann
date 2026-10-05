@@ -1,5 +1,6 @@
 # Build output
 build/
+build-prof/
 cmake-build-*/
 
 # CMake generated

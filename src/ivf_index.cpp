@@ -3,6 +3,7 @@
 #include "vecengine/pq.hpp"
 #include "kmeans.hpp"
 #include "parallel.hpp"
+#include "profile.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -12,7 +13,7 @@
 #include <queue>
 #include <utility>
 #include <stdexcept>
-
+#include <cmath>
 
 namespace vecengine {
 
@@ -109,6 +110,7 @@ vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
     assert(k <= n_total_);
     if (!trained_) throw std::logic_error("train() has not be run yet");
 
+    VECENGINE_PROF_START(t_coarse);
     // find the closest nprobe coarse centroids
     std::priority_queue<pair<float, uint16_t>, vector<pair<float, uint16_t>>, std::less<pair<float, uint16_t>>> maxCentroidHeap;
     for (size_t i = 0; i < nlist_; ++i) {
@@ -123,9 +125,12 @@ vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
         }
     }
 
+    VECENGINE_PROF_STOP(t_coarse, kProfCoarse);
+
     // intialize vars for pq, reuse allocated memory for adc table
     const size_t m = pq_enabled() ? pq_->num_subspaces() : 0;
     vector<float> table(pq_enabled() ? m * pq_->centroids_per_subspace() : 0);
+    vector<float> dists;
 
     // find top-k vectors from the inverted lists associated with the nprobe closest coarse centroids
     const size_t n1 = maxCentroidHeap.size();
@@ -137,6 +142,7 @@ vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
 
         const InvertedList& list = it->second;
         size_t listSize = list.ids.size();
+        dists.resize(listSize);
 
         // lamdba function for adding to heap
         auto push = [&](float dist, size_t j) {
@@ -149,13 +155,16 @@ vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
         };
 
         if (!pq_enabled()) {
+            VECENGINE_PROF_START(t_raw);
             for (size_t j = 0; j < listSize; ++j) {
                 const float* start = list.vecs.data() + j * dim_;
                 push(l2_distance(vec.data(), start, dim_), j);
             }
+            VECENGINE_PROF_STOP(t_raw, kProfRawScan);
             continue;
         }
 
+        VECENGINE_PROF_START(t_table);
         // calculates residuals 
         vector<float> residual(dim_);
         const float* centroid_ptr = coarse_centroids_.data() + it->first * dim_;
@@ -166,10 +175,16 @@ vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
         // calculate distance with ADC or SDC
         if (pq_distance_ == PQDistance::ADC) {
             pq_->compute_adc_table(residual, table);
+            VECENGINE_PROF_STOP(t_table, kProfTable);
+            VECENGINE_PROF_START(t_scan);
+            pq_->distances_adc(table, list.codes.data(), listSize, dists.data());
+            float worst = maxVectorHeap.size() < k ? INFINITY : maxVectorHeap.top().first;
             for (size_t j = 0; j < listSize; ++j) {
-                span<const uint8_t> code(list.codes.data() + j * m, m);
-                push(pq_->distance_adc(table, code), j);
+                if (dists[j] >= worst) continue;
+                push(dists[j], j);
+                worst = maxVectorHeap.size() < k ? INFINITY : maxVectorHeap.top().first;
             }
+            VECENGINE_PROF_STOP(t_scan, kProfCodeScan);
         } else {
             vector<uint8_t> query_code = pq_->encode(residual);
             for (size_t j = 0; j < listSize; ++j) {
@@ -179,6 +194,7 @@ vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
         }
     }
 
+    VECENGINE_PROF_START(t_drain);
     // add top-k vectors to results array
     const size_t n2 = maxVectorHeap.size();
     vector<Neighbor> results(n2);
@@ -187,6 +203,7 @@ vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
         results[i] = {idx,dist};
         maxVectorHeap.pop();
     }
+    VECENGINE_PROF_STOP(t_drain, kProfDrain);
 
     return results;
 }

@@ -461,6 +461,31 @@ TEST_CASE("PQCodebook: ADC is exact when vectors are centroids", "[pq][adc]") {
 
 // The ADC table must hold the plain per-subspace distance from each query
 // slice to each centroid, whatever internal layout builds it.
+// 37 codes covers both the 4-at-a-time loop and the 1 leftover. Each code's
+// sum runs in the same order, so results must match exactly, not just closely.
+TEST_CASE("PQCodebook: distances_adc matches distance_adc exactly", "[pq][adc]") {
+    const size_t dim = 32, m = 8, n = 37;
+    auto train = random_vectors(2000, dim, /*seed=*/21);
+    vecengine::PQCodebook pq(dim, m, 256);
+    pq.train(train, 2000, 10);
+
+    auto vecs = random_vectors(n, dim, /*seed=*/22);
+    std::vector<uint8_t> codes;
+    for (size_t i = 0; i < n; ++i) {
+        auto code = pq.encode(std::span<const float>(vecs.data() + i * dim, dim));
+        codes.insert(codes.end(), code.begin(), code.end());
+    }
+
+    auto query = random_vectors(1, dim, /*seed=*/23);
+    std::vector<float> table(m * 256);
+    pq.compute_adc_table(query, table);
+
+    std::vector<float> out(n);
+    pq.distances_adc(table, codes.data(), n, out.data());
+    for (size_t i = 0; i < n; ++i)
+        REQUIRE(out[i] == pq.distance_adc(table, std::span<const uint8_t>(codes.data() + i * m, m)));
+}
+
 TEST_CASE("PQCodebook: ADC table matches per-subspace l2_distance", "[pq][adc]") {
     const size_t dim = 16, m = 4, K = 16, sub = dim / m;
     auto data = random_vectors(K, dim, /*seed=*/13);

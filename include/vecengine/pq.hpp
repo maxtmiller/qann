@@ -48,13 +48,36 @@ public:
         assert(table.size() == num_subspaces_ * centroids_per_subspace_);
         assert(code.size() == num_subspaces_);
 
-        // Same shape as distance_sdc, indexing table[s * K + code[s]].
         float sum = 0.0f;
         for (size_t i = 0; i < num_subspaces_; ++i) {
             sum += table[(i * centroids_per_subspace_) + code[i]];
         }
-
         return sum;
+    }
+
+    void distances_adc(span<const float> table, const uint8_t* codes, size_t n, float* out) const {
+        assert(table.size() == num_subspaces_ * centroids_per_subspace_);
+
+        // calculates distance for 4 vectors at a time,
+        size_t i = 0;
+        for (; i + 4 <= n; i += 4) {
+            const uint8_t* c = codes + i * num_subspaces_;
+            float d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+            for (size_t j = 0; j < num_subspaces_; ++j) {
+                const float* row = table.data() + j * centroids_per_subspace_;
+                d0 += row[c[j]];
+                d1 += row[c[num_subspaces_ + j]];
+                d2 += row[c[2 * num_subspaces_ + j]];
+                d3 += row[c[3 * num_subspaces_ + j]];
+            }
+            out[i] = d0; out[i + 1] = d1; out[i + 2] = d2; out[i + 3] = d3;
+        }
+        for (; i < n; ++i) {
+            const uint8_t* c = codes + i * num_subspaces_;
+            float d = 0;
+            for (size_t s = 0; s < num_subspaces_; ++s) d += table[s * centroids_per_subspace_ + c[s]];
+            out[i] = d;
+        }
     }
 
     // SDC: both sides are quantized. Looks up precomputed centroid-pair

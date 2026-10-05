@@ -1,4 +1,5 @@
 #include "vecengine/refine_index.hpp"
+#include "profile.hpp"
 #include "vecengine/distance.hpp"
 
 #include <cstddef>
@@ -46,6 +47,7 @@ vector<Neighbor> RefineIndex::query(span<const float> vec, size_t k) const {
     assert(vec.size() == dim());
 
     vector<Neighbor> candidatesRaw = base_.query(vec, std::min(k * k_factor_, count_));
+    VECENGINE_PROF_START(t_rerank);
     vector<pair<float, size_t>> candidates;
     candidates.reserve(candidatesRaw.size());
 
@@ -65,6 +67,7 @@ vector<Neighbor> RefineIndex::query(span<const float> vec, size_t k) const {
         maxHeap.pop();
     }
 
+    VECENGINE_PROF_STOP(t_rerank, kProfRerank);
     return results;
 }
 

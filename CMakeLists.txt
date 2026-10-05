@@ -13,6 +13,9 @@ include(FetchContent)
 # Off for Python wheel builds (pyproject.toml) so they skip fetching and
 # compiling Catch2 and Google Benchmark.
 option(VECENGINE_BUILD_TESTS "Build C++ tests and microbenchmarks" ON)
+# Per-section query timers (src/profile.hpp) and the profile_query tool.
+# Adds timer calls to the query path, so keep it off for normal builds.
+option(VECENGINE_PROFILE "Build with query section timers and profile_query" OFF)
 
 FetchContent_Declare(
   Catch2
@@ -85,6 +88,13 @@ target_compile_features(vecengine_core PUBLIC cxx_std_20)
 # The static lib is linked into the Python shared module, which Linux requires
 # to be position-independent code (macOS builds PIC by default).
 set_target_properties(vecengine_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+if(VECENGINE_PROFILE)
+  target_compile_definitions(vecengine_core PUBLIC VECENGINE_PROFILE)
+  add_executable(profile_query benchmarks/profile_query.cpp)
+  target_include_directories(profile_query PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(profile_query PRIVATE vecengine_core)
+endif()
 
 # k-means assignment uses cblas_sgemm when available: Accelerate on Apple (runs
 # on the matrix unit), otherwise any BLAS that ships cblas.h (e.g. OpenBLAS).
