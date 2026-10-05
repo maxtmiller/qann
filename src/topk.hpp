@@ -53,7 +53,7 @@ public:
         std::sort(buf_.begin(), buf_.end());
         vector<Neighbor> results;
         results.reserve(buf_.size());
-        for (auto [dist, id] : buf_) results.emplace_back(id, dist);
+        for (auto [dist, id] : buf_) results.push_back({id, dist});
         buf_.clear();
 
         return results;
