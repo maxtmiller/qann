@@ -81,6 +81,10 @@ target_include_directories(vecengine_core PUBLIC
 
 target_compile_features(vecengine_core PUBLIC cxx_std_20)
 
+# The static lib is linked into the Python shared module, which Linux requires
+# to be position-independent code (macOS builds PIC by default).
+set_target_properties(vecengine_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # k-means assignment uses cblas_sgemm when available: Accelerate on Apple (runs
 # on the matrix unit), otherwise any BLAS that ships cblas.h (e.g. OpenBLAS).
 # Without one it falls back to a scalar scan. PUBLIC link: anything linking the
