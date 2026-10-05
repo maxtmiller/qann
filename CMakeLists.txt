@@ -37,7 +37,7 @@ set(BENCHMARK_INSTALL_DOCS      OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
   nanobind
   GIT_REPOSITORY https://github.com/wjakob/nanobind.git
-  GIT_TAG        v1.9.2
+  GIT_TAG        v3.1.0
 )
 
 if(VECENGINE_BUILD_TESTS)
@@ -152,7 +152,7 @@ endif()
 # ---------------------------------------------------------------------------
 # Python bindings (nanobind)
 # ---------------------------------------------------------------------------
-find_package(Python 3.9 REQUIRED COMPONENTS Interpreter Development.Module)
+find_package(Python 3.10 REQUIRED COMPONENTS Interpreter Development.Module)
 
 nanobind_add_module(vecengine_py
   bindings/python_bindings.cpp

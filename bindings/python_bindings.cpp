@@ -3,6 +3,7 @@
 #include <nanobind/stl/vector.h>
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
+#include <nanobind/stl/unique_ptr.h>
 
 #include <cstdint>
 #include <limits>
@@ -159,13 +160,6 @@ static float pq_distance_sdc(const vecengine::PQCodebook &self, ByteVector query
     return self.distance_sdc(as_span(query_code), as_span(code));
 }
 
-// nanobind's unique_ptr<Base> caster does not reliably downcast to the
-// concrete Python type in this nanobind version; release to a raw pointer
-// and hand ownership to Python explicitly via take_ownership instead.
-static vecengine::Index* make_index_py(vecengine::IndexType type, std::size_t dim, const vecengine::IndexOptions& opts) {
-    return vecengine::make_index(type, dim, opts).release();
-}
-
 NB_MODULE(qann, m) {
     m.doc() = "qann: Quantized Approximate Nearest Neighbors (Flat, IVF, PQ, re-ranking)";
     m.attr("__version__") = QANN_VERSION;
@@ -257,8 +251,6 @@ NB_MODULE(qann, m) {
         .def("num_subspaces", &vecengine::PQCodebook::num_subspaces)
         .def("centroids_per_subspace", &vecengine::PQCodebook::centroids_per_subspace);
 
-    m.def("make_index", &make_index_py, nb::arg("type"), nb::arg("dim"), nb::arg("opts") = vecengine::IndexOptions{},
-          nb::rv_policy::take_ownership,
-          "Construct an index of the given type. Returns a base Index handle; "
-          "for IVF-specific methods like train(), construct IVFIndex directly instead.");
+    m.def("make_index", &vecengine::make_index, nb::arg("type"), nb::arg("dim"), nb::arg("opts") = vecengine::IndexOptions{},
+          "Construct a FlatIndex or IVFIndex from an IndexType and IndexOptions");
 }
