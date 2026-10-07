@@ -4,6 +4,7 @@
 #include <nanobind/stl/optional.h>
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/unique_ptr.h>
+#include <nanobind/stl/filesystem.h>
 
 #include <cstdint>
 #include <limits>
@@ -176,7 +177,10 @@ NB_MODULE(qann, m) {
     m.def("num_threads", &vecengine::num_threads,
           "Thread count parallel work will use (resolves the 0 default to the core count).");
 
-    nb::class_<vecengine::Index>(m, "Index");
+    // Methods bound on Index are inherited by FlatIndex, IVFIndex and RefineIndex.
+    nb::class_<vecengine::Index>(m, "Index")
+        .def("save", [](const vecengine::Index& self, const std::filesystem::path& path) { vecengine::save_index(self, path); },
+             nb::arg("path"), "Save the index to a file; load it back with qann.load(path)");
 
     nb::class_<vecengine::FlatIndex, vecengine::Index>(m, "FlatIndex")
         .def(nb::init<std::size_t>(), nb::arg("dim"), "Construct FlatIndex with vector dimension")
@@ -216,6 +220,9 @@ NB_MODULE(qann, m) {
              "Re-rank an empty, trained approximate index with exact distances. Add vectors through this wrapper.")
         .def_prop_rw("k_factor", &vecengine::RefineIndex::k_factor, &vecengine::RefineIndex::set_k_factor,
                      "Candidates fetched from base per result (k * k_factor)")
+        .def_prop_ro("base", [](vecengine::RefineIndex& self) -> vecengine::Index& { return self.base(); },
+                     nb::rv_policy::reference_internal,
+                     "The wrapped approximate index, e.g. to change nprobe on a loaded RefineIndex")
         .def("add", &index_add, nb::arg("data"), "Add matrix of vectors to base and raw storage")
         .def("query", &index_query, nb::arg("query"), nb::arg("k"), "Query k-NN for a (dim,) vector; returns 1D (indices, distances)")
         .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), "Query k-NN for each row; returns (indices, distances) arrays of shape (num_queries, k), padded with -1 / inf")
@@ -253,4 +260,7 @@ NB_MODULE(qann, m) {
 
     m.def("make_index", &vecengine::make_index, nb::arg("type"), nb::arg("dim"), nb::arg("opts") = vecengine::IndexOptions{},
           "Construct a FlatIndex or IVFIndex from an IndexType and IndexOptions");
+
+    m.def("load", nb::overload_cast<const std::filesystem::path&>(&vecengine::load_index), nb::arg("path"),
+          "Load an index saved with Index.save(path); returns a FlatIndex, IVFIndex or RefineIndex");
 }
