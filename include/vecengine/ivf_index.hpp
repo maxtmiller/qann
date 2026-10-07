@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <unordered_map>
+#include <iosfwd>
 
 namespace vecengine {
 
@@ -46,6 +47,9 @@ public:
     // codebook (if enabled) uses seed + 1 onward.
     void train(span<const float> vectors, size_t num_vectors, size_t max_iters = 25,
                std::optional<uint32_t> seed = std::nullopt);
+
+    void save(std::ostream& out) const override;
+    static std::unique_ptr<IVFIndex> load_body(std::istream& in);
 
     size_t size() const noexcept override { return n_total_; }
     size_t dim() const noexcept override { return dim_; }

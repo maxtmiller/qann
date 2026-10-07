@@ -1,6 +1,9 @@
 #include "vecengine/refine_index.hpp"
-#include "profile.hpp"
 #include "vecengine/distance.hpp"
+#include "vecengine/flat_index.hpp"
+#include "vecengine/ivf_index.hpp"
+#include "profile.hpp"
+#include "serialize.hpp"
 
 #include <cstddef>
 #include <vector>
@@ -69,6 +72,44 @@ vector<Neighbor> RefineIndex::query(span<const float> vec, size_t k) const {
 
     VECENGINE_PROF_STOP(t_rerank, kProfRerank);
     return results;
+}
+
+void RefineIndex::save(std::ostream& out) const {
+    using namespace detail;
+
+    write_header(out, IndexKind::Refine);
+    write_pod(out, static_cast<uint64_t>(k_factor_));
+    write_pod(out, static_cast<uint64_t>(count_));
+    base_.save(out);
+    write_vec(out, data_);
+}
+
+std::unique_ptr<RefineIndex> RefineIndex::load_body(std::istream& in) {
+    using namespace detail;
+
+    const auto k_factor = read_pod<uint64_t>(in);
+    const auto count = read_pod<uint64_t>(in);
+    if (k_factor == 0) throw std::runtime_error("corrupt file: invalid RefineIndex shape");
+
+    std::unique_ptr<Index> base;
+    switch (read_header(in)) {
+        case IndexKind::Flat: base = FlatIndex::load_body(in); break;
+        case IndexKind::IVF:  base = IVFIndex::load_body(in); break;
+        default: throw std::runtime_error("corrupt file: RefineIndex base must be Flat or IVF");
+    }
+
+    const uint64_t dim = base->dim();
+    if (count != base->size() || count > UINT64_MAX / dim) throw std::runtime_error("corrupt file: invalid RefineIndex shape");
+
+    auto data = read_vec<float>(in, count * dim);
+    if (data.size() != count * dim) throw std::runtime_error("corrupt file: unexpected number of vectors");
+
+    auto index = std::unique_ptr<RefineIndex>(new RefineIndex(std::move(base), k_factor));
+
+    index->count_ = count;
+    index->data_ = std::move(data);
+
+    return index;
 }
 
 } // namespace vecengine

@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <vector>
 #include <span>
+#include <iosfwd>
+#include <memory>
 
 namespace vecengine {
 
@@ -28,13 +30,23 @@ public:
     void add_batch(span<const float> vecs, size_t n) override;
     vector<Neighbor> query(span<const float> vec, size_t k) const override;
 
+    void save(std::ostream& out) const override;
+    static std::unique_ptr<RefineIndex> load_body(std::istream& in);
+
     size_t size() const noexcept override { return count_; }
     size_t dim() const noexcept override { return base_.dim(); }
+    
+    Index& base() noexcept { return base_; }
+    const Index& base() const noexcept { return base_; }
 
     size_t k_factor() const noexcept { return k_factor_; }
     void set_k_factor(size_t k_factor);
 
 private:
+    RefineIndex(std::unique_ptr<Index> base, size_t k_factor)
+        : owned_base_(std::move(base)), base_(*owned_base_), k_factor_(k_factor) {}
+
+    std::unique_ptr<Index> owned_base_; // set on file load; nullptr when wrapping a caller-owned base.
     Index& base_; // approximate first-stage index
     size_t k_factor_; // candidates fetched per result: k * k_factor
     size_t count_ = 0; // num of vectors

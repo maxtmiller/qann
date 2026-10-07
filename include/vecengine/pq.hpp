@@ -6,6 +6,7 @@
 #include <vector>
 #include <span>
 #include <cassert>
+#include <iosfwd>
 
 namespace vecengine {
 
@@ -55,6 +56,8 @@ public:
         return sum;
     }
 
+    // ADC step 3: computes distances for n codes at once, storing them in out.
+    // table is the same as in distance_adc; codes is n * num_subspaces_ bytes.
     void distances_adc(span<const float> table, const uint8_t* codes, size_t n, float* out) const {
         assert(table.size() == num_subspaces_ * centroids_per_subspace_);
 
@@ -84,6 +87,9 @@ public:
     // distances in sdc_table_ built once during train() - no float math.
     float distance_sdc(span<const uint8_t> query_code, span<const uint8_t> code) const;
 
+    void save(std::ostream& out) const;
+    static PQCodebook load(std::istream& in);
+
     size_t dim() const noexcept { return dim_; }
     size_t num_subspaces() const noexcept { return num_subspaces_; }
     size_t centroids_per_subspace() const noexcept { return centroids_per_subspace_; }
@@ -97,6 +103,9 @@ private:
     vector<float> centroids_; // m * k * sub_dim_, row-major per subspace
     vector<float> centroids_t_; // m * sub_dim_ * k, contiguous over centroids for the ADC/SDC table loops
     vector<float> sdc_table_; // m * k * k, built once in train()
+
+    // Builds sdc_table_ from centroids_ after training
+    void build_tables();
 };
 
 } // namespace vecengine
