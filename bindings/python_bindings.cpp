@@ -8,6 +8,8 @@
 
 #include <cstdint>
 #include <limits>
+#include <mutex>
+#include <shared_mutex>
 #include <span>
 
 #include "vecengine/distance.hpp"
@@ -71,12 +73,48 @@ static NumpyArray<float> batch_cosine(FloatMatrix a, FloatMatrix b) {
     return to_numpy(std::move(out), {M});
 }
 
+// Locks an index and, for a RefineIndex, the chain of bases under it (the
+// base is also reachable from Python, e.g. ivf.add() on a wrapped IVFIndex).
+// Always taken outermost index first, so lock order is consistent.
+template <class Lock>
+static std::vector<Lock> lock_chain(const vecengine::Index& index) {
+    std::vector<Lock> locks;
+    for (const vecengine::Index* p = &index; p != nullptr;) {
+        locks.emplace_back(p->mutex());
+        auto* refine = dynamic_cast<const vecengine::RefineIndex*>(p);
+        p = refine ? &refine->base() : nullptr;
+    }
+    return locks;
+}
+
+// Run f with the GIL released and the index locked: shared for reads,
+// exclusive for writes. The GIL is released before locking so a thread
+// waiting for the lock never holds the GIL that the lock holder needs back.
+// f must not touch Python objects; build NumPy results after it returns.
+template <class F>
+static auto read_locked(const vecengine::Index& index, F&& f) {
+    nb::gil_scoped_release release;
+    auto locks = lock_chain<std::shared_lock<std::shared_mutex>>(index);
+    return f();
+}
+
+template <class F>
+static auto write_locked(const vecengine::Index& index, F&& f) {
+    nb::gil_scoped_release release;
+    auto locks = lock_chain<std::unique_lock<std::shared_mutex>>(index);
+    return f();
+}
+
 // Add all rows of a (N x dim) matrix to the index.
 static void index_add(vecengine::Index &self, FloatMatrix data) {
     if (data.shape(1) != self.dim())
         throw std::invalid_argument("vector dimension does not match index dimension");
 
-    self.add_batch(std::span<const float>(data.data(), data.size()), data.shape(0));
+    write_locked(self, [&] { self.add_batch(std::span<const float>(data.data(), data.size()), data.shape(0)); });
+}
+
+static std::size_t index_size(const vecengine::Index& self) {
+    return read_locked(self, [&] { return self.size(); });
 }
 
 // Query k-NN for a single vector; returns (indices, distances) as 1D arrays
@@ -86,7 +124,7 @@ index_query(const vecengine::Index &self, FloatVector query, std::size_t k) {
     if (query.shape(0) != self.dim())
         throw std::invalid_argument("query dimension does not match index dimension");
 
-    auto results = self.query(as_span(query), k);
+    auto results = read_locked(self, [&] { return self.query(as_span(query), k); });
 
     const std::size_t n = results.size();
     std::vector<int64_t> indices(n);
@@ -106,7 +144,9 @@ index_batch_query(const vecengine::Index &self, FloatMatrix query, std::size_t k
         throw std::invalid_argument("query dimension does not match index dimension");
 
     const std::size_t num_queries = query.shape(0);
-    auto results = self.query_batch(std::span<const float>(query.data(), query.size()), num_queries, k);
+    auto results = read_locked(self, [&] {
+        return self.query_batch(std::span<const float>(query.data(), query.size()), num_queries, k);
+    });
 
     std::vector<int64_t> indices(num_queries * k, -1);
     std::vector<float> distances(num_queries * k, std::numeric_limits<float>::infinity());
@@ -123,7 +163,7 @@ index_batch_query(const vecengine::Index &self, FloatMatrix query, std::size_t k
 static void ivf_train(vecengine::IVFIndex &self, FloatMatrix data, std::size_t max_iters, std::optional<uint32_t> seed) {
     if (data.shape(1) != self.dim())
         throw std::invalid_argument("training vector dimension does not match index dimension");
-    self.train(std::span<const float>(data.data(), data.size()), data.shape(0), max_iters, seed);
+    write_locked(self, [&] { self.train(std::span<const float>(data.data(), data.size()), data.shape(0), max_iters, seed); });
 }
 
 static void pq_train(vecengine::PQCodebook &self, FloatMatrix data, std::size_t max_iters, std::optional<uint32_t> seed) {
@@ -177,18 +217,21 @@ NB_MODULE(qann, m) {
     m.def("num_threads", &vecengine::num_threads,
           "Thread count parallel work will use (resolves the 0 default to the core count).");
 
-    // Methods bound on Index are inherited by FlatIndex, IVFIndex and RefineIndex.
+    // Methods bound on Index are inherited by FlatIndex, IVFIndex and RefineIndex,
+    // and give type checkers the right methods for what load() and make_index() return.
     nb::class_<vecengine::Index>(m, "Index")
-        .def("save", [](const vecengine::Index& self, const std::filesystem::path& path) { vecengine::save_index(self, path); },
-             nb::arg("path"), "Save the index to a file; load it back with qann.load(path)");
-
-    nb::class_<vecengine::FlatIndex, vecengine::Index>(m, "FlatIndex")
-        .def(nb::init<std::size_t>(), nb::arg("dim"), "Construct FlatIndex with vector dimension")
-        .def("add", &index_add, nb::arg("data"), "Add matrix of vectors to index")
+        .def("save", [](const vecengine::Index& self, const std::filesystem::path& path) {
+                 read_locked(self, [&] { vecengine::save_index(self, path); });
+             },
+             nb::arg("path"), "Save the index to a file; load it back with qann.load(path)")
+        .def("add", &index_add, nb::arg("data"), "Add an (n, dim) array of vectors; ids continue from size()")
         .def("query", &index_query, nb::arg("query"), nb::arg("k"), "Query k-NN for a (dim,) vector; returns 1D (indices, distances)")
         .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), "Query k-NN for each row; returns (indices, distances) arrays of shape (num_queries, k), padded with -1 / inf")
-        .def("size", &vecengine::Index::size, "Get number of indexed vectors")
+        .def("size", &index_size, "Get number of indexed vectors")
         .def("dim", &vecengine::Index::dim, "Get vector dimension");
+
+    nb::class_<vecengine::FlatIndex, vecengine::Index>(m, "FlatIndex")
+        .def(nb::init<std::size_t>(), nb::arg("dim"), "Construct FlatIndex with vector dimension");
 
     nb::enum_<vecengine::PQDistance>(m, "PQDistance")
         .value("ADC", vecengine::PQDistance::ADC)
@@ -199,35 +242,38 @@ NB_MODULE(qann, m) {
              "Construct IVFIndex with vector dimension, number of coarse clusters, and search breadth")
         .def("train", &ivf_train, nb::arg("data"), nb::arg("max_iters") = 25, nb::arg("seed") = nb::none(),
              "Run k-means over sample vectors to compute coarse centroids")
-        .def("enable_pq", &vecengine::IVFIndex::enable_pq,
+        .def("enable_pq", [](vecengine::IVFIndex& self, std::size_t num_subspaces, std::size_t centroids_per_subspace) {
+                 write_locked(self, [&] { self.enable_pq(num_subspaces, centroids_per_subspace); });
+             },
              nb::arg("num_subspaces"), nb::arg("centroids_per_subspace") = 256,
              "Enable PQ compression of residuals. Call before train()/add().")
-        .def_prop_rw("nprobe", &vecengine::IVFIndex::nprobe, &vecengine::IVFIndex::set_nprobe,
+        .def_prop_rw("nprobe",
+                     [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.nprobe(); }); },
+                     [](vecengine::IVFIndex& self, std::size_t v) { write_locked(self, [&] { self.set_nprobe(v); }); },
                      "Number of clusters scanned per query; can be changed after training")
-        .def_prop_rw("pq_distance", &vecengine::IVFIndex::pq_distance, &vecengine::IVFIndex::set_pq_distance,
-                     "How queries score PQ codes: PQDistance.ADC (default, more accurate) or PQDistance.SDC")
-        .def("add", &index_add, nb::arg("data"), "Add matrix of vectors to index")
-        .def("query", &index_query, nb::arg("query"), nb::arg("k"), "Query k-NN for a (dim,) vector; returns 1D (indices, distances)")
-        .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), "Query k-NN for each row; returns (indices, distances) arrays of shape (num_queries, k), padded with -1 / inf")
-        .def("size", &vecengine::Index::size, "Get number of indexed vectors")
-        .def("dim", &vecengine::Index::dim, "Get vector dimension");
+        .def_prop_rw("pq_distance",
+                     [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.pq_distance(); }); },
+                     [](vecengine::IVFIndex& self, vecengine::PQDistance v) { write_locked(self, [&] { self.set_pq_distance(v); }); },
+                     "How queries score PQ codes: PQDistance.ADC (default, more accurate) or PQDistance.SDC");
 
     // Holds `base` by reference; keep_alive ties base's lifetime to the
     // RefineIndex so Python can't free it first.
     nb::class_<vecengine::RefineIndex, vecengine::Index>(m, "RefineIndex")
-        .def(nb::init<vecengine::Index&, std::size_t>(), nb::arg("base"), nb::arg("k_factor") = 10,
+        // The constructor checks base is empty; lock base so a concurrent
+        // base.add() can't race that check.
+        .def("__init__", [](vecengine::RefineIndex* self, vecengine::Index& base, std::size_t k_factor) {
+                 write_locked(base, [&] { new (self) vecengine::RefineIndex(base, k_factor); });
+             },
+             nb::arg("base"), nb::arg("k_factor") = 10,
              nb::keep_alive<1, 2>(),
              "Re-rank an empty, trained approximate index with exact distances. Add vectors through this wrapper.")
-        .def_prop_rw("k_factor", &vecengine::RefineIndex::k_factor, &vecengine::RefineIndex::set_k_factor,
+        .def_prop_rw("k_factor",
+                     [](const vecengine::RefineIndex& self) { return read_locked(self, [&] { return self.k_factor(); }); },
+                     [](vecengine::RefineIndex& self, std::size_t v) { write_locked(self, [&] { self.set_k_factor(v); }); },
                      "Candidates fetched from base per result (k * k_factor)")
         .def_prop_ro("base", [](vecengine::RefineIndex& self) -> vecengine::Index& { return self.base(); },
                      nb::rv_policy::reference_internal,
-                     "The wrapped approximate index, e.g. to change nprobe on a loaded RefineIndex")
-        .def("add", &index_add, nb::arg("data"), "Add matrix of vectors to base and raw storage")
-        .def("query", &index_query, nb::arg("query"), nb::arg("k"), "Query k-NN for a (dim,) vector; returns 1D (indices, distances)")
-        .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), "Query k-NN for each row; returns (indices, distances) arrays of shape (num_queries, k), padded with -1 / inf")
-        .def("size", &vecengine::Index::size, "Get number of indexed vectors")
-        .def("dim", &vecengine::Index::dim, "Get vector dimension");
+                     "The wrapped approximate index, e.g. to change nprobe on a loaded RefineIndex");
 
     nb::enum_<vecengine::IndexType>(m, "IndexType")
         .value("Flat", vecengine::IndexType::Flat)
@@ -262,5 +308,6 @@ NB_MODULE(qann, m) {
           "Construct a FlatIndex or IVFIndex from an IndexType and IndexOptions");
 
     m.def("load", nb::overload_cast<const std::filesystem::path&>(&vecengine::load_index), nb::arg("path"),
+          nb::call_guard<nb::gil_scoped_release>(),
           "Load an index saved with Index.save(path); returns a FlatIndex, IVFIndex or RefineIndex");
 }

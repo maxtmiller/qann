@@ -1,3 +1,5 @@
+import threading
+
 import numpy as np
 import pytest
 
@@ -127,3 +129,76 @@ def test_load_errors(tmp_path, refine_index):
     path.write_bytes(b"not an index file")
     with pytest.raises(RuntimeError):
         qann.load(path)
+
+
+def test_batch_query_releases_gil():
+    rng = np.random.default_rng(1)
+    index = qann.FlatIndex(32)
+    index.add(rng.random((20_000, 32), dtype=np.float32))
+    queries = rng.random((1_000, 32), dtype=np.float32)
+
+    count = 0
+    stop = threading.Event()
+
+    def spin():
+        nonlocal count
+        while not stop.is_set():
+            count += 1
+
+    thread = threading.Thread(target=spin)
+    thread.start()
+    try:
+        before = count
+        index.batch_query(queries, 10)
+        after = count
+    finally:
+        stop.set()
+        thread.join()
+
+    # With the GIL held for the whole call, the spinning thread could not run at all.
+    assert after > before
+
+
+def test_concurrent_adds_queries_and_tuning(data):
+    rng = np.random.default_rng(2)
+    ivf = qann.IVFIndex(32, nlist=100, nprobe=8)
+    ivf.enable_pq(8)
+    ivf.train(data, seed=1)
+    index = qann.RefineIndex(ivf, k_factor=5)
+    index.add(data[:1_000])
+
+    batches = [rng.random((200, 32), dtype=np.float32) for _ in range(20)]
+    queries = rng.random((100, 32), dtype=np.float32)
+    errors = []
+
+    def run(fn):
+        try:
+            fn()
+        except Exception as e:  # surfaced below; a thread's exception is otherwise lost
+            errors.append(e)
+
+    def adder():
+        for batch in batches:
+            index.add(batch)
+
+    def querier():
+        for _ in range(20):
+            ids, _ = index.batch_query(queries, 10)
+            assert ids.max() < index.size()
+            index.query(queries[0], 5)
+
+    def tuner():
+        for i in range(200):
+            ivf.nprobe = 4 + i % 16
+            index.k_factor = 2 + i % 4
+
+    threads = [threading.Thread(target=run, args=(f,)) for f in (adder, querier, querier, tuner)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, errors
+    assert index.size() == 1_000 + 200 * len(batches)
+    ids, _ = index.batch_query(batches[-1][:10], 1)
+    np.testing.assert_array_equal(ids[:, 0], np.arange(index.size() - 200, index.size() - 190))
