@@ -306,6 +306,10 @@ Also exposed: `FlatIndex`, `IndexType`, `IndexOptions`, `make_index`, `set_num_t
 
 Save/load: `save(path)` is bound once on `Index` and inherited by every index class; `qann.load(path)` binds the path overload of `load_index` and returns the concrete type. Paths go through nanobind's `std::filesystem::path` caster, so `str` and `pathlib.Path` both work. `RefineIndex.base` is a read-only property returned with `rv_policy::reference_internal`, which keeps the RefineIndex alive while Python holds its base (needed for a loaded RefineIndex, which owns its base).
 
+**GIL and locking.** Every `Index` carries a `std::shared_mutex` (`Index::mutex()`), unused by the C++ library itself. The bindings run index work through `read_locked` (shared: `query`, `batch_query`, `size`, `save`, getters) or `write_locked` (exclusive: `add`, `train`, `enable_pq`, setters, and `RefineIndex.__init__`, which checks its base is empty). Both release the GIL *before* taking the lock, so a thread waiting for a lock never holds the GIL the lock holder needs to finish; the work inside must not touch Python objects, so NumPy results are built after the lock and GIL are released and reacquired. `lock_chain` locks a `RefineIndex` and then each base under it, always outermost first, because a base is also reachable from Python (e.g. `ivf.add()` while queries run through a `RefineIndex` over `ivf`). `load` only releases the GIL (`call_guard`), since the index it creates isn't shared yet. `PQCodebook` methods keep the GIL.
+
+**Type stubs.** `nanobind_add_stub` (CMake target `qann_stub`) imports the built module and writes `build/qann.pyi`, so stubs always match the bindings. Wheels install it as `qann-stubs/__init__.pyi`: type checkers read installed stubs only from packages (PEP 561), and `qann` itself is a single extension module. The shared `add`/`query`/`batch_query`/`size`/`dim` methods are bound once on `Index`, so the `Index` returned by `load` and `make_index` type-checks with them.
+
 Results are NumPy arrays that take ownership of the C++ buffer (no copy): IDs are `int64`, distances `float32`, codes `uint8`. `query` returns 1D arrays with one entry per result. `batch_query` returns `(num_queries, k)` arrays; a row with fewer than `k` results is padded with ID `-1` and distance `inf`.
 
 ---
@@ -322,12 +326,12 @@ pip install .               # builds the Python module into a wheel (no C++ test
 
 - Dependencies come from FetchContent: Catch2 v3.5.3, Google Benchmark v1.8.3, nanobind v3.1.0.
 - BLAS for k-means (`VECENGINE_USE_BLAS`): on Apple, `vecengine_core` links `-framework Accelerate` (PUBLIC, so tests and the Python module link it too). Elsewhere `find_package(BLAS)` plus a `cblas.h` search (also under `include/openblas`); on Debian/Ubuntu `apt install libopenblas-dev`. Configure prints which one it used, or that it fell back to the per-point scan. OpenBLAS runs its own threads inside `sgemm`; if PQ training (which calls it from every `parallel_for` worker) oversubscribes, set `OPENBLAS_NUM_THREADS=1`.
-- Packaging: `pyproject.toml` uses scikit-build-core, builds only `vecengine_py` with `VECENGINE_BUILD_TESTS=OFF` (skips fetching Catch2 and Google Benchmark), and installs the module at the wheel root. Runtime dependency: NumPy.
+- Packaging: `pyproject.toml` uses scikit-build-core, builds only `vecengine_py` and `qann_stub` with `VECENGINE_BUILD_TESTS=OFF` (skips fetching Catch2 and Google Benchmark), and installs the module at the wheel root and the stubs as `qann-stubs/`. Runtime dependency: NumPy.
 - `-mavx2 -mfma` are only added on x86 so arm64 builds never see unsupported flags.
 - Google Benchmark's own tests are disabled via cache variables to avoid its stale GoogleTest download.
 - Link-time optimization was tried and left off: no query speedup, and k-means training got ~35% slower.
 - `CMAKE_EXPORT_COMPILE_COMMANDS=ON` writes `build/compile_commands.json` for clangd.
-- Targets: `vecengine_core` (static lib), `test_vecengine`, `bench_vecengine`, `vecengine_py` (Python module).
+- Targets: `vecengine_core` (static lib), `test_vecengine`, `bench_vecengine`, `vecengine_py` (Python module), `qann_stub` (`qann.pyi`).
 - CI (`.github/workflows/ci.yml`, on pushes to `main` and on PRs): builds and runs `ctest` on `ubuntu-latest` (with OpenBLAS) and `macos-14`, then runs the siftsmall recall gate on macOS only, since the baseline was recorded with Accelerate. siftsmall is cached between runs.
 
 ---

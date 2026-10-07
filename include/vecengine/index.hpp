@@ -4,6 +4,7 @@
 #include <vector>
 #include <span>
 #include <iosfwd>
+#include <shared_mutex>
 
 namespace vecengine {
 
@@ -36,6 +37,15 @@ public:
 
     virtual size_t size() const noexcept = 0;
     virtual size_t dim() const noexcept = 0;
+
+    // Not used by the library itself, which is not thread-safe for writes.
+    // Callers sharing an index across threads (the Python bindings) take it
+    // shared for queries and exclusive for add/train/setters; for a
+    // RefineIndex they lock it first, then its base.
+    std::shared_mutex& mutex() const noexcept { return mutex_; }
+
+private:
+    mutable std::shared_mutex mutex_;
 };
 
 } // namespace vecengine
