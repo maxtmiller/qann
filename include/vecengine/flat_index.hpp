@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <vector>
 #include <span>
+#include <memory>
+#include <iosfwd>
 
 namespace vecengine {
 
@@ -18,6 +20,9 @@ public:
 
     void add(span<const float> vec) override;
     vector<Neighbor> query(span<const float> vec, size_t k) const override;
+
+    void save(std::ostream& out) const override;
+    static std::unique_ptr<FlatIndex> load_body(std::istream& in);
 
     size_t size() const noexcept override { return count_; }
     size_t dim() const noexcept override { return dim_; }

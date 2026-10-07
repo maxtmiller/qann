@@ -5,6 +5,7 @@
 #include "parallel.hpp"
 #include "profile.hpp"
 #include "topk.hpp"
+#include "serialize.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -25,6 +26,7 @@ using std::pair;
 
 IVFIndex::IVFIndex(size_t dim, size_t nlist, size_t nprobe): dim_(dim), nlist_(nlist), nprobe_(nprobe)  {
     if (nlist < 100 || nlist > 65535) throw std::invalid_argument("nlist must be in [100, 65535]");
+    if (dim == 0) throw std::invalid_argument("dim must be >= 1");
     coarse_centroids_.reserve(dim_ * nlist_);
 }
 
@@ -220,5 +222,87 @@ void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_i
     trained_ = true;
 }
 
+void IVFIndex::save(std::ostream& out) const {
+    using namespace detail;
+
+    write_header(out, IndexKind::IVF);
+    write_pod(out, static_cast<uint64_t>(dim_));
+    write_pod(out, static_cast<uint64_t>(nlist_));
+    write_pod(out, static_cast<uint64_t>(nprobe_));
+    write_pod(out, static_cast<uint64_t>(n_total_));
+    write_pod(out, static_cast<uint8_t>(trained_));
+    write_pod(out, static_cast<uint8_t>(pq_distance_));
+    write_vec(out, coarse_centroids_);
+    write_pod(out, static_cast<uint8_t>(pq_ != nullptr));
+    if (pq_) pq_->save(out);
+
+    static const InvertedList empty;
+    for (uint16_t i = 0; i < nlist_; ++i) {
+        auto it = data_.find(i);
+        const InvertedList& list = it == data_.end() ? empty : it->second;
+        write_vec(out, list.ids);
+        if (pq_) write_vec(out, list.codes); else write_vec(out, list.vecs);
+    }
+}
+
+std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in) {
+    using namespace detail;
+
+    const auto dim = read_pod<uint64_t>(in);
+    const auto n_list = read_pod<uint64_t>(in);
+    const auto n_probe = read_pod<uint64_t>(in);
+    const auto n_total = read_pod<uint64_t>(in);
+    const auto trained = read_pod<uint8_t>(in);
+    const auto pq_distance = read_pod<uint8_t>(in);
+
+    if (dim == 0 || n_total > UINT32_MAX || trained > 1) throw std::runtime_error("corrupt file: invalid IVFIndex shape");
+
+    auto index = std::make_unique<IVFIndex>(dim, n_list, 1);
+    if (dim > UINT64_MAX / n_list) throw std::runtime_error("corrupt file: invalid IVFIndex shape");
+    index->set_nprobe(n_probe);
+
+    auto coarse_centroids = read_vec<float>(in, n_list * dim);
+    index->coarse_centroids_ = std::move(coarse_centroids);
+
+    if (pq_distance > static_cast<uint8_t>(PQDistance::SDC)) throw std::runtime_error("corrupt file: invalid IVFIndex shape");
+    if (!trained && n_total > 0) throw std::runtime_error("corrupt file: invalid IVFIndex shape");
+    if ((trained && index->coarse_centroids_.size() != n_list * dim) || (!trained && index->coarse_centroids_.size() != 0)) throw std::runtime_error("corrupt file: invalid IVFIndex shape");
+
+    auto pq_enabled = read_pod<uint8_t>(in);
+    if (pq_enabled) {
+        index->pq_ = std::make_unique<PQCodebook>(PQCodebook::load(in));
+        if (index->pq_->dim() != dim) throw std::runtime_error("corrupt file: invalid IVFIndex shape");
+    }
+
+    const size_t num_subspaces = index->pq_ ? index->pq_->num_subspaces() : 0;
+    uint64_t seen = 0;
+    for (size_t i = 0; i < n_list; ++i) {
+        InvertedList list;
+        list.ids = read_vec<uint32_t>(in, n_total);
+
+        if (index->pq_) {
+            const uint64_t expected = list.ids.size() * num_subspaces;
+            list.codes = read_vec<uint8_t>(in, expected);
+            if (list.codes.size() != expected) throw std::runtime_error("corrupt file: IVF code length mismatch");
+        } else {
+            const uint64_t expected = list.ids.size() * dim;
+            list.vecs = read_vec<float>(in, expected);
+            if (list.vecs.size() != expected) throw std::runtime_error("corrupt file: IVF vector length mismatch");
+        }
+
+        for (uint32_t id : list.ids)
+            if (id >= n_total) throw std::runtime_error("corrupt file: IVF id out of range");
+
+        seen += list.ids.size();
+        if (!list.ids.empty()) index->data_.emplace(static_cast<uint16_t>(i), std::move(list));
+    }
+    if (seen != n_total) throw std::runtime_error("corrupt file: invalid IVFIndex shape");
+
+    index->n_total_ = n_total;
+    index->trained_ = trained;
+    index->pq_distance_ = static_cast<PQDistance>(pq_distance);
+
+    return index;
+}
 
 }

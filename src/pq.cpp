@@ -1,5 +1,6 @@
 #include "kmeans.hpp"
 #include "parallel.hpp"
+#include "serialize.hpp"
 #include "vecengine/pq.hpp"
 #include "vecengine/distance.hpp"
 
@@ -17,6 +18,9 @@ using std::size_t;
 
 PQCodebook::PQCodebook(size_t dim, size_t num_subspaces, size_t centroids_per_subspace)
     : dim_(dim), num_subspaces_(num_subspaces), centroids_per_subspace_(centroids_per_subspace) {
+
+    if (dim == 0 || num_subspaces == 0) throw std::invalid_argument("dim and num_subspaces must be >= 1");
+
     if (dim % num_subspaces != 0)
         throw std::invalid_argument("dim must be divisible by num_subspaces");
     if (centroids_per_subspace == 0 || centroids_per_subspace > 256)
@@ -39,33 +43,7 @@ void PQCodebook::train(span<const float> vectors, size_t num_vectors, size_t max
         std::copy_n(res.centroids.data(), res.centroids.size(), dst);
     });
 
-    for (size_t i = 0; i < num_subspaces_; ++i) {
-        for (size_t j = 0; j < sub_dim_; ++j) {
-            for (size_t k = 0; k < centroids_per_subspace_; ++k) {
-                centroids_t_[(i * sub_dim_ + j) * centroids_per_subspace_ + k] = centroids_[(i * centroids_per_subspace_ + k) * sub_dim_ + j];
-            }
-        }
-    }
-
-    // build SDC table
-    sdc_table_.assign(num_subspaces_ * centroids_per_subspace_ * centroids_per_subspace_, 0.0f);
-    for (size_t i = 0; i < num_subspaces_; ++i) {
-        float* sdc_subspace = sdc_table_.data() + (i * centroids_per_subspace_ * centroids_per_subspace_);
-
-        for (size_t j = 0; j < sub_dim_; ++j) {
-            const float* cent_t_pos = centroids_t_.data() + (i  * sub_dim_ + j) * centroids_per_subspace_;
-
-            for (size_t k = 0; k < centroids_per_subspace_; ++k) {
-                float val1 = cent_t_pos[k];
-                float* sdc_row = sdc_subspace + (k * centroids_per_subspace_);
-
-                for (size_t l = 0; l < centroids_per_subspace_; ++l) {
-                    float diff = val1 - cent_t_pos[l];
-                    sdc_row[l] += diff * diff;
-                }
-            }
-        }
-    }
+    build_tables();
 }
 
 vector<uint8_t> PQCodebook::encode(span<const float> vec) const {
@@ -122,6 +100,64 @@ float PQCodebook::distance_sdc(span<const uint8_t> query_code, span<const uint8_
     }
 
     return sum;
+}
+
+void PQCodebook::save(std::ostream& out) const {
+    using namespace detail;
+
+    write_pod(out, static_cast<uint64_t>(dim_));
+    write_pod(out, static_cast<uint64_t>(num_subspaces_));
+    write_pod(out, static_cast<uint64_t>(centroids_per_subspace_));
+    write_vec(out, centroids_);
+}
+
+PQCodebook PQCodebook::load(std::istream& in) {
+    using namespace detail;
+
+    const auto dim = read_pod<uint64_t>(in);
+    const auto num_subspaces = read_pod<uint64_t>(in);
+    const auto centroids_per_subspace = read_pod<uint64_t>(in);
+
+    PQCodebook cb(dim, num_subspaces, centroids_per_subspace);
+
+    const uint64_t expected_size = num_subspaces * centroids_per_subspace * cb.sub_dim_;
+
+    cb.centroids_ = read_vec<float>(in, expected_size);
+    if (cb.centroids_.size() != expected_size) throw std::runtime_error("corrupt file: unexpected number of centroids");
+
+    cb.build_tables();
+    return cb;
+}
+
+
+void PQCodebook::build_tables() {
+    for (size_t i = 0; i < num_subspaces_; ++i) {
+        for (size_t j = 0; j < sub_dim_; ++j) {
+            for (size_t k = 0; k < centroids_per_subspace_; ++k) {
+                centroids_t_[(i * sub_dim_ + j) * centroids_per_subspace_ + k] = centroids_[(i * centroids_per_subspace_ + k) * sub_dim_ + j];
+            }
+        }
+    }
+
+    // build SDC table
+    sdc_table_.assign(num_subspaces_ * centroids_per_subspace_ * centroids_per_subspace_, 0.0f);
+    for (size_t i = 0; i < num_subspaces_; ++i) {
+        float* sdc_subspace = sdc_table_.data() + (i * centroids_per_subspace_ * centroids_per_subspace_);
+
+        for (size_t j = 0; j < sub_dim_; ++j) {
+            const float* cent_t_pos = centroids_t_.data() + (i  * sub_dim_ + j) * centroids_per_subspace_;
+
+            for (size_t k = 0; k < centroids_per_subspace_; ++k) {
+                float val1 = cent_t_pos[k];
+                float* sdc_row = sdc_subspace + (k * centroids_per_subspace_);
+
+                for (size_t l = 0; l < centroids_per_subspace_; ++l) {
+                    float diff = val1 - cent_t_pos[l];
+                    sdc_row[l] += diff * diff;
+                }
+            }
+        }
+    }
 }
 
 } // namespace vecengine

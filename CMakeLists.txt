@@ -122,6 +122,7 @@ if(VECENGINE_BUILD_TESTS)
 # ---------------------------------------------------------------------------
 add_executable(test_vecengine
   tests/test_distance.cpp
+  tests/test_serialize.cpp
 )
 
 target_link_libraries(test_vecengine PRIVATE
