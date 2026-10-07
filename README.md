@@ -2,7 +2,7 @@
 
 QaNN (**Q**uantized **N**earest **N**eighbors) is a Python library for fast nearest-neighbor search over float32 vectors. It offers exact search, inverted-file (IVF) search, product quantization (PQ) compression and exact re-ranking, all implemented in multithreaded, SIMD-accelerated C++ and driven from NumPy.
 
-> **Alpha:** under active development. The API may change between releases, and indexes cannot be saved or loaded yet.
+> **Alpha:** under active development. The API may change between releases.
 
 ## Install
 
@@ -46,6 +46,7 @@ Every index has the same core methods:
 | `query(query, k)` | k nearest neighbors for a single `(dim,)` vector such as `x[i]`. Returns 1D `(ids, dists)`. |
 | `size()` | Number of vectors added. |
 | `dim()` | Vector dimension. |
+| `save(path)` | Save the index to a file; see [Saving and loading](#saving-and-loading). |
 
 ### `FlatIndex(dim)`
 
@@ -82,7 +83,7 @@ ivf.nprobe = 32   # trade speed for recall
 
 ### `RefineIndex(base, k_factor=10)`
 
-Wraps a trained, empty approximate index. Each query fetches `k * k_factor` candidates from `base`, then re-ranks them with exact distances against full-precision copies of the vectors. Add vectors through the `RefineIndex`, not the base. `k_factor` is a property and can be changed at any time.
+Wraps a trained, empty approximate index. Each query fetches `k * k_factor` candidates from `base`, then re-ranks them with exact distances against full-precision copies of the vectors. Add vectors through the `RefineIndex`, not the base. `k_factor` is a property and can be changed at any time, and the read-only `base` property returns the wrapped index, e.g. to change `nprobe`.
 
 This is the usual way to combine PQ's speed with near-exact ranking. It keeps the original vectors in memory alongside the PQ codes.
 
@@ -98,6 +99,25 @@ ivf.train(x)
 ```
 
 `IndexType` is `Flat` or `IVF`. `IndexOptions` fields and defaults: `capacity` (Flat initial reserve, 1024), `nlist` (100), `nprobe` (10), `pq_subspaces` (0, meaning no PQ) and `pq_centroids` (256).
+
+## Saving and loading
+
+Any index can be saved to a file and loaded back, including its training, so it doesn't have to be retrained or re-added each run:
+
+```python
+index.save("vectors.qann")          # str or pathlib.Path
+
+index = qann.load("vectors.qann")   # returns a FlatIndex, IVFIndex or RefineIndex
+ids, dists = index.batch_query(queries, 10)
+```
+
+- **Everything is restored:** vectors, ids, IVF centroids, PQ codebooks and settings such as `nprobe`, `pq_distance` and `k_factor`. A loaded index gives identical results and keeps accepting `add`.
+- **A `RefineIndex` file contains its base index**, so loading one restores both. Tune the base through `loaded.base`, e.g. `loaded.base.nprobe = 32`.
+- **Saving is safe to interrupt:** the file is written next to the target as `<path>.tmp` and renamed into place when complete, so a failed save never leaves a partial file or destroys an existing one.
+- **Bad files raise `RuntimeError`:** a missing, truncated or corrupted file, or one that isn't a QaNN index, is rejected instead of loading garbage.
+- **Files are versioned.** A file can be loaded by any QaNN release that supports its format version; if a future release changes the format, loading an older file raises `RuntimeError` rather than misreading it.
+
+`PQCodebook` on its own can't be saved yet; save the `IVFIndex` that uses it instead.
 
 ## Product quantization
 

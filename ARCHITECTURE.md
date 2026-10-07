@@ -29,18 +29,22 @@ vecengine/
 │   ├── ivf_index.hpp               # IVF index, optional PQ
 │   ├── pq.hpp                      # PQCodebook + PQDistance
 │   ├── refine_index.hpp            # exact re-ranking wrapper
-│   └── index_factory.hpp           # make_index() + IndexOptions
+│   └── index_factory.hpp           # make_index() + IndexOptions, save_index() / load_index()
 ├── src/
 │   ├── distance.cpp                # scalar / AVX2 / NEON kernels
 │   ├── kmeans.hpp / kmeans.cpp     # internal k-means helper (not public API)
 │   ├── parallel.hpp                # internal parallel_for (not public API)
+│   ├── serialize.hpp               # internal binary I/O helpers + file header (not public API)
 │   ├── index.cpp                   # default Index::add_batch / query_batch
 │   ├── pq.cpp
 │   ├── flat_index.cpp
 │   ├── ivf_index.cpp
 │   ├── refine_index.cpp
 │   └── index_factory.cpp
-├── tests/test_distance.cpp         # Catch2 v3 tests for every layer
+├── tests/
+│   ├── test_distance.cpp           # Catch2 v3 tests for every layer
+│   ├── test_serialize.cpp          # save/load round trips and corrupt-file rejection
+│   └── test_python.py              # pytest smoke + save/load tests for the module
 ├── benchmarks/
 │   ├── bench_distance.cpp          # Google Benchmark distance kernels
 │   ├── bench_indexes.py            # recall vs QPS on SIFT
@@ -190,6 +194,8 @@ The residual is rebuilt per probed list because it depends on the cluster's cent
 
 `RefineIndex(base, k_factor = 10)` wraps an **empty, trained** approximate index by reference and keeps its own row-major copy of the raw vectors.
 
+A RefineIndex built this way holds `base` by reference (`Index& base_`); one created by `load_body` owns its base through `owned_base_`, declared before `base_` so it is initialized first, and binds `base_` to it via a private constructor. `base()` exposes the wrapped index either way, so a loaded index can still be tuned.
+
 - `add(v)`: forwards to `base`, then appends the raw floats, so ID `i` is at `data_[i * dim]`.
 - `add_batch(vecs, n)`: forwards to `base.add_batch` and appends all rows at once.
 - `query(q, k)`: asks `base` for `min(k * k_factor, size())` candidates, replaces each approximate distance with the exact `l2_distance` against its raw vector, and returns the exact top `k`.
@@ -199,6 +205,31 @@ It only helps when `base` ranks with approximate distances (IVF + PQ). It restor
 ### `index_factory.hpp`: `make_index`
 
 `make_index(IndexType, dim, IndexOptions)` returns `unique_ptr<Index>`. `IndexOptions` holds `capacity` (Flat), `nlist`, `nprobe`, `pq_subspaces` (0 = PQ off) and `pq_centroids` (IVF). IVF-specific calls like `train()` require the concrete `IVFIndex`.
+
+`load_index(std::istream&)` reads a file header and dispatches to `FlatIndex::load_body`, `IVFIndex::load_body` or `RefineIndex::load_body`. The path overloads wrap it for files:
+
+- `save_index(index, path)` writes to `path + ".tmp"`, checks the stream after `close()` (write errors don't throw on their own), then renames into place; on any failure it removes the `.tmp` file and rethrows.
+- `load_index(path)` opens in binary mode, rethrows `invalid_argument` from constructors and setters (bad `nlist`, `nprobe`, ...) as `runtime_error("corrupt file: ...")` so every bad file reports the same way, and rejects trailing bytes after the index.
+
+---
+
+## File Format (`src/serialize.hpp`)
+
+Binary, little-endian (a `static_assert` requires a little-endian host), every size and count stored as `uint64`. Vectors are stored as a `uint64` element count followed by the raw elements (`write_vec` / `read_vec`).
+
+Every index starts with a 9-byte header: magic `QANN` (`uint32`), format version (`uint32`, currently 1) and an `IndexKind` tag (`uint8`). `Index::save` writes header + body; `load_index` reads the header and the type's static `load_body` reads only the body.
+
+| Kind | Body |
+| --- | --- |
+| `Flat` (1) | `dim`, `count`, `data` (`count * dim` floats) |
+| `IVF` (2) | `dim`, `nlist`, `nprobe`, `n_total`, `trained` (u8), `pq_distance` (u8), coarse centroids (`nlist * dim`, or empty if untrained), PQ flag (u8) + `PQCodebook` if set, then `nlist` lists in cluster order `0..nlist-1`, each `ids` + `codes` (PQ) or `vecs` (no PQ); empty lists are written as empty vectors |
+| `Refine` (3) | `k_factor`, `count`, the base index (full header + body), `data` (`count * dim` floats) |
+
+`PQCodebook` (inside IVF, no header): `dim`, `num_subspaces`, `centroids_per_subspace`, `centroids_`. `centroids_t_` and `sdc_table_` are derived and rebuilt on load by `build_tables()`, the same code `train()` runs, so they come out bit-identical.
+
+**Validation on load.** Files are untrusted input, so every loader checks before allocating or indexing: `read_vec` takes a `max_len` and callers then require the exact expected length; sizes are checked against overflow (`count > UINT64_MAX / dim`); IVF ids must be `< n_total` and list sizes must sum to `n_total`; the PQ codebook's `dim` must match the index; a Refine's `count` must equal its base's `size()` (queries index the raw vectors by base ids). A Refine base must be Flat or IVF, which also stops a crafted file from nesting Refines until the stack overflows. Any failure throws `runtime_error`.
+
+**Changing the format.** `IndexKind` values are append-only: never renumber or reuse one. Bump `kFormatVersion` whenever an existing type's layout changes, and either reject or explicitly read older versions in its `load_body`.
 
 ---
 
@@ -269,9 +300,11 @@ table = pq.compute_adc_table(x[1])     # (16 * 256,) float32
 pq.distance_adc(table, code)
 ```
 
-`RefineIndex` holds its base by reference; `keep_alive` keeps the Python base object alive as long as the wrapper exists.
+`RefineIndex` holds its base by reference; `keep_alive` keeps the Python base object alive as long as the wrapper exists. A `RefineIndex` returned by `load` owns its base instead (`owned_base_`).
 
 Also exposed: `FlatIndex`, `IndexType`, `IndexOptions`, `make_index`, `set_num_threads(n)` / `num_threads()`, and row-wise `l2_distance(a, b)` / `cosine_distance(a, b)`.
+
+Save/load: `save(path)` is bound once on `Index` and inherited by every index class; `qann.load(path)` binds the path overload of `load_index` and returns the concrete type. Paths go through nanobind's `std::filesystem::path` caster, so `str` and `pathlib.Path` both work. `RefineIndex.base` is a read-only property returned with `rv_policy::reference_internal`, which keeps the RefineIndex alive while Python holds its base (needed for a loaded RefineIndex, which owns its base).
 
 Results are NumPy arrays that take ownership of the C++ buffer (no copy): IDs are `int64`, distances `float32`, codes `uint8`. `query` returns 1D arrays with one entry per result. `batch_query` returns `(num_queries, k)` arrays; a row with fewer than `k` results is padded with ID `-1` and distance `inf`.
 
@@ -283,7 +316,7 @@ Results are NumPy arrays that take ownership of the C++ buffer (no copy): IDs ar
 pip install .               # builds the Python module into a wheel (no C++ tests)
 ./build.sh                  # Release build in ./build/, then ctest
 ./build.sh build Debug      # Debug build (asserts on)
-./build/test_vecengine "[pq]"   # run one tag: [l2] [cosine] [index] [ivf] [pq] [adc] [sdc] [refine] ...
+./build/test_vecengine "[pq]"   # run one tag: [l2] [cosine] [index] [ivf] [pq] [adc] [sdc] [refine] [serialize] [file] ...
 ./build/bench_vecengine
 ```
 
@@ -303,4 +336,3 @@ pip install .               # builds the Python module into a wheel (no C++ test
 
 - **IVF-PQ precomputed tables**: FAISS-style decomposition to avoid building an ADC table per probed list.
 - **HNSW**: graph index; slot reserved in `IndexType`.
-- **Persistence**: no save/load of trained indexes.
