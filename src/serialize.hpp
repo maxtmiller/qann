@@ -19,7 +19,8 @@ static_assert(std::endian::native == std::endian::little, "qann index files assu
 
 // "QANN" read as a little-endian uint32.
 inline constexpr uint32_t kMagic = 0x4E4E4151;
-inline constexpr uint32_t kFormatVersion = 1;
+inline constexpr uint32_t kFormatVersion = 2; // Current writer version
+inline constexpr uint32_t kMinFormatVersion = 1; // Oldest readable version
 
 // Type tag stored in each header. Values are part of the file format: never
 // renumber or reuse them, only append.
@@ -77,6 +78,12 @@ vector<T> read_vec(std::istream& in, uint64_t max_len) {
     return v;
 }
 
+// Header read from a file by read_header. The version is the format version
+struct Header {
+    IndexKind kind;
+    uint32_t version;
+};
+
 // Writes magic, format version and the type tag.
 inline void write_header(std::ostream& out, IndexKind kind) {
     write_pod(out, kMagic);
@@ -87,23 +94,24 @@ inline void write_header(std::ostream& out, IndexKind kind) {
 // Reads and validates a header written by write_header. Throws
 // std::runtime_error on a wrong magic, an unsupported version or an unknown
 // type tag.
-inline IndexKind read_header(std::istream& in) {
+inline Header read_header(std::istream& in) {
 
     if (read_pod<uint32_t>(in) != kMagic) throw std::runtime_error("not a qann index file");
 
     uint32_t version = read_pod<uint32_t>(in);
-    if (version != kFormatVersion) throw std::runtime_error("unsupported format version");
+    if (version < kMinFormatVersion || version > kFormatVersion)
+            throw std::runtime_error("unsupported format version");
 
     uint8_t kind = read_pod<uint8_t>(in);
     switch (kind) {
         case static_cast<uint8_t>(IndexKind::Flat):
-            return IndexKind::Flat;
+            return {IndexKind::Flat, version};
         case static_cast<uint8_t>(IndexKind::IVF):
-            return IndexKind::IVF;
+            return {IndexKind::IVF, version};
         case static_cast<uint8_t>(IndexKind::Refine):
-            return IndexKind::Refine;
+            return {IndexKind::Refine, version};
         default:
-            throw std::runtime_error("unknown index kind"); 
+            throw std::runtime_error("unknown index kind");
     }
 }
 

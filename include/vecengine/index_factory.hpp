@@ -11,6 +11,7 @@ namespace vecengine {
 
 using std::size_t;
 
+// Index types make_index() can build.
 enum class IndexType {
     Flat,
     IVF,
@@ -24,6 +25,7 @@ struct IndexOptions {
     size_t nprobe = 10;     // IVFIndex: clusters scanned per query
     size_t pq_subspaces = 0;   // IVFIndex: PQ subspaces, 0 = PQ off
     size_t pq_centroids = 256; // IVFIndex: PQ centroids per subspace
+    bool custom_ids = false;   // both: add_batch() takes user ids
 };
 
 // Constructs the requested index type. Caller owns the result via unique_ptr

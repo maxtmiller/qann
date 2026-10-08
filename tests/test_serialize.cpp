@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "vecengine/flat_index.hpp"
+#include "vecengine/id_map.hpp"
 #include "vecengine/index_factory.hpp"
 #include "vecengine/ivf_index.hpp"
 #include "vecengine/pq.hpp"
@@ -12,6 +13,7 @@
 #include <fstream>
 #include <memory>
 #include <random>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -40,7 +42,9 @@ TEST_CASE("serialize: header, pod and vector round-trip", "[serialize]") {
     write_vec(s, std::vector<uint8_t>{});
 
     REQUIRE(s.str().substr(0, 4) == "QANN");
-    REQUIRE(read_header(s) == IndexKind::IVF);
+    const Header header = read_header(s);
+    REQUIRE(header.kind == IndexKind::IVF);
+    REQUIRE(header.version == kFormatVersion);
     REQUIRE(read_pod<uint64_t>(s) == 42);
     REQUIRE(read_vec<float>(s, 3) == std::vector<float>{1.5f, 2.5f, 3.5f});
     REQUIRE(read_vec<uint8_t>(s, 0).empty());
@@ -167,8 +171,9 @@ TEST_CASE("PQCodebook: load rejects truncated and corrupt data", "[pq][serialize
 static std::unique_ptr<FlatIndex> flat_roundtrip(const FlatIndex& index) {
     std::stringstream s;
     index.save(s);
-    REQUIRE(read_header(s) == IndexKind::Flat);
-    return FlatIndex::load_body(s);
+    const Header header = read_header(s);
+    REQUIRE(header.kind == IndexKind::Flat);
+    return FlatIndex::load_body(s, header.version);
 }
 
 TEST_CASE("FlatIndex: rejects zero dim", "[index][serialize]") {
@@ -223,21 +228,21 @@ TEST_CASE("FlatIndex: load rejects truncated and corrupt data", "[index][seriali
 
     SECTION("truncated") {
         std::stringstream t(body.substr(0, body.size() / 2));
-        REQUIRE_THROWS_AS(FlatIndex::load_body(t), std::runtime_error);
+        REQUIRE_THROWS_AS(FlatIndex::load_body(t, kFormatVersion), std::runtime_error);
     }
 
     SECTION("zero dim") {
         std::stringstream t;
         write_pod<uint64_t>(t, 0);
         write_pod<uint64_t>(t, n);
-        REQUIRE_THROWS_AS(FlatIndex::load_body(t), std::runtime_error);
+        REQUIRE_THROWS_AS(FlatIndex::load_body(t, 1), std::runtime_error);
     }
 
     SECTION("count that overflows count * dim") {
         std::stringstream t;
         write_pod<uint64_t>(t, dim);
         write_pod<uint64_t>(t, UINT64_MAX / 2);
-        REQUIRE_THROWS_AS(FlatIndex::load_body(t), std::runtime_error);
+        REQUIRE_THROWS_AS(FlatIndex::load_body(t, 1), std::runtime_error);
     }
 
     SECTION("count does not match data length") {
@@ -245,7 +250,7 @@ TEST_CASE("FlatIndex: load rejects truncated and corrupt data", "[index][seriali
         write_pod<uint64_t>(t, dim);
         write_pod<uint64_t>(t, n);
         write_vec(t, std::vector<float>((n - 1) * dim));
-        REQUIRE_THROWS_AS(FlatIndex::load_body(t), std::runtime_error);
+        REQUIRE_THROWS_AS(FlatIndex::load_body(t, 1), std::runtime_error);
     }
 }
 
@@ -256,13 +261,15 @@ TEST_CASE("FlatIndex: load rejects truncated and corrupt data", "[index][seriali
 static std::unique_ptr<IVFIndex> ivf_roundtrip(const IVFIndex& index) {
     std::stringstream s;
     index.save(s);
-    REQUIRE(read_header(s) == IndexKind::IVF);
-    return IVFIndex::load_body(s);
+    const Header header = read_header(s);
+    REQUIRE(header.kind == IndexKind::IVF);
+    return IVFIndex::load_body(s, header.version);
 }
 
 static void require_same_results(const Index& a, const Index& b, const std::vector<float>& queries, size_t nq, size_t k) {
-    auto expected = a.query_batch(queries, nq, k);
-    auto actual = b.query_batch(queries, nq, k);
+    const std::span<const float> q(queries.data(), nq * a.dim());
+    auto expected = a.query_batch(q, nq, k);
+    auto actual = b.query_batch(q, nq, k);
     for (size_t q = 0; q < nq; ++q) {
         REQUIRE(actual[q].size() == expected[q].size());
         for (size_t j = 0; j < expected[q].size(); ++j) {
@@ -335,7 +342,7 @@ TEST_CASE("IVFIndex: untrained and empty indexes round-trip", "[ivf][serialize]"
     }
 }
 
-// Writes an IVF body by hand: plain (no PQ), trained, all centroids zero,
+// Writes a version-1 IVF body (no id map) by hand: plain (no PQ), trained, all centroids zero,
 // with list 0 holding `ids` and every other list empty.
 static std::stringstream ivf_body(uint64_t n_total, const std::vector<uint32_t>& ids, uint64_t nprobe = 1) {
     const uint64_t dim = 2, nlist = 100;
@@ -360,7 +367,7 @@ static std::stringstream ivf_body(uint64_t n_total, const std::vector<uint32_t>&
 TEST_CASE("IVFIndex: load rejects truncated and corrupt data", "[ivf][serialize]") {
     SECTION("hand-written body is valid") {
         auto t = ivf_body(2, {0, 1});
-        REQUIRE(IVFIndex::load_body(t)->size() == 2);
+        REQUIRE(IVFIndex::load_body(t, 1)->size() == 2);
     }
 
     SECTION("truncated") {
@@ -377,23 +384,23 @@ TEST_CASE("IVFIndex: load rejects truncated and corrupt data", "[ivf][serialize]
         const std::string body = s.str().substr(s.tellg());
         for (size_t cut : {size_t{10}, body.size() / 3, body.size() - 1}) {
             std::stringstream t(body.substr(0, cut));
-            REQUIRE_THROWS_AS(IVFIndex::load_body(t), std::runtime_error);
+            REQUIRE_THROWS_AS(IVFIndex::load_body(t, kFormatVersion), std::runtime_error);
         }
     }
 
     SECTION("nprobe = 0") {
         auto t = ivf_body(1, {0}, 0);
-        REQUIRE_THROWS_AS(IVFIndex::load_body(t), std::invalid_argument);
+        REQUIRE_THROWS_AS(IVFIndex::load_body(t, 1), std::invalid_argument);
     }
 
     SECTION("id >= n_total") {
         auto t = ivf_body(1, {5});
-        REQUIRE_THROWS_AS(IVFIndex::load_body(t), std::runtime_error);
+        REQUIRE_THROWS_AS(IVFIndex::load_body(t, 1), std::runtime_error);
     }
 
     SECTION("list sizes do not sum to n_total") {
         auto t = ivf_body(3, {0, 1});
-        REQUIRE_THROWS_AS(IVFIndex::load_body(t), std::runtime_error);
+        REQUIRE_THROWS_AS(IVFIndex::load_body(t, 1), std::runtime_error);
     }
 
     SECTION("PQ codebook dim does not match the index") {
@@ -408,7 +415,7 @@ TEST_CASE("IVFIndex: load rejects truncated and corrupt data", "[ivf][serialize]
         write_vec(t, std::vector<float>(nlist * dim));
         write_pod<uint8_t>(t, 1);
         PQCodebook(4, 2, 1).save(t);
-        REQUIRE_THROWS_AS(IVFIndex::load_body(t), std::runtime_error);
+        REQUIRE_THROWS_AS(IVFIndex::load_body(t, 1), std::runtime_error);
     }
 }
 
@@ -494,34 +501,37 @@ TEST_CASE("RefineIndex: load rejects truncated and corrupt data", "[refine][seri
         write_pod<uint64_t>(t, count);
         flat.save(t);
         write_vec(t, std::vector<float>(data_len));
+        IdMap ids;
+        ids.add(count, nullptr);
+        ids.save(t);
         return t;
     };
 
     SECTION("hand-written body is valid") {
         auto t = body(3, n, n * dim);
-        REQUIRE(RefineIndex::load_body(t)->size() == n);
+        REQUIRE(RefineIndex::load_body(t, kFormatVersion)->size() == n);
     }
 
     SECTION("k_factor = 0") {
         auto t = body(0, n, n * dim);
-        REQUIRE_THROWS_AS(RefineIndex::load_body(t), std::runtime_error);
+        REQUIRE_THROWS_AS(RefineIndex::load_body(t, kFormatVersion), std::runtime_error);
     }
 
     SECTION("count does not match base size") {
         auto t = body(3, n + 1, (n + 1) * dim);
-        REQUIRE_THROWS_AS(RefineIndex::load_body(t), std::runtime_error);
+        REQUIRE_THROWS_AS(RefineIndex::load_body(t, kFormatVersion), std::runtime_error);
     }
 
     SECTION("data length mismatch") {
         auto t = body(3, n, n * dim - 1);
-        REQUIRE_THROWS_AS(RefineIndex::load_body(t), std::runtime_error);
+        REQUIRE_THROWS_AS(RefineIndex::load_body(t, kFormatVersion), std::runtime_error);
     }
 
     SECTION("truncated") {
         auto t = body(3, n, n * dim);
         const std::string bytes = t.str();
         std::stringstream cut(bytes.substr(0, bytes.size() - 1));
-        REQUIRE_THROWS_AS(RefineIndex::load_body(cut), std::runtime_error);
+        REQUIRE_THROWS_AS(RefineIndex::load_body(cut, kFormatVersion), std::runtime_error);
     }
 
     SECTION("nested RefineIndex base is rejected") {
@@ -532,7 +542,7 @@ TEST_CASE("RefineIndex: load rejects truncated and corrupt data", "[refine][seri
         write_pod<uint64_t>(t, 0);
         inner.save(t);
         write_vec(t, std::vector<float>{});
-        REQUIRE_THROWS_AS(RefineIndex::load_body(t), std::runtime_error);
+        REQUIRE_THROWS_AS(RefineIndex::load_body(t, kFormatVersion), std::runtime_error);
     }
 }
 
