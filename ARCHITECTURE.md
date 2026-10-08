@@ -217,7 +217,7 @@ A RefineIndex built this way holds `base` by reference (`Index& base_`); one cre
 - `remove(ids)`: removes the ids from its own map, then removes the same slots from the base (whose ids are its slots), so the base stops returning them.
 - `query(q, k)`: asks `base` for `min(k * k_factor, size())` candidates, replaces each approximate distance with the exact `l2_distance` against its raw vector, and returns the exact top `k` with ids from its own map. Returns nothing when every vector is deleted.
 
-Delete through the `RefineIndex`, not the base: deleting from the base directly hides the vector from results but the `RefineIndex` still counts it in `size()`.
+Changing the base directly would break that alignment (an add gives the base a vector the `RefineIndex` has no raw copy of; a remove hides a vector the `RefineIndex` still counts), so the constructor sets the base's `wrapped()` flag (an `std::atomic<bool>` on `Index`, cleared by `~RefineIndex`) and rejects a base that is already wrapped. The Python `add`/`remove` bindings check the flag under the index's write lock and raise `ValueError`. The C++ API doesn't enforce it, since `RefineIndex` itself calls `add_batch`/`remove` on its base.
 
 It only helps when `base` ranks with approximate distances (IVF + PQ). It restores recall but stores the raw vectors in RAM, so IVF + PQ + re-ranking uses more memory than plain IVF; in production the raw vectors would live on disk and only the candidates would be read. `k_factor` is a query-time setting; `k_factor = 1` returns the base's IDs with exact distances.
 

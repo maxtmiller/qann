@@ -122,6 +122,15 @@ static IdVector as_ids(nb::handle obj) {
     return nb::cast<IdVector>(np.attr("ascontiguousarray")(arr, nb::arg("dtype") = "int64"));
 }
 
+// Changing a RefineIndex's base directly would misalign the two (an add would
+// give the base a vector the RefineIndex has no copy of), so it is refused.
+// Called with the index locked, since a RefineIndex sets the flag under it.
+static void refuse_if_wrapped(const vecengine::Index& self, const char* what) {
+    if (self.wrapped())
+        throw std::invalid_argument(std::string("cannot ") + what + " on the base of a RefineIndex; " + what +
+                                    " through the RefineIndex instead");
+}
+
 // Add all rows of a (N x dim) matrix to the index, with one id per row when
 // the index uses custom ids.
 static void index_add(vecengine::Index &self, FloatMatrix data, std::optional<IdsArg> ids) {
@@ -136,13 +145,19 @@ static void index_add(vecengine::Index &self, FloatMatrix data, std::optional<Id
     }
 
     const int64_t* id_ptr = id_array ? id_array->data() : nullptr;
-    write_locked(self, [&] { self.add_batch(std::span<const float>(data.data(), data.size()), data.shape(0), id_ptr); });
+    write_locked(self, [&] {
+        refuse_if_wrapped(self, "add");
+        self.add_batch(std::span<const float>(data.data(), data.size()), data.shape(0), id_ptr);
+    });
 }
 
 // Delete the vectors with these ids; returns how many were deleted.
 static std::size_t index_remove(vecengine::Index& self, IdsArg ids) {
     IdVector id_array = as_ids(ids);
-    return write_locked(self, [&] { return self.remove(std::span<const int64_t>(id_array.data(), id_array.shape(0))); });
+    return write_locked(self, [&] {
+        refuse_if_wrapped(self, "remove");
+        return self.remove(std::span<const int64_t>(id_array.data(), id_array.shape(0)));
+    });
 }
 
 static std::size_t index_size(const vecengine::Index& self) {

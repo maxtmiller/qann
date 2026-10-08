@@ -84,7 +84,7 @@ ivf.nprobe = 32   # trade speed for recall
 
 ### `RefineIndex(base, k_factor=10, *, custom_ids=False)`
 
-Wraps a trained, empty approximate index created without custom ids (give the `RefineIndex` its own `custom_ids` instead). Each query fetches `k * k_factor` candidates from `base`, then re-ranks them with exact distances against full-precision copies of the vectors. Add and remove vectors through the `RefineIndex`, not the base. `k_factor` is a property and can be changed at any time, and the read-only `base` property returns the wrapped index, e.g. to change `nprobe`.
+Wraps a trained, empty approximate index created without custom ids (give the `RefineIndex` its own `custom_ids` instead). Each query fetches `k * k_factor` candidates from `base`, then re-ranks them with exact distances against full-precision copies of the vectors. Add and remove vectors through the `RefineIndex`: while it wraps a base, calling `add` or `remove` on the base itself raises `ValueError` (it would put the two out of step), and a base can only be wrapped by one `RefineIndex` at a time. Tuning the base (`nprobe`, `pq_distance`) is fine. `k_factor` is a property and can be changed at any time, and the read-only `base` property returns the wrapped index, e.g. to change `nprobe`.
 
 This is the usual way to combine PQ's speed with near-exact ranking. It keeps the original vectors in memory alongside the PQ codes.
 

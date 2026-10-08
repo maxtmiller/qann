@@ -349,3 +349,39 @@ def test_concurrent_remove_and_query(data):
     assert index.size() == len(data) - len(to_delete)
     found, _ = index.batch_query(data[:50], 10)
     assert not np.isin(found, to_delete).any()
+
+
+def test_base_of_refine_index_is_protected(data):
+    import gc
+
+    base = qann.IVFIndex(32, nlist=100, nprobe=8)
+    base.train(data, seed=1)
+    refine = qann.RefineIndex(base, k_factor=4)
+    refine.add(data[:100])
+
+    with pytest.raises(ValueError, match="through the RefineIndex"):
+        base.add(data[:5])
+    with pytest.raises(ValueError, match="through the RefineIndex"):
+        base.remove([0])
+    with pytest.raises(ValueError):
+        qann.RefineIndex(base)
+    assert base.size() == refine.size() == 100
+
+    # Tuning the base is still allowed, and changes through the RefineIndex reach it.
+    base.nprobe = 16
+    assert refine.remove([0, 1]) == 2
+    assert base.size() == 98
+
+    # Once the RefineIndex is gone, the base can be used on its own.
+    del refine
+    gc.collect()
+    base.add(data[100:105])
+    assert base.size() == 103
+
+
+def test_base_of_loaded_refine_index_is_protected(tmp_path, refine_index, data):
+    path = tmp_path / "refine.qann"
+    refine_index.save(path)
+    loaded = qann.load(path)
+    with pytest.raises(ValueError, match="through the RefineIndex"):
+        loaded.base.add(data[:2])
