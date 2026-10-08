@@ -31,7 +31,7 @@ ids, dists = index.batch_query(x[:5], 10)   # both shaped (5, 10)
 ## Conventions
 
 - **Vectors** are passed as 2D NumPy arrays of shape `(n, dim)`, except single vectors (`query`, `PQCodebook` methods), which are `(dim,)`. float32 C-contiguous arrays are used without copying; anything else (float64, Fortran order, strided slices) is converted first.
-- **IDs** are assigned in insertion order: the first vector added gets id 0, the next id 1, and so on across all `add` calls.
+- **IDs** are assigned in insertion order by default: the first vector added gets id 0, the next id 1, and so on across all `add` calls. Create an index with `custom_ids=True` to use your own ids instead; see [Custom ids and deleting](#custom-ids-and-deleting).
 - **Distances** are squared Euclidean (L2) distances, smallest first. For cosine similarity, L2-normalize vectors before adding and querying.
 - **Results** from `batch_query` are an `int64` id array and a `float32` distance array, both shaped `(num_queries, k)`. Rows with fewer than `k` hits are padded with id `-1` and distance `inf`.
 
@@ -41,14 +41,15 @@ Every index has the same core methods:
 
 | Method | Description |
 | --- | --- |
-| `add(data)` | Add an `(n, dim)` array of vectors. |
+| `add(data, ids=None)` | Add an `(n, dim)` array of vectors, with `n` ids if the index uses custom ids. |
 | `batch_query(queries, k)` | k nearest neighbors for each row of an `(nq, dim)` array, run in parallel. Returns `(ids, dists)`. |
 | `query(query, k)` | k nearest neighbors for a single `(dim,)` vector such as `x[i]`. Returns 1D `(ids, dists)`. |
-| `size()` | Number of vectors added. |
+| `remove(ids)` | Delete vectors by id; returns how many were deleted. |
+| `size()` | Number of vectors in the index (deleted ones excluded). |
 | `dim()` | Vector dimension. |
 | `save(path)` | Save the index to a file; see [Saving and loading](#saving-and-loading). |
 
-### `FlatIndex(dim)`
+### `FlatIndex(dim, *, custom_ids=False)`
 
 Exact brute-force search: no training, 100% recall, and query cost that grows linearly with the number of vectors. Good for up to a few hundred thousand vectors, or as ground truth when measuring recall.
 
@@ -58,7 +59,7 @@ index.add(x)
 ids, dists = index.batch_query(x[:10], 10)
 ```
 
-### `IVFIndex(dim, nlist, nprobe=10)`
+### `IVFIndex(dim, nlist, nprobe=10, *, custom_ids=False)`
 
 Partitions vectors into `nlist` clusters with k-means and, at query time, scans only the `nprobe` clusters closest to the query. Much faster than flat search at a small cost in recall.
 
@@ -81,9 +82,9 @@ ivf.add(x)
 ivf.nprobe = 32   # trade speed for recall
 ```
 
-### `RefineIndex(base, k_factor=10)`
+### `RefineIndex(base, k_factor=10, *, custom_ids=False)`
 
-Wraps a trained, empty approximate index. Each query fetches `k * k_factor` candidates from `base`, then re-ranks them with exact distances against full-precision copies of the vectors. Add vectors through the `RefineIndex`, not the base. `k_factor` is a property and can be changed at any time, and the read-only `base` property returns the wrapped index, e.g. to change `nprobe`.
+Wraps a trained, empty approximate index created without custom ids (give the `RefineIndex` its own `custom_ids` instead). Each query fetches `k * k_factor` candidates from `base`, then re-ranks them with exact distances against full-precision copies of the vectors. Add and remove vectors through the `RefineIndex`, not the base. `k_factor` is a property and can be changed at any time, and the read-only `base` property returns the wrapped index, e.g. to change `nprobe`.
 
 This is the usual way to combine PQ's speed with near-exact ranking. It keeps the original vectors in memory alongside the PQ codes.
 
@@ -100,6 +101,24 @@ ivf.train(x)
 
 `IndexType` is `Flat` or `IVF`. `IndexOptions` fields and defaults: `capacity` (Flat initial reserve, 1024), `nlist` (100), `nprobe` (10), `pq_subspaces` (0, meaning no PQ) and `pq_centroids` (256).
 
+## Custom ids and deleting
+
+By default an index numbers vectors 0, 1, 2, ... in the order they're added. To use your own ids (database keys, document ids, ...), create the index with `custom_ids=True` and pass one id per vector:
+
+```python
+index = qann.FlatIndex(128, custom_ids=True)
+index.add(vectors, ids=doc_ids)     # doc_ids: one int per row
+ids, dists = index.batch_query(queries, 10)   # ids are your doc_ids
+
+index.remove([doc_ids[0], doc_ids[1]])        # returns 2
+```
+
+- **Ids** can be a NumPy array of any integer type, a list or a `range`. They must be `>= 0` (`-1` marks missing results) and unique within the index; a bad batch raises an error and adds nothing.
+- **Every add must pass ids** on a `custom_ids=True` index, and an index created without it refuses them.
+- **`remove(ids)`** works with or without custom ids. Unknown and already deleted ids are skipped, so deleting twice is harmless. A deleted id can be added again, with a new vector.
+- **Deleted vectors keep their memory** for now: queries skip them, but the space isn't reclaimed.
+- For `make_index`, set `IndexOptions.custom_ids`.
+
 ## Saving and loading
 
 Any index can be saved to a file and loaded back, including its training, so it doesn't have to be retrained or re-added each run:
@@ -111,11 +130,11 @@ index = qann.load("vectors.qann")   # returns a FlatIndex, IVFIndex or RefineInd
 ids, dists = index.batch_query(queries, 10)
 ```
 
-- **Everything is restored:** vectors, ids, IVF centroids, PQ codebooks and settings such as `nprobe`, `pq_distance` and `k_factor`. A loaded index gives identical results and keeps accepting `add`.
+- **Everything is restored:** vectors, ids (including custom ids), deletions, IVF centroids, PQ codebooks and settings such as `nprobe`, `pq_distance` and `k_factor`. A loaded index gives identical results and keeps accepting `add` and `remove`.
 - **A `RefineIndex` file contains its base index**, so loading one restores both. Tune the base through `loaded.base`, e.g. `loaded.base.nprobe = 32`.
 - **Saving is safe to interrupt:** the file is written next to the target as `<path>.tmp` and renamed into place when complete, so a failed save never leaves a partial file or destroys an existing one.
 - **Bad files raise `RuntimeError`:** a missing, truncated or corrupted file, or one that isn't a QaNN index, is rejected instead of loading garbage.
-- **Files are versioned.** A file can be loaded by any QaNN release that supports its format version; if a future release changes the format, loading an older file raises `RuntimeError` rather than misreading it.
+- **Files are versioned.** Newer releases keep loading files saved by older ones (files from 0.1.0a4 load in 0.1.0a5). A file saved by a newer release than the one loading it raises `RuntimeError` rather than being misread.
 
 `PQCodebook` on its own can't be saved yet; save the `IVFIndex` that uses it instead.
 
