@@ -14,6 +14,7 @@ enum ProfSlot { kProfCoarse, kProfTable, kProfCodeScan, kProfRawScan, kProfDrain
 
 inline thread_local double g_prof[kProfSlots] = {}; // seconds per slot
 
+// Current time in seconds, for the profiling macros.
 inline double prof_now() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }

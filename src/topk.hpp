@@ -21,6 +21,7 @@ using std::vector;
 // candidates cost one comparison and an accepted one costs one append.
 class TopK {
 public:
+    // Keeps the best k; k must be >= 1.
     explicit TopK(size_t k) : k_(k) {
         assert(k > 0);
 
@@ -31,7 +32,7 @@ public:
     // entries have been kept.
     float threshold() const { return worst_; }
 
-    // Requires dist < threshold().
+    // Adds a candidate; requires dist < threshold().
     void push(float dist, size_t id) {
         assert(dist < worst_);
 

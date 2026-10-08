@@ -24,9 +24,10 @@ using std::vector;
 using std::span;
 using std::pair;
 
-IVFIndex::IVFIndex(size_t dim, size_t nlist, size_t nprobe): dim_(dim), nlist_(nlist), nprobe_(nprobe)  {
+IVFIndex::IVFIndex(size_t dim, size_t nlist, size_t nprobe, bool custom_ids): dim_(dim), nlist_(nlist), nprobe_(nprobe), id_map_(custom_ids)  {
     if (nlist < 100 || nlist > 65535) throw std::invalid_argument("nlist must be in [100, 65535]");
     if (dim == 0) throw std::invalid_argument("dim must be >= 1");
+    set_nprobe(nprobe);
     coarse_centroids_.reserve(dim_ * nlist_);
 }
 
@@ -36,7 +37,7 @@ void IVFIndex::set_nprobe(size_t nprobe) {
 }
 
 void IVFIndex::enable_pq(size_t num_subspaces, size_t centroids_per_subspace) {
-    if (n_total_ > 0 || trained_)
+    if (id_map_.slots() > 0 || trained_)
         throw std::logic_error("enable_pq must be called before train()/add()");
     pq_ = std::make_unique<PQCodebook>(dim_, num_subspaces, centroids_per_subspace);
 }
@@ -49,11 +50,12 @@ void IVFIndex::add(span<const float> vec) {
     size_t closest_index = vecengine::detail::nearest_centroid(vec.data(), coarse_centroids_.data(), nlist_, dim_);
 
     uint16_t cluster_id = static_cast<uint16_t>(closest_index);
-    uint32_t new_id = n_total_++;
+    const uint32_t slot = static_cast<uint32_t>(id_map_.slots());
+    id_map_.add(1, nullptr);
 
     InvertedList& list = data_[cluster_id];
     
-    list.ids.emplace_back(new_id);
+    list.ids.emplace_back(slot);
 
     // adds quantized vectors if pq enabled else full dimensional vectors 
     if (pq_enabled()) {
@@ -70,9 +72,12 @@ void IVFIndex::add(span<const float> vec) {
     }
 }
 
-void IVFIndex::add_batch(span<const float> vecs, size_t n) {
+void IVFIndex::add_batch(span<const float> vecs, size_t n, const int64_t* ids) {
     assert(vecs.size() == n * dim());
     if (!trained_) throw std::logic_error("train() has not be run yet");
+
+    const uint32_t first_slot = static_cast<uint32_t>(id_map_.slots());
+    id_map_.add(n, ids);
 
     vector<uint32_t> assign(n);
     detail::assign_nearest(vecs.data(), n, dim_, coarse_centroids_.data(), nlist_, dim_, assign.data());
@@ -97,7 +102,7 @@ void IVFIndex::add_batch(span<const float> vecs, size_t n) {
 
     for (size_t i = 0; i < n; ++i) {
         InvertedList& list = data_[static_cast<uint16_t>(assign[i])];
-        list.ids.push_back(n_total_++);
+        list.ids.push_back(first_slot + static_cast<uint32_t>(i));
 
         if (use_pq) {
             list.codes.insert(list.codes.end(), codes.begin() + i * code_bytes, codes.begin() + (i + 1) * code_bytes);
@@ -110,7 +115,6 @@ void IVFIndex::add_batch(span<const float> vecs, size_t n) {
 
 vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
     assert(vec.size() == dim_);
-    assert(k <= n_total_);
     if (!trained_) throw std::logic_error("train() has not be run yet");
 
     VECENGINE_PROF_START(t_coarse);
@@ -149,7 +153,8 @@ vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
 
         // lamdba function for adding to heap
         auto push = [&](float dist, size_t j) {
-            if (dist < top.threshold()) top.push(dist, list.ids[j]);
+            if (dist < top.threshold() && !id_map_.is_deleted(list.ids[j]))
+                top.push(dist, id_map_.label(list.ids[j]));
         };
 
         if (!pq_enabled()) {
@@ -196,8 +201,12 @@ vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
     return results;
 }
 
+size_t IVFIndex::remove(span<const int64_t> ids) {
+    return id_map_.remove(ids);
+}
+
 void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_iters, std::optional<uint32_t> seed) {
-    if (n_total_ > 0) throw std::logic_error("train() cannot be called after add()");
+    if (id_map_.slots() > 0) throw std::logic_error("train() cannot be called after add()");
     if (trained_) throw std::logic_error("train() has already been called");
     if (num_vectors < nlist_) throw std::invalid_argument("training set must have at least nlist vectors");
 
@@ -229,7 +238,7 @@ void IVFIndex::save(std::ostream& out) const {
     write_pod(out, static_cast<uint64_t>(dim_));
     write_pod(out, static_cast<uint64_t>(nlist_));
     write_pod(out, static_cast<uint64_t>(nprobe_));
-    write_pod(out, static_cast<uint64_t>(n_total_));
+    write_pod(out, static_cast<uint64_t>(id_map_.slots()));
     write_pod(out, static_cast<uint8_t>(trained_));
     write_pod(out, static_cast<uint8_t>(pq_distance_));
     write_vec(out, coarse_centroids_);
@@ -243,9 +252,10 @@ void IVFIndex::save(std::ostream& out) const {
         write_vec(out, list.ids);
         if (pq_) write_vec(out, list.codes); else write_vec(out, list.vecs);
     }
+    id_map_.save(out);
 }
 
-std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in) {
+std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version) {
     using namespace detail;
 
     const auto dim = read_pod<uint64_t>(in);
@@ -298,9 +308,11 @@ std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in) {
     }
     if (seen != n_total) throw std::runtime_error("corrupt file: invalid IVFIndex shape");
 
-    index->n_total_ = n_total;
     index->trained_ = trained;
     index->pq_distance_ = static_cast<PQDistance>(pq_distance);
+
+    if (version >= 2) index->id_map_ = detail::IdMap::load(in, n_total);
+    else index->id_map_.add(n_total, nullptr);
 
     return index;
 }

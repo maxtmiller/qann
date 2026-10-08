@@ -24,7 +24,7 @@ enum class PQDistance { ADC, SDC };
 // instead of `dim` floats.
 class PQCodebook {
 public:
-    // dim must be divisible by num_subspaces.
+    // dim and num_subspaces must be >= 1 and dim divisible by num_subspaces.
     // centroids_per_subspace must fit in uint8_t (<= 256); 256 is standard.
     PQCodebook(size_t dim, size_t num_subspaces, size_t centroids_per_subspace = 256);
 
@@ -87,9 +87,15 @@ public:
     // distances in sdc_table_ built once during train() - no float math.
     float distance_sdc(span<const uint8_t> query_code, span<const uint8_t> code) const;
 
+    // Writes the codebook's shape and centroids (no header; it is stored
+    // inside an IVFIndex body).
     void save(std::ostream& out) const;
+
+    // Reads what save() wrote and rebuilds the derived tables. Throws
+    // std::runtime_error on corrupt data.
     static PQCodebook load(std::istream& in);
 
+    // Shape of the codebook.
     size_t dim() const noexcept { return dim_; }
     size_t num_subspaces() const noexcept { return num_subspaces_; }
     size_t centroids_per_subspace() const noexcept { return centroids_per_subspace_; }
@@ -104,7 +110,7 @@ private:
     vector<float> centroids_t_; // m * sub_dim_ * k, contiguous over centroids for the ADC/SDC table loops
     vector<float> sdc_table_; // m * k * k, built once in train()
 
-    // Builds sdc_table_ from centroids_ after training
+    // Builds centroids_t_ and sdc_table_ from centroids_; called by train() and load().
     void build_tables();
 };
 

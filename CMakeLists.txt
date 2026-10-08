@@ -76,6 +76,7 @@ add_library(vecengine_core STATIC
   src/kmeans.cpp
   src/refine_index.cpp
   src/index_factory.cpp
+  src/id_map.cpp
 )
 
 target_include_directories(vecengine_core PUBLIC
@@ -123,6 +124,7 @@ if(VECENGINE_BUILD_TESTS)
 add_executable(test_vecengine
   tests/test_distance.cpp
   tests/test_serialize.cpp
+  tests/test_id_map.cpp
 )
 
 target_link_libraries(test_vecengine PRIVATE
@@ -132,6 +134,8 @@ target_link_libraries(test_vecengine PRIVATE
 
 # Lets tests reach internal headers like parallel.hpp.
 target_include_directories(test_vecengine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# Index files saved by older releases, for format compatibility tests.
+target_compile_definitions(test_vecengine PRIVATE QANN_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
 
 include(CTest)
 include(Catch)

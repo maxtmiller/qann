@@ -12,6 +12,8 @@ using std::size_t;
 using std::ptrdiff_t;
 using std::vector;
 
+// std::allocator replacement whose memory starts on an Align-byte boundary,
+// so SIMD loads can use aligned instructions.
 // Alignment must be a power of two >= alignof(T).
 // Use Align=32 for AVX2 (256-bit), Align=64 for AVX-512 (512-bit).
 template <typename T, size_t Align = 32>
@@ -27,9 +29,11 @@ struct AlignedAllocator {
 
     AlignedAllocator() noexcept = default;
 
+    // Converting copy, required by the allocator interface for rebinding.
     template <typename U>
     AlignedAllocator(const AlignedAllocator<U, Align>&) noexcept {}
 
+    // Memory for n T's, Align-aligned. Throws std::bad_alloc on failure.
     [[nodiscard]] T* allocate(size_type n) {
         if (n > max_size())
             throw std::bad_array_new_length{};
@@ -50,6 +54,7 @@ struct AlignedAllocator {
         return static_cast<T*>(ptr);
     }
 
+    // Frees memory from allocate().
     void deallocate(T* ptr, size_type /*n*/) noexcept {
 #if defined(_MSC_VER)
         _aligned_free(ptr);
@@ -58,6 +63,7 @@ struct AlignedAllocator {
 #endif
     }
 
+    // Largest n allocate() accepts.
     [[nodiscard]] size_type max_size() const noexcept {
         return std::numeric_limits<size_type>::max() / sizeof(T);
     }
@@ -66,6 +72,7 @@ struct AlignedAllocator {
     struct rebind { using other = AlignedAllocator<U, Align>; };
 };
 
+// Allocators are stateless, so any two compare equal.
 template <typename T, typename U, size_t A>
 bool operator==(const AlignedAllocator<T, A>&, const AlignedAllocator<U, A>&) noexcept { return true; }
 

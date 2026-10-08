@@ -21,7 +21,7 @@ float l2_distance_avx2(const float* a, const float* b, size_t n);
 float cosine_distance_scalar(const float* a, const float* b, size_t n);
 float cosine_distance_avx2(const float* a, const float* b, size_t n);
 
-// Dispatch wrappers: use AVX2 when available, else scalar.
+// Dispatch wrappers: use AVX2 or NEON when compiled for them, else scalar.
 inline float l2_distance(const float* a, const float* b, size_t n);
 inline float cosine_distance(const float* a, const float* b, size_t n);
 
@@ -29,7 +29,8 @@ inline float cosine_distance(const float* a, const float* b, size_t n);
 inline float l2_distance(span<const float> a, span<const float> b);
 inline float cosine_distance(span<const float> a, span<const float> b);
 
-// 
+// ARM NEON versions of the same two distances (used on Apple Silicon and
+// aarch64 Linux).
 float l2_distance_neon(const float* a, const float* b, std::size_t n);
 float cosine_distance_neon(const float* a, const float* b, std::size_t n);
 

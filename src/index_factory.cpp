@@ -14,9 +14,9 @@ namespace vecengine {
 std::unique_ptr<Index> make_index(IndexType type, size_t dim, const IndexOptions& opts) {
     switch (type) {
         case IndexType::Flat:
-            return std::make_unique<FlatIndex>(dim, opts.capacity);
+            return std::make_unique<FlatIndex>(dim, opts.capacity, opts.custom_ids);
         case IndexType::IVF: {
-            auto idx = std::make_unique<IVFIndex>(dim, opts.nlist, opts.nprobe);
+            auto idx = std::make_unique<IVFIndex>(dim, opts.nlist, opts.nprobe, opts.custom_ids);
             if (opts.pq_subspaces > 0) idx->enable_pq(opts.pq_subspaces, opts.pq_centroids);
             return idx;
         }
@@ -25,10 +25,11 @@ std::unique_ptr<Index> make_index(IndexType type, size_t dim, const IndexOptions
 }
 
 std::unique_ptr<Index> load_index(std::istream& in) {
-    switch (detail::read_header(in)) {
-        case detail::IndexKind::Flat:   return FlatIndex::load_body(in);
-        case detail::IndexKind::IVF:    return IVFIndex::load_body(in);
-        case detail::IndexKind::Refine: return RefineIndex::load_body(in);
+    const detail::Header header = detail::read_header(in);
+    switch (header.kind) {
+        case detail::IndexKind::Flat:   return FlatIndex::load_body(in, header.version);
+        case detail::IndexKind::IVF:    return IVFIndex::load_body(in, header.version);
+        case detail::IndexKind::Refine: return RefineIndex::load_body(in, header.version);
     }
     throw std::runtime_error("unknown index kind");
 }

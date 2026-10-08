@@ -13,6 +13,9 @@ namespace vecengine::detail {
 
 using std::size_t;
 
+// Calls fn(i) for every i in [0, n), spread over num_threads() threads (the
+// calling thread works too). Returns once all calls finish. If any call
+// throws, the remaining work is skipped and the first exception is rethrown.
 template <class F>
 void parallel_for(size_t n, F&& fn) {
 
