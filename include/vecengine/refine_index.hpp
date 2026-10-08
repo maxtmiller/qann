@@ -28,10 +28,15 @@ using std::span;
 // index's slot i are always the same vector.
 class RefineIndex : public Index {
 public:
-    // base must have no slots yet and no custom ids, so its slots line up with
-    // this index's raw storage. k_factor >= 1. custom_ids makes add_batch()
-    // take user ids.
+    // base must have no slots yet, no custom ids, and not already be wrapped by
+    // another RefineIndex, so its slots line up with this index's raw storage.
+    // k_factor >= 1. custom_ids makes add_batch() take user ids. Marks base as
+    // wrapped (see Index::wrapped()).
     explicit RefineIndex(Index& base, size_t k_factor = 10, bool custom_ids = false);
+
+    // Clears the base's wrapped mark, so a caller-owned base can be used on
+    // its own again.
+    ~RefineIndex() override;
 
     // Index overrides; see Index for the contract of each. Adds go to the base
     // too (without ids), and remove() deletes the same slots in the base.
@@ -66,7 +71,9 @@ private:
     // Used by load_body(): takes ownership of an already filled base and skips
     // the public constructor's empty-base check.
     RefineIndex(std::unique_ptr<Index> base, size_t k_factor)
-        : owned_base_(std::move(base)), base_(*owned_base_), k_factor_(k_factor) {}
+        : owned_base_(std::move(base)), base_(*owned_base_), k_factor_(k_factor) {
+        base_.wrapped_ = true;
+    }
 
     std::unique_ptr<Index> owned_base_; // set on file load; nullptr when wrapping a caller-owned base.
     Index& base_; // approximate first-stage index

@@ -25,6 +25,12 @@ RefineIndex::RefineIndex(Index& base, size_t k_factor, bool custom_ids) : base_(
     if (base.slots() != 0) throw std::invalid_argument("base index must be empty");
     if (k_factor == 0) throw std::invalid_argument("k_factor must be >= 1");
     if (base.custom_ids()) throw std::invalid_argument("base index must not use custom ids");
+    if (base.wrapped()) throw std::invalid_argument("base index is already wrapped by another RefineIndex");
+    base.wrapped_ = true;
+}
+
+RefineIndex::~RefineIndex() {
+    base_.wrapped_ = false;
 }
 
 void RefineIndex::set_k_factor(size_t k_factor) {

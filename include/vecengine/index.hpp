@@ -5,6 +5,7 @@
 #include <span>
 #include <iosfwd>
 #include <shared_mutex>
+#include <atomic>
 #include <cstdint>
 
 namespace vecengine {
@@ -74,8 +75,18 @@ public:
     // RefineIndex they lock it first, then its base.
     std::shared_mutex& mutex() const noexcept { return mutex_; }
 
+    // Whether a RefineIndex currently wraps this index. While it does, the
+    // Python add() and remove() refuse to run on this index directly: changes
+    // must go through the RefineIndex to keep its slots aligned with this
+    // index's. The C++ API doesn't enforce it, since RefineIndex itself calls
+    // add_batch() and remove() here.
+    bool wrapped() const noexcept { return wrapped_.load(); }
+
 private:
+    friend class RefineIndex;  // sets and clears wrapped_
+
     mutable std::shared_mutex mutex_;
+    std::atomic<bool> wrapped_{false};
 };
 
 } // namespace vecengine

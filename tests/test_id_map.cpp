@@ -682,3 +682,24 @@ TEST_CASE("load rejects bad versions and misaligned id maps", "[serialize][ids]"
         REQUIRE_THROWS_AS(load_index(t), std::runtime_error);
     }
 }
+
+TEST_CASE("RefineIndex marks its base as wrapped", "[refine][ids]") {
+    const size_t dim = 4;
+    auto data = random_matrix(10, dim, 30);
+    FlatIndex base(dim);
+    REQUIRE_FALSE(base.wrapped());
+    {
+        RefineIndex refine(base, 2);
+        REQUIRE(base.wrapped());
+        REQUIRE_FALSE(refine.wrapped());
+        // A second RefineIndex over the same base would misalign both.
+        REQUIRE_THROWS_AS(RefineIndex(base, 2), std::invalid_argument);
+        refine.add_batch(data, 10);
+
+        std::stringstream s;
+        refine.save(s);
+        auto loaded = load_index(s);
+        REQUIRE(dynamic_cast<RefineIndex&>(*loaded).base().wrapped());
+    }
+    REQUIRE_FALSE(base.wrapped());  // cleared when the RefineIndex is destroyed
+}
