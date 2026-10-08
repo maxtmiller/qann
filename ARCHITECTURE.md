@@ -35,6 +35,7 @@ vecengine/
 │   ├── kmeans.hpp / kmeans.cpp     # internal k-means helper (not public API)
 │   ├── parallel.hpp                # internal parallel_for (not public API)
 │   ├── serialize.hpp               # internal binary I/O helpers + file header (not public API)
+│   ├── id_map.cpp                  # IdMap: slots <-> user ids, deletions
 │   ├── index.cpp                   # default Index::add_batch / query_batch
 │   ├── pq.cpp
 │   ├── flat_index.cpp
@@ -44,7 +45,9 @@ vecengine/
 ├── tests/
 │   ├── test_distance.cpp           # Catch2 v3 tests for every layer
 │   ├── test_serialize.cpp          # save/load round trips and corrupt-file rejection
-│   └── test_python.py              # pytest smoke + save/load tests for the module
+│   ├── test_id_map.cpp             # IdMap, custom ids and deletion per index, format v2
+│   ├── test_python.py              # pytest smoke, save/load, ids and threading tests
+│   └── data/                       # index files saved by 0.1.0a4 (format v1) + its results
 ├── benchmarks/
 │   ├── bench_distance.cpp          # Google Benchmark distance kernels
 │   ├── bench_indexes.py            # recall vs QPS on SIFT
@@ -147,16 +150,30 @@ Both distances work because squared L2 decomposes across disjoint slices: `‖a 
 
 ```cpp
 virtual void add(span<const float> vec) = 0;
-virtual void add_batch(span<const float> vecs, size_t n);
+virtual void add_batch(span<const float> vecs, size_t n, const int64_t* ids = nullptr);
 virtual vector<Neighbor> query(span<const float> vec, size_t k) const = 0;
 virtual vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k) const;
-virtual size_t size() const noexcept = 0;
+virtual size_t remove(span<const int64_t> ids) = 0;
+virtual void save(std::ostream& out) const = 0;
+virtual size_t slots() const noexcept = 0;      // ever added, including deleted
+virtual bool custom_ids() const noexcept = 0;
+virtual size_t size() const noexcept = 0;       // live vectors
 virtual size_t dim() const noexcept = 0;
 ```
 
 `Neighbor { size_t index; float distance; }`. Results are sorted nearest first.
 
-**Invariant:** `add()` assigns IDs in insertion order starting at 0, and `Neighbor::index` is that ID. `RefineIndex` depends on this. `add_batch` must keep it: row `i` of a batch gets the next ID in order.
+**Slots and ids.** Every added vector gets a *slot*: its position in insertion order (0, 1, 2, ...), which never changes. Indexes store and scan slots internally (IVF lists hold slots; `RefineIndex` finds its raw vector by slot). The id users see is the slot itself, or with `custom_ids` the id passed to `add_batch`; `Neighbor::index` always reports that id. `add_batch` must keep slots in input order: row `i` of a batch gets the next slot.
+
+### `id_map.hpp` / `id_map.cpp`: `IdMap` (`vecengine::detail`)
+
+Each index owns one. It holds `labels_` (slot → id, empty without custom ids), `slot_of_` (live id → slot, for `remove` and duplicate checks) and a deleted flag per slot.
+
+- `check(n, ids)` validates an add without changing anything: ids present iff custom ids are on, each `>= 0` (`-1` is the padding id in batch results), no duplicates in the batch or among live ids, and at most `2^32 - 1` slots. `add` runs `check` and then commits.
+- `remove(ids, removed_slots)` marks slots deleted and erases their ids from `slot_of_`, so a deleted id can be added again (it gets a new slot). Unknown and already deleted ids are skipped.
+- `label(slot)` and `is_deleted(slot)` are inline: queries call them per candidate.
+
+**Deletion is tombstoning.** Nothing is moved: moving vectors would change slots, which IVF lists and `RefineIndex` depend on. Queries skip deleted slots *during* the scan (filtering a finished top-k would return fewer than k), so deleted vectors still cost a distance computation and keep their memory until a future compaction.
 
 Defaults in `src/index.cpp`: `add_batch` calls `add` per row; `query_batch` calls `query` for each row in parallel via `parallel_for`. This is safe because `query` is `const` and touches no shared mutable state, and each result goes to its own slot. Subclasses override `add_batch` only when a whole batch allows a faster path (`IVFIndex`, `RefineIndex`).
 
@@ -168,17 +185,17 @@ Defaults in `src/index.cpp`: `add_batch` calls `add` per row; `query_batch` call
 
 ### `flat_index.hpp`: `FlatIndex`
 
-Exact search. Vectors stored row-major in one `vector<float>`. `query` scans all of them with a size-`k` max-heap and drains it back to front for ascending order. This is the ground truth for recall tests.
+Exact search. Vectors stored row-major in one `vector<float>`, one row per slot. `query` scans every live slot with a size-`k` max-heap, drains it back to front for ascending order and reports each slot's id. This is the ground truth for recall tests.
 
 ### `ivf_index.hpp`: `IVFIndex`
 
-`IVFIndex(dim, nlist, nprobe = 10)`, with `nlist` in `[100, 65535]` (cluster IDs are `uint16_t`).
+`IVFIndex(dim, nlist, nprobe = 10, custom_ids = false)`, with `nlist` in `[100, 65535]` (cluster IDs are `uint16_t`) and `nprobe` in `[1, nlist]`.
 
 **Lifecycle:** `enable_pq(...)` (optional) → `train(sample)` → `add(v)` for each vector → `query`. `train` learns the model only; it stores no vectors. Training vectors are not searchable unless they are also added.
 
 - **`train`**: one `kmeans` call for the `nlist` coarse centroids. With PQ on, computes residuals `v − centroid(assignment)` from `kmeans`'s assignments and trains the codebook on them.
-- **`add`**: `nearest_centroid` picks the cluster; the vector's ID is appended to that cluster's `InvertedList`, plus either the raw floats (`vecs`) or the PQ code of its residual (`codes`).
-- **`add_batch`**: three phases. (1) One `assign_nearest` call assigns every row. (2) With PQ on, `parallel_for` encodes each residual into its own slot of an `n * m` buffer. (3) A serial loop appends IDs and data to the lists in input order, because `unordered_map` and list growth are not thread-safe and the ID invariant needs input order. `assign_nearest` ranks by `‖c‖² − 2x·c`, so a near-tie can pick a different list than `add` would.
+- **`add`**: `nearest_centroid` picks the cluster; the vector's slot is appended to that cluster's `InvertedList`, plus either the raw floats (`vecs`) or the PQ code of its residual (`codes`).
+- **`add_batch`**: three phases. (1) One `assign_nearest` call assigns every row. (2) With PQ on, `parallel_for` encodes each residual into its own slot of an `n * m` buffer. (3) A serial loop appends slots and data to the lists in input order, because `unordered_map` and list growth are not thread-safe and slots must follow input order. The ids are checked by `IdMap` before any of this, so a bad batch changes nothing. `assign_nearest` ranks by `‖c‖² − 2x·c`, so a near-tie can pick a different list than `add` would.
 - **`query`**:
   1. Coarse: find the `nprobe` nearest coarse centroids.
   2. Fine: scan only those lists with a size-`k` max-heap. One ADC table buffer is allocated per query and reused for every list. Per list, all query-and-cluster-dependent work happens once, before the per-vector loop:
@@ -188,23 +205,25 @@ Exact search. Vectors stored row-major in one `vector<float>`. `query` scans all
 
 The residual is rebuilt per probed list because it depends on the cluster's centroid. Stored codes encode `x − c`, the query becomes `q − c`, and `(q − c) − (x − c) = q − x`, so residual distances equal true distances. Inside IVF, SDC costs about the same as ADC (both need a full pass over the centroids per list) and is less accurate. ADC is the default.
 
-`nprobe` and `pq_distance` both have setters and can be changed at any time after training; they only affect queries.
+Every candidate goes through one `push` lambda that checks the `TopK` threshold first and then `is_deleted`, and pushes the slot's id. `nprobe` and `pq_distance` both have setters and can be changed at any time after training; they only affect queries.
 
 ### `refine_index.hpp`: `RefineIndex`
 
-`RefineIndex(base, k_factor = 10)` wraps an **empty, trained** approximate index by reference and keeps its own row-major copy of the raw vectors.
+`RefineIndex(base, k_factor = 10, custom_ids = false)` wraps an approximate index with **no slots and no custom ids** by reference and keeps its own row-major copy of the raw vectors. User ids live in the `RefineIndex`'s `IdMap`; the base gets plain slots, so base slot `i` and refine slot `i` are always the same vector. (Checking `base.slots()` rather than `size()` matters: a base whose vectors were all deleted has size 0 but its slots are taken.)
 
 A RefineIndex built this way holds `base` by reference (`Index& base_`); one created by `load_body` owns its base through `owned_base_`, declared before `base_` so it is initialized first, and binds `base_` to it via a private constructor. `base()` exposes the wrapped index either way, so a loaded index can still be tuned.
 
-- `add(v)`: forwards to `base`, then appends the raw floats, so ID `i` is at `data_[i * dim]`.
-- `add_batch(vecs, n)`: forwards to `base.add_batch` and appends all rows at once.
-- `query(q, k)`: asks `base` for `min(k * k_factor, size())` candidates, replaces each approximate distance with the exact `l2_distance` against its raw vector, and returns the exact top `k`.
+- `add` / `add_batch`: `id_map_.check(...)` first, then `base.add_batch` (no ids), then `id_map_.add(...)` and the raw floats, so slot `i` is at `data_[i * dim]`. Checking before touching the base keeps the two in step when either side rejects the add (bad ids, untrained base).
+- `remove(ids)`: removes the ids from its own map, then removes the same slots from the base (whose ids are its slots), so the base stops returning them.
+- `query(q, k)`: asks `base` for `min(k * k_factor, size())` candidates, replaces each approximate distance with the exact `l2_distance` against its raw vector, and returns the exact top `k` with ids from its own map. Returns nothing when every vector is deleted.
+
+Delete through the `RefineIndex`, not the base: deleting from the base directly hides the vector from results but the `RefineIndex` still counts it in `size()`.
 
 It only helps when `base` ranks with approximate distances (IVF + PQ). It restores recall but stores the raw vectors in RAM, so IVF + PQ + re-ranking uses more memory than plain IVF; in production the raw vectors would live on disk and only the candidates would be read. `k_factor` is a query-time setting; `k_factor = 1` returns the base's IDs with exact distances.
 
 ### `index_factory.hpp`: `make_index`
 
-`make_index(IndexType, dim, IndexOptions)` returns `unique_ptr<Index>`. `IndexOptions` holds `capacity` (Flat), `nlist`, `nprobe`, `pq_subspaces` (0 = PQ off) and `pq_centroids` (IVF). IVF-specific calls like `train()` require the concrete `IVFIndex`.
+`make_index(IndexType, dim, IndexOptions)` returns `unique_ptr<Index>`. `IndexOptions` holds `capacity` (Flat), `nlist`, `nprobe`, `pq_subspaces` (0 = PQ off) and `pq_centroids` (IVF), and `custom_ids` (both). IVF-specific calls like `train()` require the concrete `IVFIndex`.
 
 `load_index(std::istream&)` reads a file header and dispatches to `FlatIndex::load_body`, `IVFIndex::load_body` or `RefineIndex::load_body`. The path overloads wrap it for files:
 
@@ -217,19 +236,21 @@ It only helps when `base` ranks with approximate distances (IVF + PQ). It restor
 
 Binary, little-endian (a `static_assert` requires a little-endian host), every size and count stored as `uint64`. Vectors are stored as a `uint64` element count followed by the raw elements (`write_vec` / `read_vec`).
 
-Every index starts with a 9-byte header: magic `QANN` (`uint32`), format version (`uint32`, currently 1) and an `IndexKind` tag (`uint8`). `Index::save` writes header + body; `load_index` reads the header and the type's static `load_body` reads only the body.
+Every index starts with a 9-byte header: magic `QANN` (`uint32`), format version (`uint32`, currently 2) and an `IndexKind` tag (`uint8`). `Index::save` writes header + body; `load_index` reads the header (`read_header` returns `{kind, version}`) and passes the version to the type's static `load_body`, which reads only the body. Versions `kMinFormatVersion` (1) through `kFormatVersion` (2) are readable.
 
 | Kind | Body |
 | --- | --- |
-| `Flat` (1) | `dim`, `count`, `data` (`count * dim` floats) |
-| `IVF` (2) | `dim`, `nlist`, `nprobe`, `n_total`, `trained` (u8), `pq_distance` (u8), coarse centroids (`nlist * dim`, or empty if untrained), PQ flag (u8) + `PQCodebook` if set, then `nlist` lists in cluster order `0..nlist-1`, each `ids` + `codes` (PQ) or `vecs` (no PQ); empty lists are written as empty vectors |
-| `Refine` (3) | `k_factor`, `count`, the base index (full header + body), `data` (`count * dim` floats) |
+| `Flat` (1) | `dim`, `count` (slots), `data` (`count * dim` floats), id map |
+| `IVF` (2) | `dim`, `nlist`, `nprobe`, `n_total` (slots), `trained` (u8), `pq_distance` (u8), coarse centroids (`nlist * dim`, or empty if untrained), PQ flag (u8) + `PQCodebook` if set, then `nlist` lists in cluster order `0..nlist-1`, each slot `ids` + `codes` (PQ) or `vecs` (no PQ), empty lists written as empty vectors; id map |
+| `Refine` (3) | `k_factor`, `count` (slots), the base index (full header + body, same version), `data` (`count * dim` floats), id map |
+
+The id map (`IdMap::save`, version 2 only) is `custom_ids` (u8), the slot count, `labels` (empty without custom ids) and one deleted flag (u8) per slot. It is the last section of each body, so a version-2 body is a version-1 body plus one section: for version 1, `load_body` skips it and starts from a map with every slot live and no custom ids.
 
 `PQCodebook` (inside IVF, no header): `dim`, `num_subspaces`, `centroids_per_subspace`, `centroids_`. `centroids_t_` and `sdc_table_` are derived and rebuilt on load by `build_tables()`, the same code `train()` runs, so they come out bit-identical.
 
-**Validation on load.** Files are untrusted input, so every loader checks before allocating or indexing: `read_vec` takes a `max_len` and callers then require the exact expected length; sizes are checked against overflow (`count > UINT64_MAX / dim`); IVF ids must be `< n_total` and list sizes must sum to `n_total`; the PQ codebook's `dim` must match the index; a Refine's `count` must equal its base's `size()` (queries index the raw vectors by base ids). A Refine base must be Flat or IVF, which also stops a crafted file from nesting Refines until the stack overflows. Any failure throws `runtime_error`.
+**Validation on load.** Files are untrusted input, so every loader checks before allocating or indexing: `read_vec` takes a `max_len` and callers then require the exact expected length; sizes are checked against overflow (`count > UINT64_MAX / dim`); IVF ids must be `< n_total` and list sizes must sum to `n_total`; the PQ codebook's `dim` must match the index; a Refine's `count` must equal its base's `slots()` (queries index the raw vectors by base slot), its base must have no custom ids and the same format version. A Refine base must be Flat or IVF, which also stops a crafted file from nesting Refines until the stack overflows. The id map must match its index's slot count, with no duplicate live ids. Any failure throws `runtime_error`.
 
-**Changing the format.** `IndexKind` values are append-only: never renumber or reuse one. Bump `kFormatVersion` whenever an existing type's layout changes, and either reject or explicitly read older versions in its `load_body`.
+**Changing the format.** `IndexKind` values are append-only: never renumber or reuse one. Bump `kFormatVersion` whenever an existing type's layout changes, and read older versions explicitly in each `load_body` (as version 2 does for version 1). `tests/data/` holds files saved by 0.1.0a4 with the results it returned; the C++ and Python tests load them to catch compatibility breaks.
 
 ---
 
@@ -303,6 +324,8 @@ pq.distance_adc(table, code)
 `RefineIndex` holds its base by reference; `keep_alive` keeps the Python base object alive as long as the wrapper exists. A `RefineIndex` returned by `load` owns its base instead (`owned_base_`).
 
 Also exposed: `FlatIndex`, `IndexType`, `IndexOptions`, `make_index`, `set_num_threads(n)` / `num_threads()`, and row-wise `l2_distance(a, b)` / `cosine_distance(a, b)`.
+
+Ids: `add(data, ids=None)` and `remove(ids)` are bound once on `Index`. `ids` accepts any sequence of integers: `as_ids` runs `numpy.asarray`, rejects non-integer and non-1D input with `TypeError`, then converts to contiguous `int64`; the stubs show it as `Iterable[int]` (`nb::typed<nb::iterable, int>`). Constructors take `custom_ids` as a keyword-only argument.
 
 Save/load: `save(path)` is bound once on `Index` and inherited by every index class; `qann.load(path)` binds the path overload of `load_index` and returns the concrete type. Paths go through nanobind's `std::filesystem::path` caster, so `str` and `pathlib.Path` both work. `RefineIndex.base` is a read-only property returned with `rv_policy::reference_internal`, which keeps the RefineIndex alive while Python holds its base (needed for a loaded RefineIndex, which owns its base).
 
