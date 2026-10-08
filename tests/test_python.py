@@ -1,3 +1,4 @@
+import pathlib
 import threading
 
 import numpy as np
@@ -202,3 +203,149 @@ def test_concurrent_adds_queries_and_tuning(data):
     assert index.size() == 1_000 + 200 * len(batches)
     ids, _ = index.batch_query(batches[-1][:10], 1)
     np.testing.assert_array_equal(ids[:, 0], np.arange(index.size() - 200, index.size() - 190))
+
+
+DATA = pathlib.Path(__file__).parent / "data"
+
+
+@pytest.mark.parametrize("name", ["flat", "ivf_pq", "refine"])
+def test_loads_files_from_0_1_0a4(name):
+    # Saved by qann 0.1.0a4 (format version 1) with the results it returned.
+    index = qann.load(DATA / f"v1_{name}.qann")
+    queries = np.load(DATA / "v1_queries.npy")
+    expected_ids = np.load(DATA / f"v1_{name}_ids.npy")
+    expected_dists = np.load(DATA / f"v1_{name}_dists.npy")
+
+    assert index.size() == 2000
+    ids, dists = index.batch_query(queries, 10)
+    # SIMD kernels round differently across CPUs, which can swap near-ties.
+    assert np.mean(ids == expected_ids) >= 0.99
+    np.testing.assert_allclose(dists, expected_dists, rtol=1e-4, atol=1e-5)
+
+
+def make_custom_index(kind, data, ids):
+    if kind == "flat":
+        index = qann.FlatIndex(32, custom_ids=True)
+    elif kind == "ivf":
+        index = qann.IVFIndex(32, nlist=100, nprobe=100, custom_ids=True)
+        index.enable_pq(8)
+        index.train(data, seed=1)
+    else:
+        base = qann.IVFIndex(32, nlist=100, nprobe=100)
+        base.enable_pq(8)
+        base.train(data, seed=1)
+        index = qann.RefineIndex(base, k_factor=5, custom_ids=True)
+    index.add(data, ids=ids)
+    return index
+
+
+@pytest.mark.parametrize("kind", ["flat", "ivf", "refine"])
+def test_custom_ids_and_remove(data, kind):
+    ids = np.arange(len(data)) * 10 + 7
+    index = make_custom_index(kind, data, ids)
+
+    found, _ = index.batch_query(data[:20], 1)
+    if kind != "ivf":  # exact distances: each vector finds itself
+        np.testing.assert_array_equal(found[:, 0], ids[:20])
+    assert np.isin(found, ids).all()
+
+    deleted = ids[::3]
+    assert index.remove(deleted) == len(deleted)
+    assert index.remove(deleted) == 0
+    assert index.size() == len(data) - len(deleted)
+    found, _ = index.batch_query(data[::3][:50], 10)
+    assert not np.isin(found, deleted).any()
+
+    # A deleted id can be added again, with a new vector.
+    new_vec = np.full((1, 32), 5.0, dtype=np.float32)
+    index.add(new_vec, ids=[int(deleted[0])])
+    assert index.query(new_vec[0], 1)[0][0] == deleted[0]
+
+
+def test_ids_accept_any_integer_sequence(data):
+    index = qann.FlatIndex(32, custom_ids=True)
+    index.add(data[:4], ids=[10, 11, 12, 13])
+    index.add(data[4:6], ids=np.array([14, 15], dtype=np.int32))
+    index.add(data[6:8], ids=range(16, 18))
+    assert index.remove([10]) == 1
+    assert index.remove(np.array([11], dtype=np.uint8)) == 1
+    assert index.remove(range(12, 14)) == 2
+    assert index.remove([]) == 0
+    assert index.size() == 4
+
+
+def test_bad_ids_are_rejected_without_adding(data):
+    index = qann.FlatIndex(32, custom_ids=True)
+    index.add(data[:3], ids=[1, 2, 3])
+
+    for ids, error in [
+        ([4], ValueError),            # wrong length
+        ([4, -1], ValueError),        # negative
+        ([4, 4], ValueError),         # duplicate in the batch
+        ([4, 1], ValueError),         # already in the index
+        ([4.0, 5.0], TypeError),      # not integers
+        ([[4, 5]], TypeError),        # not one-dimensional
+    ]:
+        with pytest.raises(error):
+            index.add(data[:2], ids=ids)
+    with pytest.raises(ValueError):
+        index.add(data[:2])           # custom-id index needs ids
+    with pytest.raises(ValueError):
+        qann.FlatIndex(32).add(data[:2], ids=[1, 2])  # default index refuses them
+    assert index.size() == 3
+
+
+def test_custom_ids_via_make_index(data):
+    opts = qann.IndexOptions()
+    opts.custom_ids = True
+    index = qann.make_index(qann.IndexType.Flat, 32, opts)
+    index.add(data[:5], ids=[50, 51, 52, 53, 54])
+    assert index.query(data[2], 1)[0][0] == 52
+
+
+def test_save_load_keeps_ids_and_deletions(tmp_path, data):
+    ids = np.arange(len(data)) + 1_000_000
+    index = make_custom_index("refine", data, ids)
+    index.remove(ids[:100])
+
+    path = tmp_path / "ids.qann"
+    index.save(path)
+    loaded = qann.load(path)
+
+    assert loaded.size() == index.size()
+    assert_same_results(index, loaded, data[:50])
+    assert loaded.remove(ids[:100]) == 0     # still deleted
+    assert loaded.remove(ids[100:110]) == 10  # still live, under the same ids
+
+
+def test_concurrent_remove_and_query(data):
+    ids = np.arange(len(data)) + 100
+    index = make_custom_index("flat", data, ids)
+    to_delete = ids[::2]
+    errors = []
+
+    def run(fn):
+        try:
+            fn()
+        except Exception as e:
+            errors.append(e)
+
+    def remover():
+        for chunk in np.array_split(to_delete, 50):
+            index.remove(chunk)
+
+    def querier():
+        for _ in range(30):
+            found, _ = index.batch_query(data[:50], 5)
+            assert np.isin(found[found >= 0], ids).all()
+
+    threads = [threading.Thread(target=run, args=(f,)) for f in (remover, querier, querier)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, errors
+    assert index.size() == len(data) - len(to_delete)
+    found, _ = index.batch_query(data[:50], 10)
+    assert not np.isin(found, to_delete).any()

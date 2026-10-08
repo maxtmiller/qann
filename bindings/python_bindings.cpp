@@ -5,6 +5,7 @@
 #include <nanobind/stl/pair.h>
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/filesystem.h>
+#include <nanobind/stl/string.h>
 
 #include <cstdint>
 #include <limits>
@@ -26,6 +27,9 @@ namespace nb = nanobind;
 using FloatMatrix = nb::ndarray<float, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
 using FloatVector = nb::ndarray<float, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
 using ByteVector = nb::ndarray<uint8_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
+using IdVector = nb::ndarray<int64_t, nb::ndim<1>, nb::c_contig, nb::device::cpu>;
+// What add()/remove() accept as ids; the stubs show it as Iterable[int].
+using IdsArg = nb::typed<nb::iterable, int>;
 
 static std::span<const float> as_span(FloatVector v) { return {v.data(), v.shape(0)}; }
 static std::span<const uint8_t> as_span(ByteVector v) { return {v.data(), v.shape(0)}; }
@@ -105,12 +109,40 @@ static auto write_locked(const vecengine::Index& index, F&& f) {
     return f();
 }
 
-// Add all rows of a (N x dim) matrix to the index.
-static void index_add(vecengine::Index &self, FloatMatrix data) {
+// Converts any sequence of integers (NumPy array of any int dtype, list,
+// range, ...) to a 1D int64 array. Floats are rejected rather than truncated.
+static IdVector as_ids(nb::handle obj) {
+    nb::module_ np = nb::module_::import_("numpy");
+    nb::object arr = np.attr("asarray")(obj);
+    if (nb::cast<std::size_t>(arr.attr("size")) > 0) {
+        const auto kind = nb::cast<std::string>(arr.attr("dtype").attr("kind"));
+        if (kind != "i" && kind != "u") throw nb::type_error("ids must be integers");
+    }
+    if (nb::cast<std::size_t>(arr.attr("ndim")) != 1) throw nb::type_error("ids must be one-dimensional");
+    return nb::cast<IdVector>(np.attr("ascontiguousarray")(arr, nb::arg("dtype") = "int64"));
+}
+
+// Add all rows of a (N x dim) matrix to the index, with one id per row when
+// the index uses custom ids.
+static void index_add(vecengine::Index &self, FloatMatrix data, std::optional<IdsArg> ids) {
     if (data.shape(1) != self.dim())
         throw std::invalid_argument("vector dimension does not match index dimension");
 
-    write_locked(self, [&] { self.add_batch(std::span<const float>(data.data(), data.size()), data.shape(0)); });
+    std::optional<IdVector> id_array;
+    if (ids) {
+        id_array = as_ids(*ids);
+        if (id_array->shape(0) != data.shape(0))
+            throw std::invalid_argument("ids must have one entry per row of data");
+    }
+
+    const int64_t* id_ptr = id_array ? id_array->data() : nullptr;
+    write_locked(self, [&] { self.add_batch(std::span<const float>(data.data(), data.size()), data.shape(0), id_ptr); });
+}
+
+// Delete the vectors with these ids; returns how many were deleted.
+static std::size_t index_remove(vecengine::Index& self, IdsArg ids) {
+    IdVector id_array = as_ids(ids);
+    return write_locked(self, [&] { return self.remove(std::span<const int64_t>(id_array.data(), id_array.shape(0))); });
 }
 
 static std::size_t index_size(const vecengine::Index& self) {
@@ -224,21 +256,30 @@ NB_MODULE(qann, m) {
                  read_locked(self, [&] { vecengine::save_index(self, path); });
              },
              nb::arg("path"), "Save the index to a file; load it back with qann.load(path)")
-        .def("add", &index_add, nb::arg("data"), "Add an (n, dim) array of vectors; ids continue from size()")
+        .def("add", &index_add, nb::arg("data"), nb::arg("ids").none() = nb::none(),
+             "Add an (n, dim) array of vectors. Pass ids (n int64 values >= 0) if the index was "
+             "created with custom_ids=True; otherwise ids continue from the number of vectors ever added")
+        .def("remove", &index_remove, nb::arg("ids"),
+             "Delete the vectors with these ids; unknown ids are skipped. Returns how many were deleted")
         .def("query", &index_query, nb::arg("query"), nb::arg("k"), "Query k-NN for a (dim,) vector; returns 1D (indices, distances)")
         .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), "Query k-NN for each row; returns (indices, distances) arrays of shape (num_queries, k), padded with -1 / inf")
         .def("size", &index_size, "Get number of indexed vectors")
         .def("dim", &vecengine::Index::dim, "Get vector dimension");
 
     nb::class_<vecengine::FlatIndex, vecengine::Index>(m, "FlatIndex")
-        .def(nb::init<std::size_t>(), nb::arg("dim"), "Construct FlatIndex with vector dimension");
+        .def("__init__", [](vecengine::FlatIndex* self, std::size_t dim, bool custom_ids) {
+                 new (self) vecengine::FlatIndex(dim, 1024, custom_ids);
+             },
+             nb::arg("dim"), nb::kw_only(), nb::arg("custom_ids") = false,
+             "Construct FlatIndex with vector dimension; custom_ids=True makes add() take your own ids");
 
     nb::enum_<vecengine::PQDistance>(m, "PQDistance")
         .value("ADC", vecengine::PQDistance::ADC)
         .value("SDC", vecengine::PQDistance::SDC);
 
     nb::class_<vecengine::IVFIndex, vecengine::Index>(m, "IVFIndex")
-        .def(nb::init<std::size_t, std::size_t, std::size_t>(), nb::arg("dim"), nb::arg("nlist"), nb::arg("nprobe") = 10,
+        .def(nb::init<std::size_t, std::size_t, std::size_t, bool>(), nb::arg("dim"), nb::arg("nlist"), nb::arg("nprobe") = 10,
+             nb::kw_only(), nb::arg("custom_ids") = false,
              "Construct IVFIndex with vector dimension, number of coarse clusters, and search breadth")
         .def("train", &ivf_train, nb::arg("data"), nb::arg("max_iters") = 25, nb::arg("seed") = nb::none(),
              "Run k-means over sample vectors to compute coarse centroids")
@@ -261,10 +302,10 @@ NB_MODULE(qann, m) {
     nb::class_<vecengine::RefineIndex, vecengine::Index>(m, "RefineIndex")
         // The constructor checks base is empty; lock base so a concurrent
         // base.add() can't race that check.
-        .def("__init__", [](vecengine::RefineIndex* self, vecengine::Index& base, std::size_t k_factor) {
-                 write_locked(base, [&] { new (self) vecengine::RefineIndex(base, k_factor); });
+        .def("__init__", [](vecengine::RefineIndex* self, vecengine::Index& base, std::size_t k_factor, bool custom_ids) {
+                 write_locked(base, [&] { new (self) vecengine::RefineIndex(base, k_factor, custom_ids); });
              },
-             nb::arg("base"), nb::arg("k_factor") = 10,
+             nb::arg("base"), nb::arg("k_factor") = 10, nb::kw_only(), nb::arg("custom_ids") = false,
              nb::keep_alive<1, 2>(),
              "Re-rank an empty, trained approximate index with exact distances. Add vectors through this wrapper.")
         .def_prop_rw("k_factor",
@@ -285,7 +326,8 @@ NB_MODULE(qann, m) {
         .def_rw("nlist", &vecengine::IndexOptions::nlist)
         .def_rw("nprobe", &vecengine::IndexOptions::nprobe)
         .def_rw("pq_subspaces", &vecengine::IndexOptions::pq_subspaces)
-        .def_rw("pq_centroids", &vecengine::IndexOptions::pq_centroids);
+        .def_rw("pq_centroids", &vecengine::IndexOptions::pq_centroids)
+        .def_rw("custom_ids", &vecengine::IndexOptions::custom_ids);
 
     nb::class_<vecengine::PQCodebook>(m, "PQCodebook")
         .def(nb::init<std::size_t, std::size_t, std::size_t>(),
