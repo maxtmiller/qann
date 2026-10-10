@@ -42,13 +42,27 @@ static std::vector<float> read_fvecs(const std::string& path, size_t dim, size_t
     return out;
 }
 
+// Seconds one clock read takes, so the timers' own cost can be shown.
+static double clock_read_cost() {
+    const int n = 1'000'000;
+    double sink = 0;
+    const double t0 = detail::prof_now();
+    for (int i = 0; i < n; ++i) sink += detail::prof_now();
+    const double t1 = detail::prof_now();
+    if (sink == 0) std::printf(" ");
+    return (t1 - t0) / n;
+}
+
 static void report(const char* label, const Index& index, const std::vector<float>& queries, size_t nq) {
+    static const double read_cost = clock_read_cost();
     for (double& s : detail::g_prof) s = 0;
+    detail::g_prof_calls = 0;
     auto start = std::chrono::steady_clock::now();
     index.query_batch(queries, nq, 10);
     double total = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 
-    const char* names[] = {"coarse search", "ADC table build", "ADC code scan", "raw vector scan", "result drain", "re-rank"};
+    const char* names[] = {"coarse search", "ADC table build", "ADC code scan", "raw vector scan", "result drain", "re-rank",
+                           "query setup", "inner table (C)", "per-list setup"};
     double accounted = 0;
     std::printf("\n%s: %.0f us/query (%.0f QPS)\n", label, total / nq * 1e6, nq / total);
     for (int i = 0; i < detail::kProfSlots; ++i) {
@@ -58,6 +72,9 @@ static void report(const char* label, const Index& index, const std::vector<floa
         std::printf("  %-16s %7.1f us  %5.1f%%\n", names[i], s / nq * 1e6, 100 * s / total);
     }
     std::printf("  %-16s %7.1f us  %5.1f%%\n", "other", (total - accounted) / nq * 1e6, 100 * (total - accounted) / total);
+    const double timers = detail::g_prof_calls * read_cost;
+    std::printf("  (timers: %.0f clock reads/query at %.0f ns = %.1f us/query, spread over the rows above)\n",
+                static_cast<double>(detail::g_prof_calls) / nq, read_cost * 1e9, timers / nq * 1e6);
 }
 
 int main(int argc, char** argv) {
