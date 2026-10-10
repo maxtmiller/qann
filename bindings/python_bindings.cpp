@@ -310,7 +310,12 @@ NB_MODULE(qann, m) {
         .def_prop_rw("pq_distance",
                      [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.pq_distance(); }); },
                      [](vecengine::IVFIndex& self, vecengine::PQDistance v) { write_locked(self, [&] { self.set_pq_distance(v); }); },
-                     "How queries score PQ codes: PQDistance.ADC (default, more accurate) or PQDistance.SDC");
+                     "How queries score PQ codes: PQDistance.ADC (default, more accurate) or PQDistance.SDC")
+        .def_prop_rw("precomputed_tables",
+                     [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.precomputed_tables(); }); },
+                     [](vecengine::IVFIndex& self, bool v) { write_locked(self, [&] { self.set_precomputed_tables(v); }); },
+                     "Whether ADC queries use per-list tables precomputed at train time (on by default). "
+                     "True only once they exist: PQ enabled, trained, and within the 256 MB cap");
 
     // Holds `base` by reference; keep_alive ties base's lifetime to the
     // RefineIndex so Python can't free it first.

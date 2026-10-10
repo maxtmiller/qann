@@ -51,12 +51,26 @@ public:
     PQDistance pq_distance() const noexcept { return pq_distance_; }
     void set_pq_distance(PQDistance mode) noexcept { pq_distance_ = mode; }
 
+    // Whether ADC queries use precomputed per-list tables instead of building
+    // a full ADC table for every probed list. Enabled by default; the getter
+    // is true only once the tables exist (PQ on, trained, and nlist * m * K
+    // floats within kPrecomputedMaxBytes). Disabling frees them. Results
+    // match the per-list path up to float rounding.
+    bool precomputed_tables() const noexcept { return !precomputed_.empty(); }
+    void set_precomputed_tables(bool enabled);
+
     // Index overrides; see Index for the contract of each. add/add_batch
     // throw std::logic_error before train().
     void add(span<const float> vec) override;
     void add_batch(span<const float> vecs, size_t n, const int64_t* ids = nullptr) override;
     vector<Neighbor> query(span<const float> vec, size_t k) const override;
     size_t remove(span<const int64_t> ids) override;
+
+    // Batched query: picks every query's nprobe lists with one matrix multiply
+    // per block of queries (with BLAS), then scans the lists in parallel.
+    // Results match query() except that a near-tie between coarse centroids
+    // can pick a different list.
+    vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k) const override;
 
     // Learns the nlist coarse centroids (and the PQ codebook, if enabled) from
     // num_vectors sample vectors (at least nlist). Call once, before any add.
@@ -81,6 +95,30 @@ private:
     // Whether enable_pq() was called.
     bool pq_enabled() const noexcept { return pq_ != nullptr; }
 
+    // Fills precomputed_ with PQCodebook::compute_list_term for every coarse
+    // centroid, or leaves it empty if disabled, untrained, without PQ or over
+    // the size cap. Called by train(), load_body() and set_precomputed_tables().
+    void build_precomputed();
+
+    // One probed list: its exact coarse distance ||q - c||^2 (term A of the
+    // precomputed tables) and its cluster id.
+    struct Probe {
+        float dist;
+        uint16_t list;
+    };
+
+    // The nprobe lists nearest to vec, furthest first.
+    vector<Probe> coarse(span<const float> vec) const;
+
+    // Coarse step for n queries (query i at queries + i * dim_): writes each
+    // query's nprobe probes to out + i * nprobe_, in any order.
+    void coarse_batch(const float* queries, size_t n, Probe* out) const;
+
+    // Fine step: the top k over the probed lists.
+    vector<Neighbor> scan(span<const float> vec, span<const Probe> probes, size_t k) const;
+
+    static constexpr size_t kPrecomputedMaxBytes = size_t{256} << 20;
+
     size_t dim_; // dimension of each vector
     size_t nlist_; // num of coarse centroids
     size_t nprobe_; // num of coarse centroids to pick from during quering
@@ -90,6 +128,8 @@ private:
     std::unordered_map<uint16_t,InvertedList> data_; // map of coarse centroid ID to inverted list
     std::unique_ptr<PQCodebook> pq_; // pointer to PQ LUT if using PQ
     PQDistance pq_distance_ = PQDistance::ADC; // type of quantization used
+    bool use_precomputed_ = true; // set_precomputed_tables() setting
+    vector<float> precomputed_; // term B: nlist * m * K floats, list-major; empty when not in use
     detail::IdMap id_map_;
 };
 

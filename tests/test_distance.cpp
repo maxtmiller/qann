@@ -631,6 +631,147 @@ TEST_CASE("IVFIndex+PQ: recall vs FlatIndex, ADC beats SDC", "[ivf][pq]") {
     REQUIRE(adc > sdc);
 }
 
+TEST_CASE("PQCodebook: coarse distance + list term + inner table equals residual ADC table", "[pq][adc][precomputed]") {
+    const size_t dim = 16, m = 4, K = 16, sub = dim / m;
+    auto data = random_vectors(200, dim, /*seed=*/21);
+    vecengine::PQCodebook pq(dim, m, K);
+    pq.train(data, 200, 10);
+
+    auto query = random_vectors(1, dim, /*seed=*/22);
+    auto centroid = random_vectors(1, dim, /*seed=*/23);
+    std::vector<float> residual(dim);
+    for (size_t d = 0; d < dim; ++d) residual[d] = query[d] - centroid[d];
+
+    std::vector<float> adc(m * K), inner(m * K), list(m * K);
+    pq.compute_adc_table(residual, adc);
+    pq.compute_inner_table(query, inner);
+    pq.compute_list_term(centroid, list);
+
+    for (size_t s = 0; s < m; ++s) {
+        float a = vecengine::l2_distance(query.data() + s * sub, centroid.data() + s * sub, sub);
+        for (size_t j = 0; j < K; ++j)
+            REQUIRE_THAT(a + list[s * K + j] + inner[s * K + j], WithinAbs(adc[s * K + j], 1e-3));
+    }
+}
+
+TEST_CASE("IVFIndex+PQ: precomputed tables match the per-list ADC path", "[ivf][pq][precomputed]") {
+    const size_t dim = 32, n = 5000, k = 10, nq = 100;
+    auto data = random_vectors(n, dim, /*seed=*/42);
+    auto queries = random_vectors(nq, dim, /*seed=*/43);
+
+    vecengine::IVFIndex idx(dim, 100, 20);
+    idx.enable_pq(8, 256);
+    REQUIRE_FALSE(idx.precomputed_tables());
+    idx.train(data, n, 15, /*seed=*/1);
+    REQUIRE(idx.precomputed_tables());
+    idx.add_batch(data, n);
+
+    auto fast = idx.query_batch(queries, nq, k);
+    idx.set_precomputed_tables(false);
+    REQUIRE_FALSE(idx.precomputed_tables());
+    auto slow = idx.query_batch(queries, nq, k);
+
+    // Float rounding differs between the two paths, so near-ties may swap.
+    size_t same = 0;
+    for (size_t q = 0; q < nq; ++q) {
+        REQUIRE(fast[q].size() == slow[q].size());
+        for (size_t i = 0; i < fast[q].size(); ++i) {
+            REQUIRE_THAT(fast[q][i].distance, WithinRel(slow[q][i].distance, 1e-3f) || WithinAbs(slow[q][i].distance, 1e-3));
+            if (fast[q][i].index == slow[q][i].index) ++same;
+        }
+    }
+    REQUIRE(same >= nq * k * 98 / 100);
+
+    idx.set_precomputed_tables(true);
+    REQUIRE(idx.precomputed_tables());
+}
+
+TEST_CASE("IVFIndex: precomputed tables stay off without PQ", "[ivf][precomputed]") {
+    const size_t dim = 8, n = 500;
+    auto data = random_vectors(n, dim, /*seed=*/5);
+    vecengine::IVFIndex idx(dim, 100, 10);
+    idx.train(data, n, 5);
+    REQUIRE_FALSE(idx.precomputed_tables());
+}
+
+// Batched coarse search may pick a different list on a near-tie between
+// centroids, so allow a few ids to differ; matching ids must have matching
+// distances.
+static void require_batch_matches_query(const vecengine::Index& idx, const std::vector<float>& queries, size_t nq, size_t k) {
+    const size_t dim = idx.dim();
+    auto batch = idx.query_batch(queries, nq, k);
+    REQUIRE(batch.size() == nq);
+
+    size_t same = 0, total = 0;
+    for (size_t q = 0; q < nq; ++q) {
+        auto single = idx.query(std::span<const float>(queries.data() + q * dim, dim), k);
+        REQUIRE(batch[q].size() == single.size());
+        for (size_t i = 0; i < single.size(); ++i) {
+            ++total;
+            if (batch[q][i].index != single[i].index) continue;
+            ++same;
+            REQUIRE_THAT(batch[q][i].distance, WithinRel(single[i].distance, 1e-4f) || WithinAbs(single[i].distance, 1e-4));
+        }
+    }
+    REQUIRE(same >= total * 99 / 100);
+}
+
+TEST_CASE("IVFIndex: batched coarse search matches query() in every mode", "[ivf][batch][coarse]") {
+    const size_t dim = 32, n = 5000, k = 10;
+    const size_t nq = 1100; // more than one 1024-query block, not a multiple of it
+    auto data = random_vectors(n, dim, /*seed=*/61);
+    auto queries = random_vectors(nq, dim, /*seed=*/62);
+
+    vecengine::IVFIndex idx(dim, 100, 12);
+    SECTION("plain") {}
+    SECTION("PQ, ADC, precomputed tables") { idx.enable_pq(8); }
+    SECTION("PQ, ADC, per-list tables") {
+        idx.enable_pq(8);
+        idx.set_precomputed_tables(false);
+    }
+    SECTION("PQ, SDC") {
+        idx.enable_pq(8);
+        idx.set_pq_distance(vecengine::PQDistance::SDC);
+    }
+    idx.train(data, n, 10, /*seed=*/1);
+    idx.add_batch(data, n);
+
+    std::vector<int64_t> dead;
+    for (int64_t id = 0; id < static_cast<int64_t>(n); id += 7) dead.push_back(id);
+    idx.remove(dead);
+
+    require_batch_matches_query(idx, queries, nq, k);
+}
+
+TEST_CASE("IVFIndex: query_batch handles k above the live count and empty batches", "[ivf][batch][coarse]") {
+    const size_t dim = 8, n = 300;
+    auto data = random_vectors(n, dim, /*seed=*/63);
+    vecengine::IVFIndex idx(dim, 100, 100);
+    idx.train(data, n, 5, /*seed=*/1);
+    idx.add_batch(std::span<const float>(data.data(), 20 * dim), 20);
+
+    require_batch_matches_query(idx, data, 5, 50);
+    REQUIRE(idx.query_batch(std::span<const float>(), 0, 10).empty());
+}
+
+TEST_CASE("RefineIndex: query_batch matches query()", "[refine][batch][coarse]") {
+    const size_t dim = 32, n = 5000, k = 10, nq = 300;
+    auto data = random_vectors(n, dim, /*seed=*/64);
+    auto queries = random_vectors(nq, dim, /*seed=*/65);
+
+    vecengine::IVFIndex base(dim, 100, 12);
+    base.enable_pq(8);
+    base.train(data, n, 10, /*seed=*/1);
+    vecengine::RefineIndex refine(base, 8);
+    refine.add_batch(data, n);
+
+    std::vector<int64_t> dead;
+    for (int64_t id = 0; id < static_cast<int64_t>(n); id += 5) dead.push_back(id);
+    refine.remove(dead);
+
+    require_batch_matches_query(refine, queries, nq, k);
+}
+
 // ---------------------------------------------------------------------------
 // RefineIndex
 // ---------------------------------------------------------------------------

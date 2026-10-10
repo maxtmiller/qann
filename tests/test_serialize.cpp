@@ -305,6 +305,7 @@ TEST_CASE("IVFIndex: save/load round-trip returns identical results", "[ivf][ser
     REQUIRE(loaded->dim() == dim);
     REQUIRE(loaded->nprobe() == 8);
     REQUIRE(loaded->pq_distance() == index.pq_distance());
+    REQUIRE(loaded->precomputed_tables() == index.precomputed_tables());
     require_same_results(index, *loaded, queries, nq, k);
 
     // Both keep accepting vectors and assign the same next id.

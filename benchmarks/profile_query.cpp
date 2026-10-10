@@ -6,7 +6,9 @@
 //
 // Builds plain IVF, IVF-PQ16 and IVF-PQ16 + re-ranking (k_factor 16) with
 // seed 1, runs every query once to warm caches, then reports microseconds per
-// query for each section timed in src/profile.hpp. Run on an idle machine.
+// query for each section timed in src/profile.hpp. The PQ indexes run twice,
+// with precomputed tables and with the per-list ADC table build, alternating
+// so machine load affects both alike. Run on an idle machine.
 
 #include "profile.hpp"
 #include "vecengine/ivf_index.hpp"
@@ -90,6 +92,11 @@ int main(int argc, char** argv) {
 
     std::printf("SIFT1M, nprobe %zu, %zu queries, 1 thread\n", nprobe, nq);
     report("plain IVF", ivf, queries, nq);
-    report("IVF-PQ16", pq, queries, nq);
-    report("IVF-PQ16 + R16", refine, queries, nq);
+    for (bool precomputed : {true, false}) {
+        pq.set_precomputed_tables(precomputed);
+        const char* tag = precomputed ? "precomputed tables" : "per-list tables";
+        std::printf("\n--- %s ---", tag);
+        report("IVF-PQ16", pq, queries, nq);
+        report("IVF-PQ16 + R16", refine, queries, nq);
+    }
 }
