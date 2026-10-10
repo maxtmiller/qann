@@ -32,6 +32,7 @@ RESULTS_DIR = BENCH_DIR / "results"
 K = 10
 NPROBES = [1, 2, 4, 8, 16, 32, 64, 128]
 PQ_SUBSPACES = [8, 16, 32]
+FAST_SCAN_SUBSPACES = [32, 64]  # 4-bit codes: 16 and 32 bytes per vector, like PQ16 and PQ32
 REFINE_K_FACTORS = [4, 16]  # re-rank k * k_factor ADC candidates with exact distances
 
 
@@ -67,12 +68,12 @@ def time_queries(index, queries: np.ndarray, k: int, repeats: int = 3):
     return ids, len(queries) / best
 
 
-def build_ivf(dim, nlist, base, learn, pq_m=None, seed=None):
+def build_ivf(dim, nlist, base, learn, pq_m=None, seed=None, fast_scan=False):
     # With PQ, vectors are added through a RefineIndex so one build serves both
     # the plain PQ rows (query idx) and the re-ranked rows (query refine).
     idx = qann.IVFIndex(dim, nlist)
     if pq_m is not None:
-        idx.enable_pq(pq_m)
+        idx.enable_pq(pq_m, fast_scan=fast_scan)
     start = time.perf_counter()
     idx.train(learn, seed=seed)
     train_s = time.perf_counter() - start
@@ -107,12 +108,19 @@ def run(dataset: str, max_queries: int | None, seed: int | None = None):
     ids, qps = time_queries(flat, queries, K)
     record("Flat", "-", ids, qps, dim * 4, add_s=add_s)
 
-    configs = [("IVF", None)] + [(f"IVF-PQ{m}", m) for m in PQ_SUBSPACES]
-    for name, m in configs:
-        idx, refine, train_s, add_s = build_ivf(dim, nlist, base, learn, m, seed)
+    configs = ([("IVF", None, False)] + [(f"IVF-PQ{m}", m, False) for m in PQ_SUBSPACES]
+               + [(f"IVF-PQ{m}x4fs", m, True) for m in FAST_SCAN_SUBSPACES])
+    for name, m, fast in configs:
+        idx, refine, train_s, add_s = build_ivf(dim, nlist, base, learn, m, seed, fast)
         print(f"{name}  (train {train_s:.1f}s, add {add_s:.1f}s)")
-        bytes_per_vec = (dim * 4 if m is None else m) + 4  # + uint32 id
-        modes = [("", None)] if m is None else [("-ADC", qann.PQDistance.ADC), ("-SDC", qann.PQDistance.SDC)]
+        code_bytes = 0 if m is None else (m // 2 if fast else m)
+        bytes_per_vec = (dim * 4 if m is None else code_bytes) + 4  # + uint32 id
+        if m is None:
+            modes = [("", None)]
+        elif fast:   # fast-scan is ADC only
+            modes = [("-ADC", qann.PQDistance.ADC)]
+        else:
+            modes = [("-ADC", qann.PQDistance.ADC), ("-SDC", qann.PQDistance.SDC)]
         for suffix, mode in modes:
             label = name + suffix
             if mode is not None:

@@ -6,6 +6,7 @@
 #include "profile.hpp"
 #include "topk.hpp"
 #include "serialize.hpp"
+#include "fast_scan.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +18,7 @@
 #include <stdexcept>
 #include <cmath>
 #include <algorithm>
+#include <bit>
 
 #ifdef VECENGINE_USE_BLAS
 #ifdef __APPLE__
@@ -64,9 +66,14 @@ void IVFIndex::build_precomputed() {
     });
 }
 
-void IVFIndex::enable_pq(size_t num_subspaces, size_t centroids_per_subspace) {
+void IVFIndex::enable_pq(size_t num_subspaces, size_t centroids_per_subspace, bool fast_scan) {
     if (id_map_.slots() > 0 || trained_)
         throw std::logic_error("enable_pq must be called before train()/add()");
+    if (fast_scan && (centroids_per_subspace != 16 || num_subspaces % 2 != 0 || num_subspaces > 256))
+        throw std::invalid_argument("fast_scan needs 16 centroids per subspace and an even num_subspaces <= 256");
+    if (fast_scan && pq_distance_ == PQDistance::SDC)
+        throw std::invalid_argument("cannot use SDC with fast-scan");
+    fast_scan_= fast_scan;
     pq_ = std::make_unique<PQCodebook>(dim_, num_subspaces, centroids_per_subspace);
 }
 
@@ -94,7 +101,14 @@ void IVFIndex::add(span<const float> vec) {
         }
 
         auto code = pq_->encode(residual);
-        list.codes.insert(list.codes.end(), code.begin(), code.end());
+        if (fast_scan_) {
+            const size_t m = pq_->num_subspaces(), pos = list.ids.size() - 1;
+            if (pos % 32 == 0) list.codes.resize(list.codes.size() + m * 16, 0);
+            uint8_t* block = list.codes.data() + (pos / 32) * m * 16;
+            for (size_t s = 0; s < m; ++s) detail::fs_set(block, pos % 32, s, code[s]);
+        } else {
+            list.codes.insert(list.codes.end(), code.begin(), code.end());
+        }
     } else {
         list.vecs.insert(list.vecs.end(), vec.begin(), vec.end());
     }
@@ -133,7 +147,14 @@ void IVFIndex::add_batch(span<const float> vecs, size_t n, const int64_t* ids) {
         list.ids.push_back(first_slot + static_cast<uint32_t>(i));
 
         if (use_pq) {
-            list.codes.insert(list.codes.end(), codes.begin() + i * code_bytes, codes.begin() + (i + 1) * code_bytes);
+            if (fast_scan_) {
+            const size_t m = pq_->num_subspaces(), pos = list.ids.size() - 1;
+            if (pos % 32 == 0) list.codes.resize(list.codes.size() + m * 16, 0);
+            uint8_t* block = list.codes.data() + (pos / 32) * m * 16;
+            for (size_t s = 0; s < m; ++s) detail::fs_set(block, pos % 32, s, codes[i * code_bytes + s]);
+            } else {
+                list.codes.insert(list.codes.end(), codes.begin() + i * code_bytes, codes.begin() + (i + 1) * code_bytes);
+            }
         } else {
             const float* src = vecs.data() + i * dim_;
             list.vecs.insert(list.vecs.end(), src, src + dim_);
@@ -251,6 +272,7 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<const Probe> probes,
 
     const bool use_pre = pq_enabled() && pq_distance_ == PQDistance::ADC && precomputed_tables();
     vector<float> C(use_pre ? m * K : 0);
+    vector<uint8_t> lut(fast_scan_ ? m * K : 0);
     VECENGINE_PROF_STOP(t_setup, kProfSetup);
     VECENGINE_PROF_START(t_inner);
     if (use_pre) pq_->compute_inner_table(vec, C);
@@ -303,9 +325,39 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<const Probe> probes,
             if (!use_pre) pq_->compute_adc_table(residual, table);
             VECENGINE_PROF_STOP(t_table, kProfTable);
             VECENGINE_PROF_START(t_scan);
-            pq_->distances_adc(table, list.codes.data(), listSize, dists.data());
-            for (size_t j = 0; j < listSize; ++j) {
-                push(dists[j], j);
+            if (fast_scan_) {
+                // round the table to bytes, then score 32 vectors per kernel call
+                float scale, offset;
+                detail::quantize_lut(table.data(), m, lut.data(), scale, offset);
+                const size_t block_bytes = detail::fs_block_bytes(m);
+                uint16_t sums[detail::kFsBlock];
+
+                for (size_t start = 0; start < listSize; start += detail::kFsBlock) {
+                    // the current k-th best distance in the table's integer scale, recomputed
+                    // per block as it shrinks; sums are whole, so sum < limit <=> sum < ceil(limit)
+                    const float limit = (top.threshold() - offset) * scale;
+                    const uint16_t limit16 = limit >= 65535.0f ? 65535
+                                           : limit <= 0.0f    ? 0
+                                                              : static_cast<uint16_t>(std::ceil(limit));
+
+                    // bit v is set when vector v can beat the k-th best; padding bits are dropped
+                    uint32_t mask = detail::fast_scan_block_mask(
+                        lut.data(), list.codes.data() + (start / detail::kFsBlock) * block_bytes, m, limit16, sums);
+                    const size_t count = std::min(detail::kFsBlock, listSize - start);
+                    if (count < detail::kFsBlock) mask &= (1u << count) - 1;
+
+                    // visit only the set bits, lowest first
+                    while (mask != 0) {
+                        const unsigned v = static_cast<unsigned>(std::countr_zero(mask));
+                        mask &= mask - 1;
+                        push(sums[v] / scale + offset, start + v);
+                    }
+                }
+            } else {
+                pq_->distances_adc(table, list.codes.data(), listSize, dists.data());
+                for (size_t j = 0; j < listSize; ++j) {
+                    push(dists[j], j);
+                }
             }
             VECENGINE_PROF_STOP(t_scan, kProfCodeScan);
         } else {
@@ -354,7 +406,13 @@ void IVFIndex::compact_storage(const vector<uint32_t>& remap) {
 
             list.ids[write_slot] = new_slot;
             if (j != write_slot) {
-                if (pq_enabled()) {
+                if (fast_scan_) {
+                    // w < j, so writing entry w never clobbers an entry still to be read
+                    const uint8_t* src = list.codes.data() + (j / detail::kFsBlock) * detail::fs_block_bytes(m);
+                    uint8_t* dst = list.codes.data() + (write_slot / detail::kFsBlock) * detail::fs_block_bytes(m);
+                    for (size_t s = 0; s < m; ++s)
+                        detail::fs_set(dst, write_slot % detail::kFsBlock, s, detail::fs_get(src, j % detail::kFsBlock, s));
+                } else if (pq_enabled()) {
                     uint8_t* src = list.codes.data() + j * m;
                     uint8_t* dst = list.codes.data() + write_slot * m;
                     std::copy_n(src, m, dst);
@@ -371,7 +429,8 @@ void IVFIndex::compact_storage(const vector<uint32_t>& remap) {
         list.ids.resize(write_slot);
         list.ids.shrink_to_fit();
         if (pq_enabled()) {
-            list.codes.resize(write_slot * m);
+            const size_t blocks = (write_slot + detail::kFsBlock - 1) / detail::kFsBlock;
+            list.codes.resize(fast_scan_ ? blocks * detail::fs_block_bytes(m) : write_slot * m);
             list.codes.shrink_to_fit();
         } else {
             list.vecs.resize(write_slot * dim());
@@ -420,7 +479,10 @@ void IVFIndex::save(std::ostream& out) const {
     write_pod(out, static_cast<uint8_t>(pq_distance_));
     write_vec(out, coarse_centroids_);
     write_pod(out, static_cast<uint8_t>(pq_ != nullptr));
-    if (pq_) pq_->save(out);
+    if (pq_) {
+        pq_->save(out);
+        write_pod(out, static_cast<uint8_t>(fast_scan_));
+    }
 
     static const InvertedList empty;
     for (uint16_t i = 0; i < nlist_; ++i) {
@@ -460,6 +522,14 @@ std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version
     if (pq_enabled) {
         index->pq_ = std::make_unique<PQCodebook>(PQCodebook::load(in));
         if (index->pq_->dim() != dim) throw std::runtime_error("corrupt file: invalid IVFIndex shape");
+        if (version >= 4) {
+            const auto fast_scan = read_pod<uint8_t>(in);
+            const size_t m = index->pq_->num_subspaces();
+            if (fast_scan > 1 || (fast_scan && (index->pq_->centroids_per_subspace() != 16 || m % 2 != 0 || m > 256 ||
+                                                pq_distance != static_cast<uint8_t>(PQDistance::ADC))))
+                throw std::runtime_error("corrupt file: invalid IVFIndex fast-scan settings");
+            index->fast_scan_ = fast_scan;
+        }
     }
 
     const size_t num_subspaces = index->pq_ ? index->pq_->num_subspaces() : 0;
@@ -469,7 +539,9 @@ std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version
         list.ids = read_vec<uint32_t>(in, n_total);
 
         if (index->pq_) {
-            const uint64_t expected = list.ids.size() * num_subspaces;
+            const uint64_t blocks = (list.ids.size() + detail::kFsBlock - 1) / detail::kFsBlock;
+            const uint64_t expected = index->fast_scan_ ? blocks * detail::fs_block_bytes(num_subspaces)
+                                                        : list.ids.size() * num_subspaces;
             list.codes = read_vec<uint8_t>(in, expected);
             if (list.codes.size() != expected) throw std::runtime_error("corrupt file: IVF code length mismatch");
         } else {

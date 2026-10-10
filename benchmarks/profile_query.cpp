@@ -4,9 +4,10 @@
 //   cmake --build build-prof --target profile_query -j
 //   ./build-prof/profile_query benchmarks/data/sift [nprobe]
 //
-// Builds plain IVF, IVF-PQ16 and IVF-PQ16 + re-ranking (k_factor 16) with
-// seed 1, runs every query once to warm caches, then reports microseconds per
-// query for each section timed in src/profile.hpp. The PQ indexes run twice,
+// Builds plain IVF, IVF-PQ16, IVF-PQ64 with fast-scan, and each PQ index with
+// re-ranking (k_factor 16), with seed 1, runs every query once to warm caches,
+// then reports microseconds per query for each section timed in
+// src/profile.hpp. The PQ16 indexes run twice,
 // with precomputed tables and with the per-list ADC table build, alternating
 // so machine load affects both alike. Run on an idle machine.
 
@@ -102,10 +103,18 @@ int main(int argc, char** argv) {
     RefineIndex refine(pq, k_factor);
     refine.add_batch(base, nb);
 
+    IVFIndex fs(dim, nlist, nprobe);
+    fs.enable_pq(64, 16, /*fast_scan=*/true);
+    fs.train(learn, nl, 25, seed);
+    RefineIndex fs_refine(fs, k_factor);
+    fs_refine.add_batch(base, nb);
+
     set_num_threads(1);
     ivf.query_batch(queries, nq, 10);
     pq.query_batch(queries, nq, 10);
     refine.query_batch(queries, nq, 10);
+    fs.query_batch(queries, nq, 10);
+    fs_refine.query_batch(queries, nq, 10);
 
     std::printf("SIFT1M, nprobe %zu, %zu queries, 1 thread\n", nprobe, nq);
     report("plain IVF", ivf, queries, nq);
@@ -116,4 +125,8 @@ int main(int argc, char** argv) {
         report("IVF-PQ16", pq, queries, nq);
         report("IVF-PQ16 + R16", refine, queries, nq);
     }
+
+    std::printf("\n--- fast-scan (4-bit codes, precomputed tables) ---");
+    report("IVF-PQ64x4fs", fs, queries, nq);
+    report("IVF-PQ64x4fs + R16", fs_refine, queries, nq);
 }

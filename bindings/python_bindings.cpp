@@ -308,11 +308,21 @@ NB_MODULE(qann, m) {
              "Construct IVFIndex with vector dimension, number of coarse clusters, and search breadth")
         .def("train", &ivf_train, nb::arg("data"), nb::arg("max_iters") = 25, nb::arg("seed") = nb::none(),
              "Run k-means over sample vectors to compute coarse centroids")
-        .def("enable_pq", [](vecengine::IVFIndex& self, std::size_t num_subspaces, std::size_t centroids_per_subspace) {
-                 write_locked(self, [&] { self.enable_pq(num_subspaces, centroids_per_subspace); });
+        .def("enable_pq",
+             [](vecengine::IVFIndex& self, std::size_t num_subspaces, std::optional<std::size_t> centroids_per_subspace,
+                bool fast_scan) {
+                 const std::size_t k = centroids_per_subspace.value_or(fast_scan ? 16 : 256);
+                 write_locked(self, [&] { self.enable_pq(num_subspaces, k, fast_scan); });
              },
-             nb::arg("num_subspaces"), nb::arg("centroids_per_subspace") = 256,
-             "Enable PQ compression of residuals. Call before train()/add().")
+             nb::arg("num_subspaces"), nb::arg("centroids_per_subspace").none() = nb::none(), nb::kw_only(),
+             nb::arg("fast_scan") = false,
+             "Enable PQ compression of residuals. Call before train()/add(). centroids_per_subspace defaults to "
+             "256, or 16 with fast_scan=True, which stores 4-bit codes and scores 32 vectors per SIMD instruction "
+             "(much faster; distances are approximate, so pair it with a RefineIndex). fast_scan needs an even "
+             "num_subspaces <= 256 and ADC")
+        .def_prop_ro("fast_scan",
+                     [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.fast_scan(); }); },
+                     "Whether enable_pq(..., fast_scan=True) was used")
         .def_prop_rw("nprobe",
                      [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.nprobe(); }); },
                      [](vecengine::IVFIndex& self, std::size_t v) { write_locked(self, [&] { self.set_nprobe(v); }); },
