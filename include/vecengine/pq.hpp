@@ -43,6 +43,17 @@ public:
     // reuse it for every code scanned.
     void compute_adc_table(span<const float> query, span<float> out) const;
 
+    // Precomputed-table term C: out[s * K + j] = -2 <query_s, y_sj>, where
+    // y_sj is centroid j of subspace s. Build once per query and share it
+    // across every probed list. Same layout as compute_adc_table.
+    void compute_inner_table(span<const float> query, span<float> out) const;
+
+    // Precomputed-table term B for one coarse centroid c:
+    // out[s * K + j] = ||y_sj||^2 + 2 <c_s, y_sj>. Built once per list at
+    // train/load time. Per subspace, ||q_s - c_s||^2 + B + C equals the ADC
+    // table entry of the residual (q - c).
+    void compute_list_term(span<const float> coarse_centroid, span<float> out) const;
+
     // ADC step 2: query stays full-precision; only `code` is quantized.
     // Sums table[s * K + code[s]] over subspaces - lookups only, no float math.
     float distance_adc(span<const float> table, span<const uint8_t> code) const {

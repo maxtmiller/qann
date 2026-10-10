@@ -89,6 +89,45 @@ void PQCodebook::compute_adc_table(span<const float> query, span<float> out) con
     }
 }
 
+void PQCodebook::compute_inner_table(span<const float> query, span<float> out) const {
+    assert(query.size() == dim_);
+    assert(out.size() == num_subspaces_ * centroids_per_subspace_);
+
+    for (size_t i = 0; i < num_subspaces_; ++i) {
+        float* out_pos = out.data() + (i * centroids_per_subspace_);
+        std::fill_n(out_pos, centroids_per_subspace_, 0.0f);
+        
+        for (size_t j = 0; j < sub_dim_; ++j) {
+            float q_d = query[i * sub_dim_ + j];
+            const float* cent_d = centroids_t_.data() + (i * sub_dim_ + j) * centroids_per_subspace_;
+
+            for (size_t k = 0; k < centroids_per_subspace_; ++k) {
+                float diff = -2 * q_d * cent_d[k];
+                out_pos[k] += diff;
+            }
+        }
+    }
+}
+
+void PQCodebook::compute_list_term(span<const float> coarse_centroid, span<float> out) const {
+    assert(coarse_centroid.size() == dim_);
+    assert(out.size() == num_subspaces_ * centroids_per_subspace_);
+
+    for (size_t i = 0; i < num_subspaces_; ++i) {
+        float* out_pos = out.data() + (i * centroids_per_subspace_);
+        std::fill_n(out_pos, centroids_per_subspace_, 0.0f);
+        
+        for (size_t j = 0; j < sub_dim_; ++j) {
+            float c_d = coarse_centroid[i * sub_dim_ + j];
+            const float* cent_d = centroids_t_.data() + (i * sub_dim_ + j) * centroids_per_subspace_;
+
+            for (size_t k = 0; k < centroids_per_subspace_; ++k) {
+                out_pos[k] += cent_d[k] * (cent_d[k] + 2 * c_d);
+            }
+        }
+    }
+}
+
 float PQCodebook::distance_sdc(span<const uint8_t> query_code, span<const uint8_t> code) const {
     assert(query_code.size() == num_subspaces_);
     assert(code.size() == num_subspaces_);

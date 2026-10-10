@@ -69,6 +69,7 @@ Partitions vectors into `nlist` clusters with k-means and, at query time, scans 
 | `enable_pq(num_subspaces, centroids_per_subspace=256)` | Compress stored vectors with product quantization. Call before `train`. |
 | `nprobe` | Property: clusters scanned per query. Can be changed at any time; higher means better recall and slower queries. |
 | `pq_distance` | Property: how PQ codes are scored, `qann.PQDistance.ADC` (default, more accurate) or `qann.PQDistance.SDC`. |
+| `precomputed_tables` | Property: whether ADC queries use lookup tables precomputed at train time, which makes PQ queries faster. On by default; reads `True` once the tables exist (PQ enabled, trained, and `nlist * num_subspaces * centroids_per_subspace * 4` bytes within 256 MB). Set to `False` to free them. |
 
 `nlist` must be between 100 and 65535, and `nprobe` between 1 and `nlist`. A common starting point is `nlist` around `sqrt(n)` to `4 * sqrt(n)` and `nprobe` at 1% to 5% of `nlist`.
 

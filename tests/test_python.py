@@ -385,3 +385,20 @@ def test_base_of_loaded_refine_index_is_protected(tmp_path, refine_index, data):
     loaded = qann.load(path)
     with pytest.raises(ValueError, match="through the RefineIndex"):
         loaded.base.add(data[:2])
+
+
+def test_precomputed_tables_toggle(data):
+    ivf = qann.IVFIndex(32, 100, 20)
+    ivf.enable_pq(8)
+    assert not ivf.precomputed_tables
+    ivf.train(data, seed=1)
+    assert ivf.precomputed_tables
+    ivf.add(data)
+
+    ids_fast, dists_fast = ivf.batch_query(data[:50], 10)
+    ivf.precomputed_tables = False
+    assert not ivf.precomputed_tables
+    ids_slow, dists_slow = ivf.batch_query(data[:50], 10)
+
+    np.testing.assert_allclose(dists_fast, dists_slow, rtol=1e-3, atol=1e-3)
+    assert np.mean(ids_fast == ids_slow) >= 0.98

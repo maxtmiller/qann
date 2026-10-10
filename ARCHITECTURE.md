@@ -133,6 +133,7 @@ All three are built in `train()`.
 
 - `train(vectors, n)`: one `kmeans` call per subspace, run in parallel with `parallel_for`, then the transposed copy, then `sdc_table_`.
 - `compute_adc_table(query, out)` + `distance_adc(table, code)`: **ADC**. The caller-provided `out` holds `m * K` distances from each query slice to every centroid (`table[s * K + c]`); the distance is `m` lookups. `distance_adc` is defined in the header so it inlines into the IVF scan loop.
+- `compute_inner_table(query, out)` and `compute_list_term(c, out)`: the two halves of IVF's precomputed tables (see `IVFIndex`), in the same `[s * K + c]` layout. The first gives `−2⟨q_s, y_sj⟩`, the second `‖y_sj‖² + 2⟨c_s, y_sj⟩` for one coarse centroid `c`. Both use the `centroids_t_` loop shape.
 - `encode(vec)`: builds the ADC table for `vec`, then takes the argmin of each subspace's row (a vectorized min pass, then a short search for its position).
 - `distance_sdc(query_code, code)`: **SDC**. Both sides are codes; `m` lookups into `sdc_table_`, no float math.
 
@@ -200,10 +201,23 @@ Exact search. Vectors stored row-major in one `vector<float>`, one row per slot.
   1. Coarse: find the `nprobe` nearest coarse centroids.
   2. Fine: scan only those lists with a size-`k` max-heap. One ADC table buffer is allocated per query and reused for every list. Per list, all query-and-cluster-dependent work happens once, before the per-vector loop:
      - PQ off: `l2_distance` per stored vector.
-     - ADC: residual `q − centroid(c)` → `compute_adc_table` → `distance_adc` per code.
+     - ADC with precomputed tables (the default): table = `B[list] + C`, plus `A` on subspace 0's row → `distances_adc` over the list's codes. See below.
+     - ADC without them: residual `q − centroid(c)` → `compute_adc_table` → `distances_adc`.
      - SDC: residual → `encode` → `distance_sdc` per code.
 
-The residual is rebuilt per probed list because it depends on the cluster's centroid. Stored codes encode `x − c`, the query becomes `q − c`, and `(q − c) − (x − c) = q − x`, so residual distances equal true distances. Inside IVF, SDC costs about the same as ADC (both need a full pass over the centroids per list) and is less accurate. ADC is the default.
+The residual depends on the cluster's centroid, so without precomputed tables it is rebuilt per probed list. Stored codes encode `x − c`, the query becomes `q − c`, and `(q − c) − (x − c) = q − x`, so residual distances equal true distances. SDC still rebuilds and encodes the residual per list, so it is slower than precomputed ADC as well as less accurate. ADC is the default.
+
+**Precomputed tables** (FAISS-style). With `y` the PQ reconstruction of a stored residual, the ADC distance expands per subspace as `‖q − c − y‖² = ‖q − c‖² + (‖y‖² + 2⟨c, y⟩) − 2⟨q, y⟩ = A + B + C`:
+
+| Term | Depends on | Built | Stored |
+|---|---|---|---|
+| `A = ‖q − c‖²` | query, list | coarse search already computes it | the coarse heap (read before `pop`) |
+| `B[list][s][j] = ‖y_sj‖² + 2⟨c_s, y_sj⟩` | list | `build_precomputed()`, once per list, in parallel | `precomputed_`, `nlist * m * K` floats, list-major |
+| `C[s][j] = −2⟨q_s, y_sj⟩` | query | `compute_inner_table`, once per query | a local `m * K` vector |
+
+Per probed list the table is then `m * K` additions instead of a `sub_dim`-long loop per entry, and `A` is added to the `K` entries of subspace 0 only: each code picks exactly one entry per row, so every distance gets `A` once and `distances_adc` stays unchanged. Results match the per-list path up to float rounding (the tests allow `1e-3`).
+
+`build_precomputed()` runs at the end of `train()`, after `load_body()` (the tables are derived, never saved), and from `set_precomputed_tables(true)`. It leaves `precomputed_` empty, and queries fall back to the per-list build, when PQ is off, the index is untrained, the setting is off, or the tables would exceed `kPrecomputedMaxBytes` (256 MB). SIFT1M with `nlist = 1000` and PQ16 needs 16 MB. `precomputed_tables()` reports whether the tables exist; `set_precomputed_tables(false)` frees them.
 
 Every candidate goes through one `push` lambda that checks the `TopK` threshold first and then `is_deleted`, and pushes the slot's id. `nprobe` and `pq_distance` both have setters and can be changed at any time after training; they only affect queries.
 
@@ -291,6 +305,8 @@ Thread scaling at `nprobe = 16` (`set_num_threads`):
 
 **Build times** on all cores: IVF trains in 2.5 s and adds 1M vectors in 1.3 s (`add_batch`); IVF + PQ16 trains in 3.4 s (8.6 s on one thread) and adds in 3.0 s. Before `assign_nearest`, IVF training took 37 s and IVF + PQ16 55 s.
 
+**Precomputed tables** (`profile_query`, `nprobe = 16`, 1 thread, both paths in one run): the ADC table build drops from 37.8 to 9.0 µs per query, taking IVF + PQ16 from 131 to 108 µs (+21% QPS). The code scan (~70 µs) is now most of a PQ query. The thread-scaling table above predates this change.
+
 The PQ rows of `benchmarks/results/sift.csv` from this run are ~20% low: other jobs loaded the machine during its second half. The thread-scaling numbers above come from a separate clean run.
 
 ---
@@ -311,6 +327,7 @@ refine = qann.RefineIndex(ivf, k_factor=10)   # optional; wrap before adding
 refine.add(x)                          # adds to ivf too
 ivf.nprobe = 32                        # tune after training
 ivf.pq_distance = qann.PQDistance.ADC    # default ADC
+ivf.precomputed_tables = False         # default True; frees the precomputed ADC tables
 ids, dists = refine.query(x[0], 10)      # (10,) arrays
 ids, dists = refine.batch_query(x[:5], 10)  # (5, 10) arrays
 
@@ -343,7 +360,7 @@ Results are NumPy arrays that take ownership of the C++ buffer (no copy): IDs ar
 pip install .               # builds the Python module into a wheel (no C++ tests)
 ./build.sh                  # Release build in ./build/, then ctest
 ./build.sh build Debug      # Debug build (asserts on)
-./build/test_vecengine "[pq]"   # run one tag: [l2] [cosine] [index] [ivf] [pq] [adc] [sdc] [refine] [serialize] [file] ...
+./build/test_vecengine "[pq]"   # run one tag: [l2] [cosine] [index] [ivf] [pq] [adc] [sdc] [refine] [serialize] [file] [precomputed] ...
 ./build/bench_vecengine
 ```
 
@@ -361,5 +378,4 @@ pip install .               # builds the Python module into a wheel (no C++ test
 
 ## Not Yet Implemented
 
-- **IVF-PQ precomputed tables**: FAISS-style decomposition to avoid building an ADC table per probed list.
 - **HNSW**: graph index; slot reserved in `IndexType`.

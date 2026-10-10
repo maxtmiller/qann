@@ -36,6 +36,25 @@ void IVFIndex::set_nprobe(size_t nprobe) {
     nprobe_ = nprobe;
 }
 
+void IVFIndex::set_precomputed_tables(bool enabled) {
+    use_precomputed_ = enabled;
+    if (enabled) build_precomputed();
+    else vector<float>().swap(precomputed_);
+}
+
+void IVFIndex::build_precomputed() {
+    precomputed_.clear();
+    if (!use_precomputed_ || !trained_ || !pq_enabled()) return;
+
+    size_t list_size = pq_->num_subspaces() * pq_->centroids_per_subspace();
+    if (nlist_ * list_size * sizeof(float) > kPrecomputedMaxBytes) return;
+    
+    precomputed_.resize(nlist_ * list_size);
+    detail::parallel_for(nlist_, [&](size_t i) {
+        pq_->compute_list_term({coarse_centroids_.data() + i * dim_, dim_}, {precomputed_.data() + i * list_size, list_size});
+    });
+}
+
 void IVFIndex::enable_pq(size_t num_subspaces, size_t centroids_per_subspace) {
     if (id_map_.slots() > 0 || trained_)
         throw std::logic_error("enable_pq must be called before train()/add()");
@@ -136,13 +155,19 @@ vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
 
     // intialize vars for pq, reuse allocated memory for adc table
     const size_t m = pq_enabled() ? pq_->num_subspaces() : 0;
-    vector<float> table(pq_enabled() ? m * pq_->centroids_per_subspace() : 0);
+    const size_t K = pq_enabled() ? pq_->centroids_per_subspace() : 0;
+    vector<float> table(pq_enabled() ? m * K : 0);
     vector<float> dists;
     detail::TopK top(k);
+
+    const bool use_pre = pq_enabled() && pq_distance_ == PQDistance::ADC && precomputed_tables();
+    vector<float> C(use_pre ? m * K : 0);
+    if (use_pre) pq_->compute_inner_table(vec, C);
 
     // find top-k vectors from the inverted lists associated with the nprobe closest coarse centroids
     const size_t n1 = maxCentroidHeap.size();
     for (size_t i = 0; i < n1; ++i) {
+        const float A = maxCentroidHeap.top().first;
         auto it = data_.find(maxCentroidHeap.top().second);
         maxCentroidHeap.pop();
         if (it == data_.end()) continue;
@@ -167,17 +192,23 @@ vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
             continue;
         }
 
+        vector<float> residual(use_pre ? 0 : dim_);
         VECENGINE_PROF_START(t_table);
-        // calculates residuals 
-        vector<float> residual(dim_);
-        const float* centroid_ptr = coarse_centroids_.data() + it->first * dim_;
-        for (size_t l = 0; l < dim_; ++l) {
-            residual[l] = vec[l] - centroid_ptr[l];
+        if (use_pre) {
+            const float* B = precomputed_.data() + it->first * m * K;
+            for (size_t t = 0; t < m * K; ++t) table[t] = B[t] + C[t];
+            for (size_t j = 0; j < K; ++j) table[j] += A;
+        } else {
+            // calculates residuals 
+            const float* centroid_ptr = coarse_centroids_.data() + it->first * dim_;
+            for (size_t l = 0; l < dim_; ++l) {
+                residual[l] = vec[l] - centroid_ptr[l];
+            }
         }
 
         // calculate distance with ADC or SDC
         if (pq_distance_ == PQDistance::ADC) {
-            pq_->compute_adc_table(residual, table);
+            if (!use_pre) pq_->compute_adc_table(residual, table);
             VECENGINE_PROF_STOP(t_table, kProfTable);
             VECENGINE_PROF_START(t_scan);
             pq_->distances_adc(table, list.codes.data(), listSize, dists.data());
@@ -229,6 +260,7 @@ void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_i
         pq_->train(residuals, num_vectors, max_iters, seed ? std::optional<uint32_t>(*seed + 1) : std::nullopt);
     }
     trained_ = true;
+    build_precomputed();
 }
 
 void IVFIndex::save(std::ostream& out) const {
@@ -313,6 +345,8 @@ std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version
 
     if (version >= 2) index->id_map_ = detail::IdMap::load(in, n_total);
     else index->id_map_.add(n_total, nullptr);
+
+    index->build_precomputed();
 
     return index;
 }

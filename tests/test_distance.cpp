@@ -631,6 +631,69 @@ TEST_CASE("IVFIndex+PQ: recall vs FlatIndex, ADC beats SDC", "[ivf][pq]") {
     REQUIRE(adc > sdc);
 }
 
+TEST_CASE("PQCodebook: coarse distance + list term + inner table equals residual ADC table", "[pq][adc][precomputed]") {
+    const size_t dim = 16, m = 4, K = 16, sub = dim / m;
+    auto data = random_vectors(200, dim, /*seed=*/21);
+    vecengine::PQCodebook pq(dim, m, K);
+    pq.train(data, 200, 10);
+
+    auto query = random_vectors(1, dim, /*seed=*/22);
+    auto centroid = random_vectors(1, dim, /*seed=*/23);
+    std::vector<float> residual(dim);
+    for (size_t d = 0; d < dim; ++d) residual[d] = query[d] - centroid[d];
+
+    std::vector<float> adc(m * K), inner(m * K), list(m * K);
+    pq.compute_adc_table(residual, adc);
+    pq.compute_inner_table(query, inner);
+    pq.compute_list_term(centroid, list);
+
+    for (size_t s = 0; s < m; ++s) {
+        float a = vecengine::l2_distance(query.data() + s * sub, centroid.data() + s * sub, sub);
+        for (size_t j = 0; j < K; ++j)
+            REQUIRE_THAT(a + list[s * K + j] + inner[s * K + j], WithinAbs(adc[s * K + j], 1e-3));
+    }
+}
+
+TEST_CASE("IVFIndex+PQ: precomputed tables match the per-list ADC path", "[ivf][pq][precomputed]") {
+    const size_t dim = 32, n = 5000, k = 10, nq = 100;
+    auto data = random_vectors(n, dim, /*seed=*/42);
+    auto queries = random_vectors(nq, dim, /*seed=*/43);
+
+    vecengine::IVFIndex idx(dim, 100, 20);
+    idx.enable_pq(8, 256);
+    REQUIRE_FALSE(idx.precomputed_tables());
+    idx.train(data, n, 15, /*seed=*/1);
+    REQUIRE(idx.precomputed_tables());
+    idx.add_batch(data, n);
+
+    auto fast = idx.query_batch(queries, nq, k);
+    idx.set_precomputed_tables(false);
+    REQUIRE_FALSE(idx.precomputed_tables());
+    auto slow = idx.query_batch(queries, nq, k);
+
+    // Float rounding differs between the two paths, so near-ties may swap.
+    size_t same = 0;
+    for (size_t q = 0; q < nq; ++q) {
+        REQUIRE(fast[q].size() == slow[q].size());
+        for (size_t i = 0; i < fast[q].size(); ++i) {
+            REQUIRE_THAT(fast[q][i].distance, WithinRel(slow[q][i].distance, 1e-3f) || WithinAbs(slow[q][i].distance, 1e-3));
+            if (fast[q][i].index == slow[q][i].index) ++same;
+        }
+    }
+    REQUIRE(same >= nq * k * 98 / 100);
+
+    idx.set_precomputed_tables(true);
+    REQUIRE(idx.precomputed_tables());
+}
+
+TEST_CASE("IVFIndex: precomputed tables stay off without PQ", "[ivf][precomputed]") {
+    const size_t dim = 8, n = 500;
+    auto data = random_vectors(n, dim, /*seed=*/5);
+    vecengine::IVFIndex idx(dim, 100, 10);
+    idx.train(data, n, 5);
+    REQUIRE_FALSE(idx.precomputed_tables());
+}
+
 // ---------------------------------------------------------------------------
 // RefineIndex
 // ---------------------------------------------------------------------------
