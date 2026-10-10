@@ -160,6 +160,14 @@ static std::size_t index_remove(vecengine::Index& self, IdsArg ids) {
     });
 }
 
+// Free the storage of deleted vectors; returns how many slots were reclaimed.
+static std::size_t index_compact(vecengine::Index& self) {
+    return write_locked(self, [&] {
+        refuse_if_wrapped(self, "compact");
+        return self.compact();
+    });
+}
+
 static std::size_t index_size(const vecengine::Index& self) {
     return read_locked(self, [&] { return self.size(); });
 }
@@ -273,9 +281,11 @@ NB_MODULE(qann, m) {
              nb::arg("path"), "Save the index to a file; load it back with qann.load(path)")
         .def("add", &index_add, nb::arg("data"), nb::arg("ids").none() = nb::none(),
              "Add an (n, dim) array of vectors. Pass ids (n int64 values >= 0) if the index was "
-             "created with custom_ids=True; otherwise ids continue from the number of vectors ever added")
+             "created with custom_ids=True; otherwise ids continue after the highest id ever assigned")
         .def("remove", &index_remove, nb::arg("ids"),
              "Delete the vectors with these ids; unknown ids are skipped. Returns how many were deleted")
+        .def("compact", &index_compact,
+             "Free the memory of deleted vectors; ids and results are unchanged. Returns how many were freed")
         .def("query", &index_query, nb::arg("query"), nb::arg("k"), "Query k-NN for a (dim,) vector; returns 1D (indices, distances)")
         .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), "Query k-NN for each row; returns (indices, distances) arrays of shape (num_queries, k), padded with -1 / inf")
         .def("size", &index_size, "Get number of indexed vectors")

@@ -28,7 +28,7 @@ using std::span;
 // index's slot i are always the same vector.
 class RefineIndex : public Index {
 public:
-    // base must have no slots yet, no custom ids, and not already be wrapped by
+    // base must have no slots yet, ids equal to its slots (no custom ids, never compacted), and not already be wrapped by
     // another RefineIndex, so its slots line up with this index's raw storage.
     // k_factor >= 1. custom_ids makes add_batch() take user ids. Marks base as
     // wrapped (see Index::wrapped()).
@@ -44,6 +44,10 @@ public:
     void add_batch(span<const float> vecs, size_t n, const int64_t* ids = nullptr) override;
     vector<Neighbor> query(span<const float> vec, size_t k) const override;
     size_t remove(span<const int64_t> ids) override;
+
+    // Compacts this index's ids and raw vectors and the base's storage with
+    // the same remap, keeping them aligned.
+    size_t compact() override;
 
     // Fetches every query's candidates with one base query_batch() call (so
     // IVFIndex's batched coarse search applies), then re-ranks in parallel.
@@ -61,6 +65,7 @@ public:
 
     size_t slots() const noexcept override { return id_map_.slots(); }
     bool custom_ids() const noexcept override { return id_map_.custom_ids(); }
+    bool ids_are_slots() const noexcept override { return id_map_.ids_are_slots(); }
 
     // The wrapped approximate index, e.g. to tune nprobe on a loaded index.
     Index& base() noexcept { return base_; }
@@ -72,6 +77,9 @@ public:
     void set_k_factor(size_t k_factor);
 
 private:
+    // A RefineIndex is never a base; throws std::logic_error.
+    size_t compact_as_base() override;
+
     // Exact top k of the base's candidates for vec (candidate ids are base slots).
     vector<Neighbor> rerank(span<const float> vec, const vector<Neighbor>& candidates, size_t k) const;
 

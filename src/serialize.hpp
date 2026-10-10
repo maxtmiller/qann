@@ -19,7 +19,7 @@ static_assert(std::endian::native == std::endian::little, "qann index files assu
 
 // "QANN" read as a little-endian uint32.
 inline constexpr uint32_t kMagic = 0x4E4E4151;
-inline constexpr uint32_t kFormatVersion = 2; // Current writer version
+inline constexpr uint32_t kFormatVersion = 3; // Current writer version
 inline constexpr uint32_t kMinFormatVersion = 1; // Oldest readable version
 
 // Type tag stored in each header. Values are part of the file format: never

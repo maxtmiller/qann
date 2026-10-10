@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include "vecengine/id_map.hpp"
 #include "serialize.hpp"
@@ -97,7 +98,7 @@ TEST_CASE("IdMap: save/load round-trip", "[idmap][serialize]") {
 
         std::stringstream s;
         map.save(s);
-        IdMap loaded = IdMap::load(s, 4);
+        IdMap loaded = IdMap::load(s, 4, kFormatVersion);
 
         REQUIRE(loaded.custom_ids() == custom);
         REQUIRE(loaded.slots() == 4);
@@ -114,54 +115,96 @@ TEST_CASE("IdMap: save/load round-trip", "[idmap][serialize]") {
 }
 
 TEST_CASE("IdMap: load rejects corrupt data", "[idmap][serialize]") {
-    auto body = [](uint8_t custom, uint64_t slots, std::vector<int64_t> labels, std::vector<uint8_t> deleted) {
+    // A version-3 body; next_id defaults to the slot count (ids equal slots).
+    auto body = [](uint8_t custom, uint64_t slots, std::vector<int64_t> labels, std::vector<uint8_t> deleted,
+                   int64_t next_id = -2) {
         std::stringstream t;
         write_pod(t, custom);
         write_pod(t, slots);
+        write_pod<int64_t>(t, next_id == -2 ? static_cast<int64_t>(slots) : next_id);
         write_vec(t, labels);
         write_vec(t, deleted);
         return t;
     };
+    const uint32_t v = kFormatVersion;
 
     SECTION("valid hand-written body loads") {
         auto t = body(1, 2, {5, 6}, {0, 0});
-        REQUIRE(IdMap::load(t, 2).live() == 2);
+        REQUIRE(IdMap::load(t, 2, v).live() == 2);
     }
     SECTION("slot count differs from the index") {
         auto t = body(0, 3, {}, {0, 0, 0});
-        REQUIRE_THROWS_AS(IdMap::load(t, 2), std::runtime_error);
+        REQUIRE_THROWS_AS(IdMap::load(t, 2, v), std::runtime_error);
     }
     SECTION("bad custom flag") {
         auto t = body(2, 1, {}, {0});
-        REQUIRE_THROWS_AS(IdMap::load(t, 1), std::runtime_error);
+        REQUIRE_THROWS_AS(IdMap::load(t, 1, v), std::runtime_error);
     }
-    SECTION("labels without custom ids") {
-        auto t = body(0, 2, {5, 6}, {0, 0});
-        REQUIRE_THROWS_AS(IdMap::load(t, 2), std::runtime_error);
+    SECTION("auto ids from a compacted index") {
+        auto t = body(0, 2, {5, 6}, {0, 0}, 9);
+        IdMap map = IdMap::load(t, 2, v);
+        REQUIRE(map.label(1) == 6);
+        map.add(1, nullptr);
+        REQUIRE(map.label(2) == 9);
+    }
+    SECTION("auto ids out of order, negative, or at or past the next id") {
+        auto unsorted = body(0, 2, {6, 5}, {0, 0}, 9);
+        REQUIRE_THROWS_AS(IdMap::load(unsorted, 2, v), std::runtime_error);
+        auto negative = body(0, 2, {-1, 5}, {0, 0}, 9);
+        REQUIRE_THROWS_AS(IdMap::load(negative, 2, v), std::runtime_error);
+        auto past = body(0, 2, {5, 9}, {0, 0}, 9);
+        REQUIRE_THROWS_AS(IdMap::load(past, 2, v), std::runtime_error);
+    }
+    SECTION("auto ids without labels must equal slots") {
+        auto gap = body(0, 2, {}, {0, 0}, 5);
+        REQUIRE_THROWS_AS(IdMap::load(gap, 2, v), std::runtime_error);
+        auto emptied = body(0, 0, {}, {}, 5);   // compacted down to nothing
+        IdMap map = IdMap::load(emptied, 0, v);
+        map.add(1, nullptr);
+        REQUIRE(map.label(0) == 5);
+        auto negative = body(0, 0, {}, {}, -1);
+        REQUIRE_THROWS_AS(IdMap::load(negative, 0, v), std::runtime_error);
+    }
+    SECTION("version 2: no next id, and auto ids carry no labels") {
+        std::stringstream t;
+        write_pod<uint8_t>(t, 0);
+        write_pod<uint64_t>(t, 2);
+        write_vec(t, std::vector<int64_t>{});
+        write_vec(t, std::vector<uint8_t>{0, 1});
+        IdMap map = IdMap::load(t, 2, 2);
+        REQUIRE(map.live() == 1);
+        REQUIRE(map.ids_are_slots());
+
+        std::stringstream labelled;
+        write_pod<uint8_t>(labelled, 0);
+        write_pod<uint64_t>(labelled, 2);
+        write_vec(labelled, std::vector<int64_t>{5, 6});
+        write_vec(labelled, std::vector<uint8_t>{0, 0});
+        REQUIRE_THROWS_AS(IdMap::load(labelled, 2, 2), std::runtime_error);
     }
     SECTION("too few labels") {
         auto t = body(1, 2, {5}, {0, 0});
-        REQUIRE_THROWS_AS(IdMap::load(t, 2), std::runtime_error);
+        REQUIRE_THROWS_AS(IdMap::load(t, 2, v), std::runtime_error);
     }
     SECTION("deleted flags wrong length or value") {
         auto short_flags = body(0, 2, {}, {0});
-        REQUIRE_THROWS_AS(IdMap::load(short_flags, 2), std::runtime_error);
+        REQUIRE_THROWS_AS(IdMap::load(short_flags, 2, v), std::runtime_error);
         auto bad_flag = body(0, 2, {}, {0, 2});
-        REQUIRE_THROWS_AS(IdMap::load(bad_flag, 2), std::runtime_error);
+        REQUIRE_THROWS_AS(IdMap::load(bad_flag, 2, v), std::runtime_error);
     }
     SECTION("duplicate live ids") {
         auto t = body(1, 2, {5, 5}, {0, 0});
-        REQUIRE_THROWS_AS(IdMap::load(t, 2), std::runtime_error);
+        REQUIRE_THROWS_AS(IdMap::load(t, 2, v), std::runtime_error);
     }
     SECTION("a deleted slot may share an id with a live one") {
         auto t = body(1, 2, {5, 5}, {1, 0});
-        REQUIRE(IdMap::load(t, 2).live() == 1);
+        REQUIRE(IdMap::load(t, 2, v).live() == 1);
     }
     SECTION("truncated") {
         auto t = body(1, 2, {5, 6}, {0, 0});
         const std::string bytes = t.str();
         std::stringstream cut(bytes.substr(0, bytes.size() - 1));
-        REQUIRE_THROWS_AS(IdMap::load(cut, 2), std::runtime_error);
+        REQUIRE_THROWS_AS(IdMap::load(cut, 2, v), std::runtime_error);
     }
 }
 
@@ -625,6 +668,39 @@ TEST_CASE("files from format version 1 (0.1.0a4) still load", "[serialize][compa
     }
 }
 
+TEST_CASE("files from format version 2 (0.1.0a6) still load", "[serialize][compat]") {
+    // Saved by 0.1.0a6 with 400 of 2000 vectors deleted; flat and refine use
+    // custom ids 100, 103, 106, ... (every fifth deleted), ivf_pq auto ids.
+    const std::filesystem::path dir = QANN_TEST_DATA_DIR;
+    for (const char* name : {"v2_flat.qann", "v2_ivf_pq.qann", "v2_refine.qann"}) {
+        CAPTURE(name);
+        auto index = load_index(dir / name);
+        REQUIRE(index->size() == 1600);
+        REQUIRE(index->slots() == 2000);
+        REQUIRE(index->dim() == 16);
+        const bool custom = index->custom_ids();
+        REQUIRE(custom == (std::string(name) != "v2_ivf_pq.qann"));
+
+        // Compacting a loaded file works, then re-saving writes the current version.
+        auto query = random_matrix(1, 16, 23);
+        const auto before = index->query(query, 10);
+        REQUIRE(index->compact() == 400);
+        const auto after = index->query(query, 10);
+        REQUIRE(after.size() == before.size());
+        for (size_t i = 0; i < before.size(); ++i) REQUIRE(after[i].index == before[i].index);
+
+        std::stringstream s;
+        index->save(s);
+        REQUIRE(read_header(s).version == kFormatVersion);
+        s.seekg(0);
+        auto reloaded = load_index(s);
+        REQUIRE(reloaded->size() == 1600);
+        REQUIRE(reloaded->slots() == 1600);
+        const auto again = reloaded->query(query, 10);
+        for (size_t i = 0; i < before.size(); ++i) REQUIRE(again[i].index == before[i].index);
+    }
+}
+
 TEST_CASE("load rejects bad versions and misaligned id maps", "[serialize][ids]") {
     const size_t dim = 4;
     auto data = random_matrix(10, dim, 24);
@@ -649,7 +725,7 @@ TEST_CASE("load rejects bad versions and misaligned id maps", "[serialize][ids]"
         std::stringstream inner;
         base.save(inner);
         std::string inner_bytes = inner.str();
-        inner_bytes[4] = 1;   // nested header claims version 1 inside a version 2 file
+        inner_bytes[4] = 1;   // nested header claims an older version than the file
         t << inner_bytes;
         REQUIRE_THROWS_AS(load_index(t), std::runtime_error);
     }
@@ -702,4 +778,208 @@ TEST_CASE("RefineIndex marks its base as wrapped", "[refine][ids]") {
         REQUIRE(dynamic_cast<RefineIndex&>(*loaded).base().wrapped());
     }
     REQUIRE_FALSE(base.wrapped());  // cleared when the RefineIndex is destroyed
+}
+
+// ---------------------------------------------------------------------------
+// Compaction
+// ---------------------------------------------------------------------------
+
+TEST_CASE("IdMap: compact drops deleted slots and keeps ids", "[idmap][compact]") {
+    SECTION("auto ids") {
+        IdMap map;
+        map.add(6, nullptr);
+        REQUIRE(map.compact(true).empty());  // nothing deleted
+
+        const std::vector<int64_t> del{1, 4};
+        map.remove(del);
+        const auto remap = map.compact(true);
+        const uint32_t X = IdMap::kRemoved;
+        REQUIRE(remap == std::vector<uint32_t>{0, X, 1, 2, X, 3});
+        REQUIRE(map.slots() == 4);
+        REQUIRE(map.live() == 4);
+        REQUIRE_FALSE(map.ids_are_slots());
+        for (uint32_t s = 0; s < 4; ++s) REQUIRE_FALSE(map.is_deleted(s));
+        REQUIRE(map.label(0) == 0);
+        REQUIRE(map.label(1) == 2);
+        REQUIRE(map.label(2) == 3);
+        REQUIRE(map.label(3) == 5);
+
+        // Old ids still resolve; deleted ids stay gone; new ids continue at 6.
+        const std::vector<int64_t> gone{1, 4, 6};
+        REQUIRE(map.remove(gone) == 0);
+        std::vector<uint32_t> removed;
+        const std::vector<int64_t> five{5};
+        REQUIRE(map.remove(five, &removed) == 1);
+        REQUIRE(removed == std::vector<uint32_t>{3});
+        map.add(2, nullptr);
+        REQUIRE(map.label(4) == 6);
+        REQUIRE(map.label(5) == 7);
+
+        // A second compaction works on already-materialized labels.
+        const auto again = map.compact(true);
+        REQUIRE(again == std::vector<uint32_t>{0, 1, 2, X, 3, 4});
+        REQUIRE(map.label(3) == 6);
+        REQUIRE(map.label(4) == 7);
+    }
+
+    SECTION("auto ids, renumbered for a RefineIndex base") {
+        IdMap map;
+        map.add(5, nullptr);
+        const std::vector<int64_t> del{0, 3};
+        map.remove(del);
+        map.compact(false);
+        REQUIRE(map.slots() == 3);
+        REQUIRE(map.ids_are_slots());
+        REQUIRE(map.label(2) == 2);
+        map.add(1, nullptr);
+        REQUIRE(map.label(3) == 3);
+        REQUIRE(map.ids_are_slots());
+    }
+
+    SECTION("custom ids") {
+        IdMap map(true);
+        const std::vector<int64_t> ids{100, 7, 42, 9};
+        map.add(ids.size(), ids.data());
+        const std::vector<int64_t> del{7};
+        map.remove(del);
+        map.compact(true);
+        REQUIRE(map.slots() == 3);
+        REQUIRE(map.label(0) == 100);
+        REQUIRE(map.label(1) == 42);
+        REQUIRE(map.label(2) == 9);
+
+        std::vector<uint32_t> removed;
+        const std::vector<int64_t> forty_two{42};
+        REQUIRE(map.remove(forty_two, &removed) == 1);
+        REQUIRE(removed == std::vector<uint32_t>{1});
+
+        // A deleted id can be added again after compaction.
+        const std::vector<int64_t> seven{7};
+        map.add(1, seven.data());
+        REQUIRE(map.label(3) == 7);
+        REQUIRE_THROWS_AS(map.add(1, ids.data()), std::invalid_argument);  // 100 is live
+    }
+}
+
+// Deletes every third live id, compacts, and checks that nothing a caller can
+// see changed: same results (ids and distances), same size, old ids still
+// removable, new ids continuing after the highest ever assigned.
+static void check_compaction(Index& index, const std::vector<int64_t>& ids, const std::vector<float>& data, size_t dim) {
+    const size_t nq = 40, k = 10;
+    auto queries = random_matrix(nq, dim, 77);
+
+    std::vector<int64_t> dead;
+    for (size_t i = 0; i < ids.size(); i += 3) dead.push_back(ids[i]);
+    REQUIRE(index.remove(dead) == dead.size());
+    const size_t live = index.size();
+    const auto before = index.query_batch(queries, nq, k);
+
+    REQUIRE(index.compact() == dead.size());
+    REQUIRE(index.size() == live);
+    REQUIRE(index.slots() == live);
+    REQUIRE(index.compact() == 0);
+
+    const auto after = index.query_batch(queries, nq, k);
+    for (size_t q = 0; q < nq; ++q) {
+        REQUIRE(after[q].size() == before[q].size());
+        for (size_t i = 0; i < before[q].size(); ++i) {
+            REQUIRE(after[q][i].index == before[q][i].index);
+            REQUIRE(after[q][i].distance == before[q][i].distance);
+        }
+    }
+
+    // A compacted index saves and loads with the same results and ids.
+    auto loaded = roundtrip(index);
+    REQUIRE(loaded->slots() == live);
+    REQUIRE(loaded->ids_are_slots() == index.ids_are_slots());
+    require_same(index, *loaded, queries, nq, k);
+
+    // An id that survived can still be removed, and is never returned again.
+    const int64_t victim = ids[1];
+    const std::vector<int64_t> one{victim};
+    REQUIRE(index.remove(one) == 1);
+    REQUIRE(index.size() == live - 1);
+    for (const auto& r : index.query_batch(queries, nq, k))
+        for (const auto& nb : r) REQUIRE(static_cast<int64_t>(nb.index) != victim);
+
+    // New vectors get new ids and are found.
+    const int64_t next = index.custom_ids() ? 5'000'000 : static_cast<int64_t>(ids.size());
+    const std::vector<int64_t> fresh{next, next + 1};
+    index.add_batch(std::span<const float>(data.data(), 2 * dim), 2, index.custom_ids() ? fresh.data() : nullptr);
+    REQUIRE(index.size() == live + 1);
+    REQUIRE(static_cast<int64_t>(index.query(row(data, 0, dim), 1)[0].index) == next);
+    REQUIRE(static_cast<int64_t>(index.query(row(data, 1, dim), 1)[0].index) == next + 1);
+}
+
+TEST_CASE("compact keeps results and ids for every index", "[compact]") {
+    const size_t n = 1200, dim = 8;
+    auto data = random_matrix(n, dim, 71);
+    const bool custom = GENERATE(false, true);
+    std::vector<int64_t> ids(n);
+    for (size_t i = 0; i < n; ++i) ids[i] = custom ? 10'000 + 3 * static_cast<int64_t>(i) : static_cast<int64_t>(i);
+    const int64_t* add_ids = custom ? ids.data() : nullptr;
+    INFO("custom ids: " << custom);
+
+    SECTION("Flat") {
+        FlatIndex index(dim, 16, custom);
+        index.add_batch(data, n, add_ids);
+        check_compaction(index, ids, data, dim);
+    }
+    SECTION("IVF") {
+        const auto mode = GENERATE(IvfMode::Plain, IvfMode::ADC, IvfMode::SDC);
+        auto index = make_ivf(mode, dim, data, n, custom);
+        index->add_batch(data, n, add_ids);
+        check_compaction(*index, ids, data, dim);
+    }
+    SECTION("IVF, ADC without precomputed tables") {
+        auto index = make_ivf(IvfMode::ADC, dim, data, n, custom);
+        index->set_precomputed_tables(false);
+        index->add_batch(data, n, add_ids);
+        check_compaction(*index, ids, data, dim);
+    }
+    SECTION("Refine over Flat") {
+        FlatIndex base(dim);
+        RefineIndex refine(base, 4, custom);
+        refine.add_batch(data, n, add_ids);
+        check_compaction(refine, ids, data, dim);
+        REQUIRE(base.slots() == refine.slots());
+        REQUIRE(base.ids_are_slots());
+    }
+    SECTION("Refine over IVF-PQ") {
+        auto base = make_ivf(IvfMode::ADC, dim, data, n, false);
+        RefineIndex refine(*base, 4, custom);
+        refine.add_batch(data, n, add_ids);
+        check_compaction(refine, ids, data, dim);
+        REQUIRE(base->slots() == refine.slots());
+        REQUIRE(base->ids_are_slots());
+    }
+}
+
+TEST_CASE("compact after deleting everything", "[compact]") {
+    const size_t n = 10, dim = 4;
+    auto data = random_matrix(n, dim, 72);
+    FlatIndex index(dim);
+    index.add_batch(data, n);
+    std::vector<int64_t> all(n);
+    for (size_t i = 0; i < n; ++i) all[i] = static_cast<int64_t>(i);
+    index.remove(all);
+
+    REQUIRE(index.compact() == n);
+    REQUIRE(index.size() == 0);
+    REQUIRE(index.slots() == 0);
+    REQUIRE(index.query(row(data, 0, dim), 3).empty());
+
+    // Ids never repeat, even after the index was emptied.
+    index.add_batch(std::span<const float>(data.data(), 2 * dim), 2);
+    REQUIRE(index.query(row(data, 0, dim), 1)[0].index == n);
+    REQUIRE(index.query(row(data, 1, dim), 1)[0].index == n + 1);
+
+    // Its ids no longer equal its slots, so it can't be a RefineIndex base.
+    FlatIndex emptied(dim);
+    emptied.add_batch(std::span<const float>(data.data(), 2 * dim), 2);
+    const std::vector<int64_t> both{0, 1};
+    emptied.remove(both);
+    emptied.compact();
+    REQUIRE(emptied.slots() == 0);
+    REQUIRE_THROWS_AS(RefineIndex(emptied), std::invalid_argument);
 }

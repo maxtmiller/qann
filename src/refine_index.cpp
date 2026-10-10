@@ -25,7 +25,7 @@ using std::pair;
 RefineIndex::RefineIndex(Index& base, size_t k_factor, bool custom_ids) : base_(base), k_factor_(k_factor), id_map_(custom_ids) {
     if (base.slots() != 0) throw std::invalid_argument("base index must be empty");
     if (k_factor == 0) throw std::invalid_argument("k_factor must be >= 1");
-    if (base.custom_ids()) throw std::invalid_argument("base index must not use custom ids");
+    if (!base.ids_are_slots()) throw std::invalid_argument("base index must not use custom ids or have been compacted");
     if (base.wrapped()) throw std::invalid_argument("base index is already wrapped by another RefineIndex");
     base.wrapped_ = true;
 }
@@ -107,6 +107,34 @@ size_t RefineIndex::remove(span<const int64_t> ids) {
     return removed;
 }
 
+size_t RefineIndex::compact() {
+    auto remap = id_map_.compact(true);
+    if (remap.empty()) return 0;
+
+    base_.compact_as_base();
+    size_t write_slot = 0;
+    for (size_t i = 0; i < remap.size(); ++i) {
+        uint32_t new_slot = remap[i];
+        if (remap[i] == detail::IdMap::kRemoved) continue;
+
+        if (new_slot != i) {
+            float* src = data_.data() + i * dim();
+            float* dst = data_.data() + new_slot * dim();
+            std::copy_n(src, dim(), dst);
+        }
+        ++write_slot;
+    }
+    data_.resize(write_slot * dim());
+    data_.shrink_to_fit();
+
+    return remap.size() - id_map_.slots();
+}
+
+size_t RefineIndex::compact_as_base() {
+    assert(base_.slots() == id_map_.slots());
+    throw std::logic_error("a RefineIndex cannot be the base of another RefineIndex");
+}
+
 void RefineIndex::save(std::ostream& out) const {
     using namespace detail;
 
@@ -135,8 +163,8 @@ std::unique_ptr<RefineIndex> RefineIndex::load_body(std::istream& in, uint32_t v
         case IndexKind::IVF:  base = IVFIndex::load_body(in, header.version); break;
         default: throw std::runtime_error("corrupt file: RefineIndex base must be Flat or IVF");
     }
-    if (base->custom_ids())
-        throw std::runtime_error("corrupt file: RefineIndex base must not use custom ids");
+    if (!base->ids_are_slots())
+        throw std::runtime_error("corrupt file: RefineIndex base ids must equal its slots");
 
     const uint64_t dim = base->dim();
     if (count != base->slots() || count > UINT64_MAX / dim) throw std::runtime_error("corrupt file: invalid RefineIndex shape");
@@ -148,7 +176,7 @@ std::unique_ptr<RefineIndex> RefineIndex::load_body(std::istream& in, uint32_t v
 
     index->data_ = std::move(data);
 
-    if (version >= 2) index->id_map_ = detail::IdMap::load(in, count);
+    if (version >= 2) index->id_map_ = detail::IdMap::load(in, count, version);
     else index->id_map_.add(count, nullptr);
 
     return index;

@@ -45,6 +45,7 @@ Every index has the same core methods:
 | `batch_query(queries, k)` | k nearest neighbors for each row of an `(nq, dim)` array, run in parallel. Returns `(ids, dists)`. |
 | `query(query, k)` | k nearest neighbors for a single `(dim,)` vector such as `x[i]`. Returns 1D `(ids, dists)`. |
 | `remove(ids)` | Delete vectors by id; returns how many were deleted. |
+| `compact()` | Free the memory of deleted vectors; returns how many were freed. Ids and results are unchanged. |
 | `size()` | Number of vectors in the index (deleted ones excluded). |
 | `dim()` | Vector dimension. |
 | `save(path)` | Save the index to a file; see [Saving and loading](#saving-and-loading). |
@@ -85,7 +86,7 @@ ivf.nprobe = 32   # trade speed for recall
 
 ### `RefineIndex(base, k_factor=10, *, custom_ids=False)`
 
-Wraps a trained, empty approximate index created without custom ids (give the `RefineIndex` its own `custom_ids` instead). Each query fetches `k * k_factor` candidates from `base`, then re-ranks them with exact distances against full-precision copies of the vectors. Add and remove vectors through the `RefineIndex`: while it wraps a base, calling `add` or `remove` on the base itself raises `ValueError` (it would put the two out of step), and a base can only be wrapped by one `RefineIndex` at a time. Tuning the base (`nprobe`, `pq_distance`) is fine. `k_factor` is a property and can be changed at any time, and the read-only `base` property returns the wrapped index, e.g. to change `nprobe`.
+Wraps a trained, empty approximate index created without custom ids (and never compacted) (give the `RefineIndex` its own `custom_ids` instead). Each query fetches `k * k_factor` candidates from `base`, then re-ranks them with exact distances against full-precision copies of the vectors. Add, remove and compact through the `RefineIndex`: while it wraps a base, calling `add`, `remove` or `compact` on the base itself raises `ValueError` (it would put the two out of step), and a base can only be wrapped by one `RefineIndex` at a time. Tuning the base (`nprobe`, `pq_distance`) is fine. `k_factor` is a property and can be changed at any time, and the read-only `base` property returns the wrapped index, e.g. to change `nprobe`.
 
 This is the usual way to combine PQ's speed with near-exact ranking. It keeps the original vectors in memory alongside the PQ codes.
 
@@ -117,7 +118,8 @@ index.remove([doc_ids[0], doc_ids[1]])        # returns 2
 - **Ids** can be a NumPy array of any integer type, a list or a `range`. They must be `>= 0` (`-1` marks missing results) and unique within the index; a bad batch raises an error and adds nothing.
 - **Every add must pass ids** on a `custom_ids=True` index, and an index created without it refuses them.
 - **`remove(ids)`** works with or without custom ids. Unknown and already deleted ids are skipped, so deleting twice is harmless. A deleted id can be added again, with a new vector.
-- **Deleted vectors keep their memory** for now: queries skip them, but the space isn't reclaimed.
+- **Deleted vectors keep their memory until `compact()`**: queries skip them, but they still take space and scan time. `compact()` frees them in one pass, keeping every id and every query result the same, so call it after a large batch of deletes. It doesn't retrain anything.
+- **Default ids never repeat.** New vectors continue after the highest id ever assigned, even after deletes and `compact()` (delete ids 0 to 9, compact, add one more, and it gets id 10).
 - For `make_index`, set `IndexOptions.custom_ids`.
 
 ## Saving and loading
@@ -131,11 +133,11 @@ index = qann.load("vectors.qann")   # returns a FlatIndex, IVFIndex or RefineInd
 ids, dists = index.batch_query(queries, 10)
 ```
 
-- **Everything is restored:** vectors, ids (including custom ids), deletions, IVF centroids, PQ codebooks and settings such as `nprobe`, `pq_distance` and `k_factor`. A loaded index gives identical results and keeps accepting `add` and `remove`.
+- **Everything is restored:** vectors, ids (including custom ids), deletions, IVF centroids, PQ codebooks and settings such as `nprobe`, `pq_distance`, `precomputed_tables` and `k_factor`. A loaded index gives identical results and keeps accepting `add` and `remove`.
 - **A `RefineIndex` file contains its base index**, so loading one restores both. Tune the base through `loaded.base`, e.g. `loaded.base.nprobe = 32`.
 - **Saving is safe to interrupt:** the file is written next to the target as `<path>.tmp` and renamed into place when complete, so a failed save never leaves a partial file or destroys an existing one.
 - **Bad files raise `RuntimeError`:** a missing, truncated or corrupted file, or one that isn't a QaNN index, is rejected instead of loading garbage.
-- **Files are versioned.** Newer releases keep loading files saved by older ones (files from 0.1.0a4 load in 0.1.0a5). A file saved by a newer release than the one loading it raises `RuntimeError` rather than being misread.
+- **Files are versioned.** Newer releases keep loading files saved by older ones (files from 0.1.0a4 and 0.1.0a6 load in 0.1.0a7). A file saved by a newer release than the one loading it raises `RuntimeError` rather than being misread.
 
 `PQCodebook` on its own can't be saved yet; save the `IVFIndex` that uses it instead.
 

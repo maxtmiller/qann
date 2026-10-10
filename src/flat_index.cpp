@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <cassert>
 #include <queue>
+#include <algorithm>
 
 
 namespace vecengine {
@@ -62,6 +63,34 @@ vector<Neighbor> FlatIndex::query(span<const float> vec, size_t k) const {
 
 size_t FlatIndex::remove(span<const int64_t> ids) { return id_map_.remove(ids); }
 
+size_t FlatIndex::compact() { return compact_impl(true); }
+
+size_t FlatIndex::compact_as_base() { return compact_impl(false); }
+
+size_t FlatIndex::compact_impl(bool keep_ids) {
+    auto remap = id_map_.compact(keep_ids);
+    if (remap.empty()) return 0;
+    compact_storage(remap);
+    return remap.size() - id_map_.slots();
+}
+
+void FlatIndex::compact_storage(const vector<uint32_t>& remap) {
+    size_t write_slot = 0;
+    for (size_t i = 0; i < remap.size(); ++i) {
+        uint32_t new_slot = remap[i];
+        if (remap[i] == detail::IdMap::kRemoved) continue;
+
+        if (new_slot != i) {
+            float* src = data_.data() + i * dim();
+            float* dst = data_.data() + new_slot * dim();
+            std::copy_n(src, dim(), dst);
+        }
+        ++write_slot;
+    }
+    data_.resize(write_slot * dim());
+    data_.shrink_to_fit();
+}
+
 void FlatIndex::save(std::ostream& out) const {
     using namespace detail;
 
@@ -85,7 +114,7 @@ std::unique_ptr<FlatIndex> FlatIndex::load_body(std::istream& in, uint32_t versi
     index->data_ = read_vec<float>(in, count * dim);
 
     if (index->data_.size() != count * dim) throw std::runtime_error("corrupt file: FlatIndex data length mismatch");
-    if (version >= 2) index->id_map_ = detail::IdMap::load(in, count);
+    if (version >= 2) index->id_map_ = detail::IdMap::load(in, count, version);
     else index->id_map_.add(count, nullptr);
 
     return index;

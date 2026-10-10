@@ -314,6 +314,12 @@ TEST_CASE("IVFIndex: save/load round-trip returns identical results", "[ivf][ser
     loaded->add(extra);
     REQUIRE(loaded->size() == n + 1);
     require_same_results(index, *loaded, queries, nq, k);
+
+    // Turning the tables off is a setting, and survives a round-trip too.
+    if (index.precomputed_tables()) {
+        index.set_precomputed_tables(false);
+        REQUIRE_FALSE(ivf_roundtrip(index)->precomputed_tables());
+    }
 }
 
 TEST_CASE("IVFIndex: untrained and empty indexes round-trip", "[ivf][serialize]") {

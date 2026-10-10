@@ -402,3 +402,58 @@ def test_precomputed_tables_toggle(data):
 
     np.testing.assert_allclose(dists_fast, dists_slow, rtol=1e-3, atol=1e-3)
     assert np.mean(ids_fast == ids_slow) >= 0.98
+
+
+@pytest.mark.parametrize("kind", ["flat", "ivf", "refine"])
+def test_compact_keeps_ids_and_results(tmp_path, data, kind):
+    ids = np.arange(len(data)) * 10 + 7
+    index = make_custom_index(kind, data, ids)
+    assert index.remove(ids[::4]) == len(ids[::4])
+    before_ids, before_dists = index.batch_query(data[:50], 10)
+
+    assert index.compact() == len(ids[::4])
+    assert index.compact() == 0
+    assert index.size() == len(data) - len(ids[::4])
+    after_ids, after_dists = index.batch_query(data[:50], 10)
+    np.testing.assert_array_equal(after_ids, before_ids)
+    np.testing.assert_array_equal(after_dists, before_dists)
+
+    index.save(tmp_path / "compacted.qann")
+    loaded = qann.load(tmp_path / "compacted.qann")
+    loaded_ids, _ = loaded.batch_query(data[:50], 10)
+    np.testing.assert_array_equal(loaded_ids, before_ids)
+    assert loaded.remove([ids[1]]) == 1
+
+
+def test_compact_auto_ids_continue(data):
+    index = qann.FlatIndex(32)
+    index.add(data[:10])
+    index.remove(range(10))
+    assert index.compact() == 10
+    index.add(data[:2])
+    ids, _ = index.batch_query(data[:2], 1)
+    np.testing.assert_array_equal(ids[:, 0], [10, 11])
+
+
+def test_compact_refused_on_wrapped_base(data):
+    base = qann.FlatIndex(32)
+    refine = qann.RefineIndex(base, k_factor=2)
+    refine.add(data[:100])
+    refine.remove([0, 1])
+    with pytest.raises(ValueError, match="compact"):
+        base.compact()
+    assert refine.compact() == 2
+
+
+@pytest.mark.parametrize("name", ["flat", "ivf_pq", "refine"])
+def test_loads_files_from_0_1_0a6(name):
+    # Saved by qann 0.1.0a6 (format version 2), with deletions, and the results it returned.
+    index = qann.load(DATA / f"v2_{name}.qann")
+    queries = np.load(DATA / "v2_queries.npy")
+    expected_ids = np.load(DATA / f"v2_{name}_ids.npy")
+    expected_dists = np.load(DATA / f"v2_{name}_dists.npy")
+
+    assert index.size() == 1600
+    ids, dists = index.batch_query(queries, 10)
+    assert np.mean(ids == expected_ids) >= 0.99
+    np.testing.assert_allclose(dists, expected_dists, rtol=1e-4, atol=1e-5)
