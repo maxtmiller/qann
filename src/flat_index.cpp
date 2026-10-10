@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <cassert>
 #include <queue>
+#include <algorithm>
 
 
 namespace vecengine {
