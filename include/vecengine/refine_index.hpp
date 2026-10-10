@@ -45,6 +45,10 @@ public:
     vector<Neighbor> query(span<const float> vec, size_t k) const override;
     size_t remove(span<const int64_t> ids) override;
 
+    // Fetches every query's candidates with one base query_batch() call (so
+    // IVFIndex's batched coarse search applies), then re-ranks in parallel.
+    vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k) const override;
+
     // Writes this index's header and fields with the base nested inside.
     void save(std::ostream& out) const override;
 
@@ -68,6 +72,9 @@ public:
     void set_k_factor(size_t k_factor);
 
 private:
+    // Exact top k of the base's candidates for vec (candidate ids are base slots).
+    vector<Neighbor> rerank(span<const float> vec, const vector<Neighbor>& candidates, size_t k) const;
+
     // Used by load_body(): takes ownership of an already filled base and skips
     // the public constructor's empty-base check.
     RefineIndex(std::unique_ptr<Index> base, size_t k_factor)

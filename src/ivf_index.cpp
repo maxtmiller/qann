@@ -16,6 +16,15 @@
 #include <utility>
 #include <stdexcept>
 #include <cmath>
+#include <algorithm>
+
+#ifdef VECENGINE_USE_BLAS
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>
+#endif
+#endif
 
 namespace vecengine {
 
@@ -137,22 +146,101 @@ vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
     if (!trained_) throw std::logic_error("train() has not be run yet");
 
     VECENGINE_PROF_START(t_coarse);
+    vector<Probe> probes = coarse(vec);
+    VECENGINE_PROF_STOP(t_coarse, kProfCoarse);
+
+    return scan(vec, probes, k);
+}
+
+vector<vector<Neighbor>> IVFIndex::query_batch(span<const float> queries, size_t num_queries, size_t k) const {
+    assert(queries.size() == num_queries * dim_);
+    if (!trained_) throw std::logic_error("train() has not be run yet");
+
+#ifndef VECENGINE_USE_BLAS
+    return Index::query_batch(queries, num_queries, k);
+#else
+    // coarse_batch holds block * nlist_ scores; cap them at 32 MB
+    const size_t block = std::clamp<size_t>((size_t{32} << 20) / (nlist_ * sizeof(float)), 1, 1024);
+
+    vector<vector<Neighbor>> results(num_queries);
+    vector<Probe> probes(block * nprobe_);
+    for (size_t start = 0; start < num_queries; start += block) {
+        const size_t b = std::min(block, num_queries - start);
+        const float* q = queries.data() + start * dim_;
+
+        VECENGINE_PROF_START(t_coarse);
+        coarse_batch(q, b, probes.data());
+        VECENGINE_PROF_STOP(t_coarse, kProfCoarse);
+
+        detail::parallel_for(b, [&](size_t i) {
+            results[start + i] = scan({q + i * dim_, dim_}, {probes.data() + i * nprobe_, nprobe_}, k);
+        });
+    }
+    return results;
+#endif
+}
+
+vector<IVFIndex::Probe> IVFIndex::coarse(span<const float> vec) const {
     // find the closest nprobe coarse centroids
     std::priority_queue<pair<float, uint16_t>, vector<pair<float, uint16_t>>, std::less<pair<float, uint16_t>>> maxCentroidHeap;
     for (size_t i = 0; i < nlist_; ++i) {
         const float* centroid_ptr = coarse_centroids_.data() + i * dim_;
         float dist = l2_distance(vec.data(), centroid_ptr, dim_);
-        
+
         if (maxCentroidHeap.size() < nprobe_) {
-            maxCentroidHeap.emplace(dist, i);
+            maxCentroidHeap.emplace(dist, static_cast<uint16_t>(i));
         } else if (dist < maxCentroidHeap.top().first) {
             maxCentroidHeap.pop();
             maxCentroidHeap.emplace(dist, static_cast<uint16_t>(i));
         }
     }
 
-    VECENGINE_PROF_STOP(t_coarse, kProfCoarse);
+    vector<Probe> probes;
+    probes.reserve(maxCentroidHeap.size());
+    while (!maxCentroidHeap.empty()) {
+        probes.push_back({maxCentroidHeap.top().first, maxCentroidHeap.top().second});
+        maxCentroidHeap.pop();
+    }
+    return probes;
+}
 
+#ifdef VECENGINE_USE_BLAS
+void IVFIndex::coarse_batch(const float* queries, size_t n, Probe* out) const {
+    vector<float> norms(nlist_);
+    for (size_t c = 0; c < nlist_; ++c) {
+        const float* centroid = coarse_centroids_.data() + c * dim_;
+        float sum = 0.0f;
+        for (size_t d = 0; d < dim_; ++d) sum += centroid[d] * centroid[d];
+        norms[c] = sum;
+    }
+
+    // dots[i * nlist_ + c] = q_i . c for the whole block in one call
+    vector<float> dots(n * nlist_);
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                static_cast<int>(n), static_cast<int>(nlist_), static_cast<int>(dim_),
+                1.0f, queries, static_cast<int>(dim_),
+                coarse_centroids_.data(), static_cast<int>(dim_),
+                0.0f, dots.data(), static_cast<int>(nlist_));
+
+    detail::parallel_for(n, [&](size_t i) {
+        // ||q - c||^2 = ||q||^2 + ||c||^2 - 2 q.c, and ||q||^2 is the same for
+        // every list, so ||c||^2 - 2 q.c ranks the lists
+        const float* row = dots.data() + i * nlist_;
+        vector<pair<float, uint16_t>> scored(nlist_);
+        for (size_t c = 0; c < nlist_; ++c) scored[c] = {norms[c] - 2.0f * row[c], static_cast<uint16_t>(c)};
+        std::nth_element(scored.begin(), scored.begin() + (nprobe_ - 1), scored.end());
+
+        // the scores lose precision to cancellation, so A is recomputed exactly
+        const float* q = queries + i * dim_;
+        for (size_t j = 0; j < nprobe_; ++j) {
+            const uint16_t list = scored[j].second;
+            out[i * nprobe_ + j] = {l2_distance(q, coarse_centroids_.data() + list * dim_, dim_), list};
+        }
+    });
+}
+#endif
+
+vector<Neighbor> IVFIndex::scan(span<const float> vec, span<const Probe> probes, size_t k) const {
     // intialize vars for pq, reuse allocated memory for adc table
     const size_t m = pq_enabled() ? pq_->num_subspaces() : 0;
     const size_t K = pq_enabled() ? pq_->centroids_per_subspace() : 0;
@@ -165,11 +253,9 @@ vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
     if (use_pre) pq_->compute_inner_table(vec, C);
 
     // find top-k vectors from the inverted lists associated with the nprobe closest coarse centroids
-    const size_t n1 = maxCentroidHeap.size();
-    for (size_t i = 0; i < n1; ++i) {
-        const float A = maxCentroidHeap.top().first;
-        auto it = data_.find(maxCentroidHeap.top().second);
-        maxCentroidHeap.pop();
+    for (const Probe& probe : probes) {
+        const float A = probe.dist;
+        auto it = data_.find(probe.list);
         if (it == data_.end()) continue;
 
         const InvertedList& list = it->second;

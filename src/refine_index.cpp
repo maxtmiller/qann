@@ -2,6 +2,7 @@
 #include "vecengine/distance.hpp"
 #include "vecengine/flat_index.hpp"
 #include "vecengine/ivf_index.hpp"
+#include "parallel.hpp"
 #include "profile.hpp"
 #include "serialize.hpp"
 
@@ -58,7 +59,22 @@ vector<Neighbor> RefineIndex::query(span<const float> vec, size_t k) const {
     assert(vec.size() == dim());
     if (id_map_.live() == 0) return {};
 
-    vector<Neighbor> candidatesRaw = base_.query(vec, std::min(k * k_factor_, id_map_.live()));
+    return rerank(vec, base_.query(vec, std::min(k * k_factor_, id_map_.live())), k);
+}
+
+vector<vector<Neighbor>> RefineIndex::query_batch(span<const float> queries, size_t num_queries, size_t k) const {
+    assert(queries.size() == num_queries * dim());
+    if (id_map_.live() == 0) return vector<vector<Neighbor>>(num_queries);
+
+    auto candidates = base_.query_batch(queries, num_queries, std::min(k * k_factor_, id_map_.live()));
+    vector<vector<Neighbor>> results(num_queries);
+    detail::parallel_for(num_queries, [&](size_t i) {
+        results[i] = rerank({queries.data() + i * dim(), dim()}, candidates[i], k);
+    });
+    return results;
+}
+
+vector<Neighbor> RefineIndex::rerank(span<const float> vec, const vector<Neighbor>& candidatesRaw, size_t k) const {
     VECENGINE_PROF_START(t_rerank);
     vector<pair<float, size_t>> candidates;
     candidates.reserve(candidatesRaw.size());

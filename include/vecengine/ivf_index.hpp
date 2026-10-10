@@ -66,6 +66,12 @@ public:
     vector<Neighbor> query(span<const float> vec, size_t k) const override;
     size_t remove(span<const int64_t> ids) override;
 
+    // Batched query: picks every query's nprobe lists with one matrix multiply
+    // per block of queries (with BLAS), then scans the lists in parallel.
+    // Results match query() except that a near-tie between coarse centroids
+    // can pick a different list.
+    vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k) const override;
+
     // Learns the nlist coarse centroids (and the PQ codebook, if enabled) from
     // num_vectors sample vectors (at least nlist). Call once, before any add.
     // A seed makes training reproducible: coarse k-means uses seed, the PQ
@@ -93,6 +99,23 @@ private:
     // centroid, or leaves it empty if disabled, untrained, without PQ or over
     // the size cap. Called by train(), load_body() and set_precomputed_tables().
     void build_precomputed();
+
+    // One probed list: its exact coarse distance ||q - c||^2 (term A of the
+    // precomputed tables) and its cluster id.
+    struct Probe {
+        float dist;
+        uint16_t list;
+    };
+
+    // The nprobe lists nearest to vec, furthest first.
+    vector<Probe> coarse(span<const float> vec) const;
+
+    // Coarse step for n queries (query i at queries + i * dim_): writes each
+    // query's nprobe probes to out + i * nprobe_, in any order.
+    void coarse_batch(const float* queries, size_t n, Probe* out) const;
+
+    // Fine step: the top k over the probed lists.
+    vector<Neighbor> scan(span<const float> vec, span<const Probe> probes, size_t k) const;
 
     static constexpr size_t kPrecomputedMaxBytes = size_t{256} << 20;
 
