@@ -322,6 +322,59 @@ size_t IVFIndex::remove(span<const int64_t> ids) {
     return id_map_.remove(ids);
 }
 
+size_t IVFIndex::compact() { return compact_impl(true); }
+
+size_t IVFIndex::compact_as_base() { return compact_impl(false); }
+
+size_t IVFIndex::compact_impl(bool keep_ids) {
+    auto remap = id_map_.compact(keep_ids);
+    if (remap.empty()) return 0;
+    compact_storage(remap);
+    return remap.size() - id_map_.slots();
+}
+
+void IVFIndex::compact_storage(const vector<uint32_t>& remap) {
+    size_t m = pq_enabled() ? pq_->num_subspaces() : 0;
+    for (uint16_t i = 0; i < nlist_; ++i) {
+        size_t write_slot = 0;
+
+        auto it = data_.find(i);
+        if (it == data_.end()) continue;
+        InvertedList& list = it->second;
+        
+        for (size_t j = 0; j < list.ids.size(); ++j) {
+            uint32_t new_slot = remap[list.ids[j]];
+            if (new_slot == detail::IdMap::kRemoved) continue;
+
+            list.ids[write_slot] = new_slot;
+            if (j != write_slot) {
+                if (pq_enabled()) {
+                    uint8_t* src = list.codes.data() + j * m;
+                    uint8_t* dst = list.codes.data() + write_slot * m;
+                    std::copy_n(src, m, dst);
+                } else {
+                    float* src = list.vecs.data() + j * dim();
+                    float* dst = list.vecs.data() + write_slot * dim();
+                    std::copy_n(src, dim(), dst);
+                }
+            }
+            ++write_slot;
+        }
+        if (write_slot == 0) { data_.erase(it); continue; }
+
+        list.ids.resize(write_slot);
+        list.ids.shrink_to_fit();
+        if (pq_enabled()) {
+            list.codes.resize(write_slot * m);
+            list.codes.shrink_to_fit();
+        } else {
+            list.vecs.resize(write_slot * dim());
+            list.vecs.shrink_to_fit();
+        }
+    }
+    
+}
+
 void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_iters, std::optional<uint32_t> seed) {
     if (id_map_.slots() > 0) throw std::logic_error("train() cannot be called after add()");
     if (trained_) throw std::logic_error("train() has already been called");
@@ -371,6 +424,7 @@ void IVFIndex::save(std::ostream& out) const {
         if (pq_) write_vec(out, list.codes); else write_vec(out, list.vecs);
     }
     id_map_.save(out);
+    write_pod(out, static_cast<uint8_t>(use_precomputed_));
 }
 
 std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version) {
@@ -429,9 +483,14 @@ std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version
     index->trained_ = trained;
     index->pq_distance_ = static_cast<PQDistance>(pq_distance);
 
-    if (version >= 2) index->id_map_ = detail::IdMap::load(in, n_total);
+    if (version >= 2) index->id_map_ = detail::IdMap::load(in, n_total, version);
     else index->id_map_.add(n_total, nullptr);
 
+    if (version >= 3) {
+        const auto use_precomputed = read_pod<uint8_t>(in);
+        if (use_precomputed > 1) throw std::runtime_error("corrupt file: invalid IVFIndex shape");
+        index->use_precomputed_ = use_precomputed;
+    }
     index->build_precomputed();
 
     return index;

@@ -29,6 +29,7 @@ public:
     void add_batch(span<const float> vecs, size_t n, const int64_t* ids = nullptr) override;
     vector<Neighbor> query(span<const float> vec, size_t k) const override;
     size_t remove(span<const int64_t> ids) override;
+    size_t compact() override;
 
     void save(std::ostream& out) const override;
 
@@ -38,11 +39,22 @@ public:
 
     size_t slots() const noexcept override { return id_map_.slots(); }
     bool custom_ids() const noexcept override { return id_map_.custom_ids(); }
+    bool ids_are_slots() const noexcept override { return id_map_.ids_are_slots(); }
 
     size_t size() const noexcept override { return id_map_.live(); }
     size_t dim() const noexcept override { return dim_; }
 
 private:
+    size_t compact_as_base() override;
+
+    // Shared by compact() and compact_as_base(): compacts id_map_, then the
+    // storage, and returns the slots reclaimed.
+    size_t compact_impl(bool keep_ids);
+
+    // Moves every live vector from its old slot to remap[old] (see
+    // IdMap::compact) and drops deleted ones, keeping their order.
+    void compact_storage(const vector<uint32_t>& remap);
+
     size_t dim_;
     vector<float> data_; // row-major, one row per slot: slots() * dim_
     detail::IdMap id_map_;

@@ -54,11 +54,21 @@ public:
     // queries skip them.
     virtual size_t remove(span<const int64_t> ids) = 0;
 
+    // Frees the storage of deleted vectors and returns how many slots were
+    // reclaimed (0 when nothing is deleted). Ids stay the same: results,
+    // remove() and later adds behave as before, with new ids continuing after
+    // the highest ever assigned. Slots are renumbered, so slots() shrinks.
+    virtual size_t compact() = 0;
+
     // Writes the index (header + body) so load_index() can rebuild it.
     virtual void save(std::ostream& out) const = 0;
 
-    // Vectors ever added, including deleted ones (the next slot number).
+    // Current slots: live vectors plus deleted ones not yet compacted away.
     virtual size_t slots() const noexcept = 0;
+
+    // Whether every vector's id is its slot (auto ids, never compacted with
+    // stable ids). RefineIndex requires this of its base.
+    virtual bool ids_are_slots() const noexcept = 0;
 
     // Whether add_batch() takes user ids (fixed at construction).
     virtual bool custom_ids() const noexcept = 0;
@@ -83,7 +93,11 @@ public:
     bool wrapped() const noexcept { return wrapped_.load(); }
 
 private:
-    friend class RefineIndex;  // sets and clears wrapped_
+    friend class RefineIndex;  // sets and clears wrapped_; calls compact_as_base()
+
+    // compact() for the base of a RefineIndex: same storage compaction, but
+    // ids become the new slots so they keep matching the RefineIndex's slots.
+    virtual size_t compact_as_base() = 0;
 
     mutable std::shared_mutex mutex_;
     std::atomic<bool> wrapped_{false};

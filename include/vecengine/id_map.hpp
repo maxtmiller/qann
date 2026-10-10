@@ -46,8 +46,7 @@ public:
     // The id reported for a slot. Called for every query result, so it stays
     // inline.
     int64_t label(uint32_t slot) const noexcept {
-        if (custom_ids_) return labels_[slot];
-        return slot;
+        return labels_.empty() ? slot : labels_[slot];
     }
 
     // Whether a slot was deleted. Called for every candidate a query scans, so
@@ -56,28 +55,44 @@ public:
         return deleted_[slot];
     }
 
+    // constant for determining if a vector was moved
+    static constexpr uint32_t kRemoved = UINT32_MAX;
+
+    // reassigns slots to ids to compact vector store 
+    vector<uint32_t> compact(bool keep_ids);
+
+    // Whether every slot's id is the slot itself, which a RefineIndex base
+    // needs: auto ids, never compacted with keep_ids, no gaps in the ids.
+    bool ids_are_slots() const noexcept {
+        return !custom_ids_ && labels_.empty() && static_cast<size_t>(next_id_) == slots_;
+    }
+
     // Whether add() takes user ids.
     bool custom_ids() const noexcept { return custom_ids_; }
-    size_t slots() const noexcept { return slots_; }                  // ever added, including deleted
+    size_t slots() const noexcept { return slots_; }                  // current slots, including deleted
     size_t live() const noexcept { return slots_ - deleted_count_; }  // what Index::size() reports
 
-    // Writes the custom_ids flag, the labels (when custom ids are on) and the
-    // deleted flags. No header: it is part of each index's body.
+    // Writes the custom_ids flag, the slot count, the next auto id, the labels
+    // (when ids differ from slots) and the deleted flags. No header: it is part
+    // of each index's body.
     void save(std::ostream& out) const;
 
-    // Reads what save() wrote for an index with `slots` slots. Throws
-    // std::runtime_error unless the labels are empty (custom ids off) or exactly
-    // `slots` long with no duplicates among live slots, and the deleted flags
-    // are exactly `slots` long.
-    static IdMap load(std::istream& in, uint64_t slots);
+    // Reads what save() wrote, in format `version`, for an index with `slots`
+    // slots. Version 2 has no next auto id (it equals the slot count). Throws
+    // std::runtime_error unless the deleted flags are exactly `slots` long and
+    // the labels are either `slots` long (custom ids: no duplicates among live
+    // slots; auto ids: strictly increasing, >= 0 and below the next id) or, for
+    // auto ids, empty with ids equal to slots.
+    static IdMap load(std::istream& in, uint64_t slots, uint32_t version);
 
 private:
     bool custom_ids_;
     size_t slots_ = 0;
+    int64_t next_id_ = 0; // for auto ids next id
     size_t deleted_count_ = 0;
-    vector<int64_t> labels_;                    // slot -> id; empty unless custom_ids_
+    vector<int64_t> labels_; // slot -> id; empty while ids equal slots
     std::unordered_map<int64_t, uint32_t> slot_of_;  // live id -> slot; empty unless custom_ids_
-    vector<bool> deleted_;                      // one flag per slot
+    vector<bool> deleted_; // one flag per slot
 };
 
 } // namespace vecengine::detail
