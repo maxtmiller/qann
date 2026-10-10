@@ -10,9 +10,11 @@
 
 namespace vecengine::detail {
 
-enum ProfSlot { kProfCoarse, kProfTable, kProfCodeScan, kProfRawScan, kProfDrain, kProfRerank, kProfSlots };
+enum ProfSlot { kProfCoarse, kProfTable, kProfCodeScan, kProfRawScan, kProfDrain, kProfRerank,
+                kProfSetup, kProfInner, kProfListSetup, kProfSlots };
 
 inline thread_local double g_prof[kProfSlots] = {}; // seconds per slot
+inline thread_local unsigned long long g_prof_calls = 0; // clock reads, to estimate the timers' own cost
 
 // Current time in seconds, for the profiling macros.
 inline double prof_now() {
@@ -21,8 +23,8 @@ inline double prof_now() {
 
 } // namespace vecengine::detail
 
-#define VECENGINE_PROF_START(name) const double name = vecengine::detail::prof_now()
-#define VECENGINE_PROF_STOP(name, slot) (vecengine::detail::g_prof[vecengine::detail::slot] += vecengine::detail::prof_now() - (name))
+#define VECENGINE_PROF_START(name) const double name = (++vecengine::detail::g_prof_calls, vecengine::detail::prof_now())
+#define VECENGINE_PROF_STOP(name, slot) (++vecengine::detail::g_prof_calls, vecengine::detail::g_prof[vecengine::detail::slot] += vecengine::detail::prof_now() - (name))
 #else
 #define VECENGINE_PROF_START(name) ((void)0)
 #define VECENGINE_PROF_STOP(name, slot) ((void)0)

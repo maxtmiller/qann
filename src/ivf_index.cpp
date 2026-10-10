@@ -241,6 +241,7 @@ void IVFIndex::coarse_batch(const float* queries, size_t n, Probe* out) const {
 #endif
 
 vector<Neighbor> IVFIndex::scan(span<const float> vec, span<const Probe> probes, size_t k) const {
+    VECENGINE_PROF_START(t_setup);
     // intialize vars for pq, reuse allocated memory for adc table
     const size_t m = pq_enabled() ? pq_->num_subspaces() : 0;
     const size_t K = pq_enabled() ? pq_->centroids_per_subspace() : 0;
@@ -250,10 +251,14 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<const Probe> probes,
 
     const bool use_pre = pq_enabled() && pq_distance_ == PQDistance::ADC && precomputed_tables();
     vector<float> C(use_pre ? m * K : 0);
+    VECENGINE_PROF_STOP(t_setup, kProfSetup);
+    VECENGINE_PROF_START(t_inner);
     if (use_pre) pq_->compute_inner_table(vec, C);
+    VECENGINE_PROF_STOP(t_inner, kProfInner);
 
     // find top-k vectors from the inverted lists associated with the nprobe closest coarse centroids
     for (const Probe& probe : probes) {
+        VECENGINE_PROF_START(t_list);
         const float A = probe.dist;
         auto it = data_.find(probe.list);
         if (it == data_.end()) continue;
@@ -261,6 +266,7 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<const Probe> probes,
         const InvertedList& list = it->second;
         size_t listSize = list.ids.size();
         dists.resize(listSize);
+        VECENGINE_PROF_STOP(t_list, kProfListSetup);
 
         // lamdba function for adding to heap
         auto push = [&](float dist, size_t j) {
@@ -278,8 +284,8 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<const Probe> probes,
             continue;
         }
 
-        vector<float> residual(use_pre ? 0 : dim_);
         VECENGINE_PROF_START(t_table);
+        vector<float> residual(use_pre ? 0 : dim_);
         if (use_pre) {
             const float* B = precomputed_.data() + it->first * m * K;
             for (size_t t = 0; t < m * K; ++t) table[t] = B[t] + C[t];
