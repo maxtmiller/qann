@@ -30,7 +30,7 @@ void quantize_lut_scalar(const float* table, size_t m, uint8_t* lut, float& scal
         max_w = std::max(max_w, hi - min_s[i]);
     }
 
-    scale = max_w > 0 ? 255 / max_w : 1;
+    scale = max_w > 0 ? kLutMax / max_w : 1;
 
     for (size_t i = 0; i < m; ++i) {
         const float* pos = table + (i * 16);
@@ -58,7 +58,7 @@ static void quantize_lut_neon(const float* table, size_t m, uint8_t* lut, float&
         widest = std::max(widest, hi - lo);
     }
 
-    scale = widest > 0.0f ? 255.0f / widest : 1.0f;
+    scale = widest > 0.0f ? kLutMax / widest : 1.0f;
     const float32x4_t vscale = vdupq_n_f32(scale);
 
     for (size_t i = 0; i < m; ++i) {
@@ -96,13 +96,19 @@ void fast_scan_block_scalar(const uint8_t* lut, const uint8_t* block, size_t m, 
 static uint32_t fast_scan_block_neon(const uint8_t* lut, const uint8_t* block, size_t m, uint16_t limit, uint16_t* out) {
     const uint8x16_t mask = vdupq_n_u8(0x0F);
     uint16x8_t a0 = vdupq_n_u16(0), a1 = a0, a2 = a0, a3 = a0;
-    for (size_t s = 0; s < m; ++s) {
-        const uint8x16_t t = vld1q_u8(lut + s * 16);
-        const uint8x16_t c = vld1q_u8(block + s * 16);
-        // one table lookup scores 16 vectors: low nibbles are vectors 0-15,
-        // high nibbles vectors 16-31
-        const uint8x16_t lo = vqtbl1q_u8(t, vandq_u8(c, mask));
-        const uint8x16_t hi = vqtbl1q_u8(t, vshrq_n_u8(c, 4));
+    for (size_t s = 0; s < m; s += 4) {
+        // up to 4 subspaces are summed in bytes (entries <= kLutMax, so no
+        // overflow) and widened once: the widening adds were the bottleneck
+        const size_t group = std::min<size_t>(4, m - s);
+        uint8x16_t lo = vdupq_n_u8(0), hi = lo;
+        for (size_t g = 0; g < group; ++g) {
+            const uint8x16_t t = vld1q_u8(lut + (s + g) * 16);
+            const uint8x16_t c = vld1q_u8(block + (s + g) * 16);
+            // one table lookup scores 16 vectors: low nibbles are vectors 0-15,
+            // high nibbles vectors 16-31
+            lo = vaddq_u8(lo, vqtbl1q_u8(t, vandq_u8(c, mask)));
+            hi = vaddq_u8(hi, vqtbl1q_u8(t, vshrq_n_u8(c, 4)));
+        }
         a0 = vaddw_u8(a0, vget_low_u8(lo));
         a1 = vaddw_high_u8(a1, lo);
         a2 = vaddw_u8(a2, vget_low_u8(hi));
@@ -127,11 +133,16 @@ static uint32_t fast_scan_block_ssse3(const uint8_t* lut, const uint8_t* block, 
     const __m128i mask = _mm_set1_epi8(0x0F);
     const __m128i zero = _mm_setzero_si128();
     __m128i a0 = zero, a1 = zero, a2 = zero, a3 = zero;
-    for (size_t s = 0; s < m; ++s) {
-        const __m128i t = _mm_loadu_si128(reinterpret_cast<const __m128i*>(lut + s * 16));
-        const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block + s * 16));
-        const __m128i lo = _mm_shuffle_epi8(t, _mm_and_si128(c, mask));                       // vectors 0-15
-        const __m128i hi = _mm_shuffle_epi8(t, _mm_and_si128(_mm_srli_epi16(c, 4), mask));    // vectors 16-31
+    for (size_t s = 0; s < m; s += 4) {
+        // same byte-sum grouping as the NEON kernel
+        const size_t group = std::min<size_t>(4, m - s);
+        __m128i lo = zero, hi = zero;
+        for (size_t g = 0; g < group; ++g) {
+            const __m128i t = _mm_loadu_si128(reinterpret_cast<const __m128i*>(lut + (s + g) * 16));
+            const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i*>(block + (s + g) * 16));
+            lo = _mm_add_epi8(lo, _mm_shuffle_epi8(t, _mm_and_si128(c, mask)));                       // vectors 0-15
+            hi = _mm_add_epi8(hi, _mm_shuffle_epi8(t, _mm_and_si128(_mm_srli_epi16(c, 4), mask)));    // vectors 16-31
+        }
         a0 = _mm_add_epi16(a0, _mm_unpacklo_epi8(lo, zero));
         a1 = _mm_add_epi16(a1, _mm_unpackhi_epi8(lo, zero));
         a2 = _mm_add_epi16(a2, _mm_unpacklo_epi8(hi, zero));

@@ -64,8 +64,8 @@ TEST_CASE("fast_scan_block matches the scalar version", "[fastscan]") {
     std::vector<uint8_t> lut(m * 16), block(fs_block_bytes(m));
     for (auto& x : block) x = rng() & 0xFF;
 
-    SECTION("random tables") { for (auto& x : lut) x = rng() & 0xFF; }
-    SECTION("all 255, the largest sums") { std::fill(lut.begin(), lut.end(), 255); }
+    SECTION("random tables") { for (auto& x : lut) x = rng() % (kLutMax + 1); }
+    SECTION("all kLutMax, the largest sums") { std::fill(lut.begin(), lut.end(), kLutMax); }
 
     std::vector<uint16_t> simd(kFsBlock), scalar(kFsBlock);
     fast_scan_block(lut.data(), block.data(), m, simd.data());
@@ -92,7 +92,7 @@ TEST_CASE("quantize_lut keeps distances within its error bound", "[fastscan]") {
         const auto row = lut.begin() + s * 16;
         REQUIRE(*std::min_element(row, row + 16) == 0);   // each row's minimum maps to 0
     }
-    REQUIRE(*std::max_element(lut.begin(), lut.end()) == 255);  // the widest row spans 0..255
+    REQUIRE(*std::max_element(lut.begin(), lut.end()) == kLutMax);  // the widest row spans 0..kLutMax
 
     const float bound = m / (2 * scale) + 1e-2f;
     for (int trial = 0; trial < 200; ++trial) {
@@ -130,10 +130,10 @@ TEST_CASE("quantize_lut handles rows of negative values", "[fastscan]") {
     std::vector<uint8_t> lut(m * 16);
     float scale = 0, offset = 0;
     quantize_lut(table.data(), m, lut.data(), scale, offset);
-    REQUIRE(scale == 255.0f / 150.0f);
+    REQUIRE(scale == kLutMax / 150.0f);
     REQUIRE(offset == -570.0f);
     REQUIRE(lut[0] == 0);
-    REQUIRE(lut[15] == 255);
+    REQUIRE(lut[15] == kLutMax);
     REQUIRE(lut[16 + 15] == 0);                // row 1's minimum is its last entry
     REQUIRE(lut[16] == std::lround(30.0f * scale));
 }
@@ -222,11 +222,12 @@ TEST_CASE("fast-scan matches the float ADC scan on the same codes", "[fastscan][
     REQUIRE(overlap(rf, rr) >= 0.95);
 
     // Matching ids get nearly the same distance: rounding the table to bytes
-    // moves each by at most m / (2 * scale).
+    // moves each by at most m / (2 * scale), and scale shrinks with kLutMax.
+    const float slack = 255.0f / kLutMax;
     for (size_t q = 0; q < nq; ++q)
         for (const auto& a : rf[q])
             for (const auto& b : rr[q])
-                if (a.index == b.index) REQUIRE(std::fabs(a.distance - b.distance) <= 0.02f * b.distance + 0.05f);
+                if (a.index == b.index) REQUIRE(std::fabs(a.distance - b.distance) <= slack * (0.02f * b.distance + 0.05f));
 
     // Against exact search, fast-scan loses almost nothing next to the float scan.
     FlatIndex flat(dim);
@@ -357,7 +358,7 @@ TEST_CASE("fast_scan_block_mask flags exactly the sums below the limit", "[fasts
     CAPTURE(m);
     std::mt19937 rng(static_cast<unsigned>(m) + 200);
     std::vector<uint8_t> lut(m * 16), block(fs_block_bytes(m));
-    for (auto& x : lut) x = rng() & 0xFF;
+    for (auto& x : lut) x = rng() % (kLutMax + 1);
     for (auto& x : block) x = rng() & 0xFF;
 
     std::vector<uint16_t> ref(kFsBlock);
