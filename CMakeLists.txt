@@ -77,6 +77,7 @@ add_library(vecengine_core STATIC
   src/refine_index.cpp
   src/index_factory.cpp
   src/id_map.cpp
+  src/fast_scan.cpp
 )
 
 target_include_directories(vecengine_core PUBLIC
@@ -125,6 +126,7 @@ add_executable(test_vecengine
   tests/test_distance.cpp
   tests/test_serialize.cpp
   tests/test_id_map.cpp
+  tests/test_fast_scan.cpp
 )
 
 target_link_libraries(test_vecengine PRIVATE

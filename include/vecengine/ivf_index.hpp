@@ -12,6 +12,7 @@
 #include <optional>
 #include <unordered_map>
 #include <iosfwd>
+#include <stdexcept>
 
 namespace vecengine {
 
@@ -39,7 +40,7 @@ public:
     // Enables PQ compression of residuals (vec - assigned coarse centroid).
     // Must be called before train()/add(). Once enabled, add() stores codes
     // in InvertedList::codes instead of raw floats in InvertedList::vecs.
-    void enable_pq(size_t num_subspaces, size_t centroids_per_subspace = 256);
+    void enable_pq(size_t num_subspaces, size_t centroids_per_subspace = 256, bool fast_scan = false);
 
     // Clusters scanned per query. set_nprobe throws std::invalid_argument
     // unless 1 <= nprobe <= nlist; it can change at any time.
@@ -49,7 +50,11 @@ public:
     // How PQ codes are scored: ADC (default, more accurate) or SDC. Has no
     // effect without PQ.
     PQDistance pq_distance() const noexcept { return pq_distance_; }
-    void set_pq_distance(PQDistance mode) noexcept { pq_distance_ = mode; }
+    void set_pq_distance(PQDistance mode) { 
+        if (fast_scan_ && mode == PQDistance::SDC) 
+            throw std::invalid_argument("cannot use SDC with fast-scan");
+        pq_distance_ = mode; 
+    }
 
     // Whether ADC queries use precomputed per-list tables instead of building
     // a full ADC table for every probed list. Enabled by default; the getter
@@ -89,6 +94,7 @@ public:
     size_t slots() const noexcept override { return id_map_.slots(); }
     bool custom_ids() const noexcept override { return id_map_.custom_ids(); }
     bool ids_are_slots() const noexcept override { return id_map_.ids_are_slots(); }
+    bool fast_scan() const noexcept { return fast_scan_; }
 
     size_t size() const noexcept override { return id_map_.live(); }
     size_t dim() const noexcept override { return dim_; }
@@ -143,6 +149,7 @@ private:
     bool use_precomputed_ = true; // set_precomputed_tables() setting
     vector<float> precomputed_; // term B: nlist * m * K floats, list-major; empty when not in use
     detail::IdMap id_map_;
+    bool fast_scan_ = false;
 };
 
 } // namespace vecengine

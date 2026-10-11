@@ -67,7 +67,8 @@ Partitions vectors into `nlist` clusters with k-means and, at query time, scans 
 | Member | Description |
 | --- | --- |
 | `train(data, max_iters=25, seed=None)` | Learn the cluster centroids from a sample of at least `nlist` vectors. Call once, before `add`. Pass `seed` for reproducible results. |
-| `enable_pq(num_subspaces, centroids_per_subspace=256)` | Compress stored vectors with product quantization. Call before `train`. |
+| `enable_pq(num_subspaces, centroids_per_subspace=None, *, fast_scan=False)` | Compress stored vectors with product quantization. Call before `train`. `centroids_per_subspace` defaults to 256 (one byte per slice), or 16 with `fast_scan`; see [Fast-scan](#fast-scan). |
+| `fast_scan` | Read-only property: whether `enable_pq(..., fast_scan=True)` was used. |
 | `nprobe` | Property: clusters scanned per query. Can be changed at any time; higher means better recall and slower queries. |
 | `pq_distance` | Property: how PQ codes are scored, `qann.PQDistance.ADC` (default, more accurate) or `qann.PQDistance.SDC`. |
 | `precomputed_tables` | Property: whether ADC queries use lookup tables precomputed at train time, which makes PQ queries faster. On by default; reads `True` once the tables exist (PQ enabled, trained, and `nlist * num_subspaces * centroids_per_subspace * 4` bytes within 256 MB). Set to `False` to free them. |
@@ -83,6 +84,22 @@ ivf.train(x, seed=1)
 ivf.add(x)
 ivf.nprobe = 32   # trade speed for recall
 ```
+
+#### Fast-scan
+
+`enable_pq(num_subspaces, fast_scan=True)` stores each slice in 4 bits (16 centroids per slice) and scores 32 vectors at a time with a single SIMD table lookup per slice (NEON on ARM, SSSE3 on x86). Scanning the codes is about 6x faster than regular PQ at the same bytes per vector. Use twice the `num_subspaces` you would with regular PQ to keep the memory and most of the accuracy, and pair it with a `RefineIndex`:
+
+```python
+ivf = qann.IVFIndex(128, nlist=1024, nprobe=16)
+ivf.enable_pq(64, fast_scan=True)          # 64 x 4 bits = 32 bytes per vector
+ivf.train(x, seed=1)
+refine = qann.RefineIndex(ivf, k_factor=16)
+refine.add(x)
+```
+
+- On SIFT1M with re-ranking (`k_factor=16`), 64 subspaces with fast-scan match 32 regular subspaces (recall@10 0.931 at `nprobe=16`, 0.995 at `nprobe=64`) and beat 16 regular ones, while scanning several times faster.
+- Without a `RefineIndex`, recall is lower than regular PQ at the same memory, and the returned distances are approximate: the lookup tables are rounded to 8 bits.
+- `num_subspaces` must be even and at most 256, `centroids_per_subspace` must be 16 (the default with `fast_scan`), and `pq_distance` stays `ADC`: setting `SDC` raises `ValueError`.
 
 ### `RefineIndex(base, k_factor=10, *, custom_ids=False)`
 
@@ -137,7 +154,7 @@ ids, dists = index.batch_query(queries, 10)
 - **A `RefineIndex` file contains its base index**, so loading one restores both. Tune the base through `loaded.base`, e.g. `loaded.base.nprobe = 32`.
 - **Saving is safe to interrupt:** the file is written next to the target as `<path>.tmp` and renamed into place when complete, so a failed save never leaves a partial file or destroys an existing one.
 - **Bad files raise `RuntimeError`:** a missing, truncated or corrupted file, or one that isn't a QaNN index, is rejected instead of loading garbage.
-- **Files are versioned.** Newer releases keep loading files saved by older ones (files from 0.1.0a4 and 0.1.0a6 load in 0.1.0a7). A file saved by a newer release than the one loading it raises `RuntimeError` rather than being misread.
+- **Files are versioned.** Newer releases keep loading files saved by older ones (files from 0.1.0a4, 0.1.0a6 and 0.1.0a7 load in 0.1.0a8). A file saved by a newer release than the one loading it raises `RuntimeError` rather than being misread.
 
 `PQCodebook` on its own can't be saved yet; save the `IVFIndex` that uses it instead.
 

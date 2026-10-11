@@ -457,3 +457,47 @@ def test_loads_files_from_0_1_0a6(name):
     ids, dists = index.batch_query(queries, 10)
     assert np.mean(ids == expected_ids) >= 0.99
     np.testing.assert_allclose(dists, expected_dists, rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize("name", ["flat", "ivf_pq", "refine"])
+def test_loads_files_from_0_1_0a7(name):
+    # Saved by qann 0.1.0a7 (format version 3) after compaction, with the results it returned.
+    index = qann.load(DATA / f"v3_{name}.qann")
+    queries = np.load(DATA / "v3_queries.npy")
+    expected_ids = np.load(DATA / f"v3_{name}_ids.npy")
+    expected_dists = np.load(DATA / f"v3_{name}_dists.npy")
+
+    assert index.size() == (1300 if name == "flat" else 1500)
+    ids, dists = index.batch_query(queries, 10)
+    assert np.mean(ids == expected_ids) >= 0.99
+    np.testing.assert_allclose(dists, expected_dists, rtol=1e-4, atol=1e-5)
+
+
+def test_fast_scan(tmp_path, data):
+    def build(fast):
+        ivf = qann.IVFIndex(32, nlist=100, nprobe=100)
+        ivf.enable_pq(16, fast_scan=fast) if fast else ivf.enable_pq(16, 16)
+        ivf.train(data, seed=1)
+        ivf.add(data)
+        return ivf
+
+    fast, ref = build(True), build(False)
+    assert fast.fast_scan and not ref.fast_scan
+    ids_f, dists_f = fast.batch_query(data[:100], 10)
+    ids_r, _ = ref.batch_query(data[:100], 10)
+    assert np.mean([len(set(a) & set(b)) / 10 for a, b in zip(ids_f, ids_r)]) >= 0.95
+    assert np.mean(ids_f[:, 0] == np.arange(100)) >= 0.9
+
+    fast.save(tmp_path / "fs.qann")
+    loaded = qann.load(tmp_path / "fs.qann")
+    assert loaded.fast_scan
+    np.testing.assert_array_equal(loaded.batch_query(data[:100], 10)[0], ids_f)
+
+
+def test_fast_scan_rejects_bad_settings():
+    ivf = qann.IVFIndex(32, nlist=100)
+    with pytest.raises(ValueError):
+        ivf.enable_pq(16, 256, fast_scan=True)
+    ivf.enable_pq(16, fast_scan=True)
+    with pytest.raises(ValueError):
+        ivf.pq_distance = qann.PQDistance.SDC

@@ -35,6 +35,7 @@ vecengine/
 │   ├── kmeans.hpp / kmeans.cpp     # internal k-means helper (not public API)
 │   ├── parallel.hpp                # internal parallel_for (not public API)
 │   ├── serialize.hpp               # internal binary I/O helpers + file header (not public API)
+│   ├── fast_scan.hpp / fast_scan.cpp  # 4-bit PQ block layout, uint8 tables, NEON / SSSE3 / scalar kernels
 │   ├── id_map.cpp                  # IdMap: slots <-> user ids, deletions
 │   ├── index.cpp                   # default Index::add_batch / query_batch
 │   ├── pq.cpp
@@ -46,12 +47,16 @@ vecengine/
 │   ├── test_distance.cpp           # Catch2 v3 tests for every layer
 │   ├── test_serialize.cpp          # save/load round trips and corrupt-file rejection
 │   ├── test_id_map.cpp             # IdMap, custom ids, deletion and compaction per index, format v2/v3
+│   ├── test_fast_scan.cpp          # fast-scan packing, kernels, table rounding, IVF fast-scan
 │   ├── test_python.py              # pytest smoke, save/load, ids and threading tests
-│   └── data/                       # index files saved by 0.1.0a4 (v1) and 0.1.0a6 (v2) + their results
+│   └── data/                       # index files saved by 0.1.0a4 (v1), 0.1.0a6 (v2) and 0.1.0a7 (v3) + their results
 ├── benchmarks/
 │   ├── bench_distance.cpp          # Google Benchmark distance kernels
 │   ├── bench_indexes.py            # recall vs QPS on SIFT
 │   ├── compare.py                  # ref vs working tree: recall, QPS, build times
+│   ├── profile_query.cpp           # per-section query time breakdown on SIFT1M (VECENGINE_PROFILE=ON)
+│   ├── fastscan_recall.py          # recall of 4-bit codes and uint8 tables on SIFT1M (fast-scan study)
+│   ├── fastscan_bench.cpp          # NEON fast-scan kernel vs the scalar ADC scan (ARM only)
 │   ├── baseline_siftsmall.json     # recall baseline for the CI gate
 │   ├── data/                       # downloaded datasets (git-ignored)
 │   └── results/                    # CSV + PNG output (git-ignored)
@@ -143,6 +148,18 @@ Both distances work because squared L2 decomposes across disjoint slices: `‖a 
 
 `PQDistance { ADC, SDC }` lives here and selects the mode in `IVFIndex`.
 
+### `src/fast_scan.hpp` / `fast_scan.cpp` (`vecengine::detail`): PQ fast-scan
+
+With 16 centroids per subspace a code is 4 bits, and a row of the ADC table is 16 entries. Rounded to bytes, a row fits one 128-bit register, so one shuffle instruction (`vqtbl1q_u8` on NEON, `_mm_shuffle_epi8` on SSSE3) does 16 table lookups at once. FAISS calls this fast-scan (`IndexIVFPQFastScan`).
+
+- **Block layout.** `IVFIndex` stores a fast-scan list's codes in blocks of `kFsBlock = 32` vectors, `fs_block_bytes(m) = m * 16` bytes each: per subspace, 16 bytes where byte `j` holds vector `j` in its low nibble and vector `j + 16` in its high nibble. The last block is zero-padded; the list's `ids.size()` says how many entries are real. `fs_set` / `fs_get` write and read one code (used by `add`, `add_batch`, `compact` and tests; never in the scan).
+- **`quantize_lut(table, m, lut, scale, offset)`** rounds the `m × 16` float table: each row is shifted by its minimum (rows can be negative with precomputed tables, since `C = −2⟨q, y⟩`), and one scale for all rows makes the widest row span 0..255 (`scale = 1` if every row is flat). A distance is `sum / scale + offset`, where `offset` is the sum of the row minimums, accurate to `m / (2 · scale)`.
+- **`fast_scan_block(lut, block, m, out)`** writes the 32 `uint16_t` sums of a block: per subspace, two lookups (low nibbles, high nibbles) widened into four 8-lane accumulators. `m <= 256` keeps the sums below 65536. The NEON and SSSE3 versions must equal `fast_scan_block_scalar` exactly (tested, including all-255 tables).
+- **`fast_scan_block_mask(lut, block, m, limit, out)`** is the same kernel plus the threshold test: it compares the four accumulators with `limit` while they are in registers and returns a 32-bit mask, bit `v` set when `out[v] < limit` (NEON: compare, keep one power-of-two weight per lane, horizontal add; SSSE3: flip the top bit so a signed compare orders unsigned values, pack to bytes, `movemask`). The scan converts the k-th-best distance to `ceil((threshold − offset) · scale)`, drops the padding bits, and visits only set bits with `countr_zero`.
+- `quantize_lut` has a NEON version (four floats per instruction for the row min/max and the rounding, `vcvtaq` rounding like `lround`) that matches `quantize_lut_scalar` byte for byte; it takes ~0.15 µs per list instead of ~0.6 µs at `m = 64`.
+
+Measured on SIFT1M (`benchmarks/fastscan_recall.py`): rounding the tables to bytes costs no recall (0.482 vs 0.482 for PQ32×4, 0.672 vs 0.673 for PQ64×4, flat PQ over 100k vectors). The 4-bit codes do cost recall before re-ranking (PQ64×4 0.638 vs PQ32×8 0.706 at the same 32 bytes), but with re-ranking (`k_factor = 16`) PQ64×4 matches PQ32×8: 0.931 vs 0.932 at `nprobe = 16`, 0.995 vs 0.995 at 64.
+
 ---
 
 ## Layer 3: Indexes
@@ -210,6 +227,7 @@ Exact search. Vectors stored row-major in one `vector<float>`, one row per slot.
      - PQ off: `l2_distance` per stored vector.
      - ADC with precomputed tables (the default): table = `B[list] + C`, plus `A` on subspace 0's row → `distances_adc` over the list's codes. See below.
      - ADC without them: residual `q − centroid(c)` → `compute_adc_table` → `distances_adc`.
+     - Fast-scan (`enable_pq(m, 16, true)`): either float table above → `quantize_lut` → `fast_scan_block` per 32-vector block. The top-k threshold is converted to the table's integer scale once per block (`(threshold − offset) · scale`), so most vectors are rejected by one integer compare; survivors, minus padding, are pushed with `sum / scale + offset`. Distances are approximate; a `RefineIndex` makes them exact. SDC is refused (`set_pq_distance` and `enable_pq` throw `invalid_argument`).
      - SDC: residual → `encode` → `distance_sdc` per code.
 
 The residual depends on the cluster's centroid, so without precomputed tables it is rebuilt per probed list. Stored codes encode `x − c`, the query becomes `q − c`, and `(q − c) − (x − c) = q − x`, so residual distances equal true distances. SDC still rebuilds and encodes the residual per list, so it is slower than precomputed ADC as well as less accurate. ADC is the default.
@@ -269,27 +287,27 @@ It only helps when `base` ranks with approximate distances (IVF + PQ). It restor
 
 Binary, little-endian (a `static_assert` requires a little-endian host), every size and count stored as `uint64`. Vectors are stored as a `uint64` element count followed by the raw elements (`write_vec` / `read_vec`).
 
-Every index starts with a 9-byte header: magic `QANN` (`uint32`), format version (`uint32`, currently 3) and an `IndexKind` tag (`uint8`). `Index::save` writes header + body; `load_index` reads the header (`read_header` returns `{kind, version}`) and passes the version to the type's static `load_body`, which reads only the body. Versions `kMinFormatVersion` (1) through `kFormatVersion` (3) are readable.
+Every index starts with a 9-byte header: magic `QANN` (`uint32`), format version (`uint32`, currently 4) and an `IndexKind` tag (`uint8`). `Index::save` writes header + body; `load_index` reads the header (`read_header` returns `{kind, version}`) and passes the version to the type's static `load_body`, which reads only the body. Versions `kMinFormatVersion` (1) through `kFormatVersion` (4) are readable.
 
 | Kind | Body |
 | --- | --- |
 | `Flat` (1) | `dim`, `count` (slots), `data` (`count * dim` floats), id map |
-| `IVF` (2) | `dim`, `nlist`, `nprobe`, `n_total` (slots), `trained` (u8), `pq_distance` (u8), coarse centroids (`nlist * dim`, or empty if untrained), PQ flag (u8) + `PQCodebook` if set, then `nlist` lists in cluster order `0..nlist-1`, each slot `ids` + `codes` (PQ) or `vecs` (no PQ), empty lists written as empty vectors; id map; `use_precomputed` (u8, version 3+) |
+| `IVF` (2) | `dim`, `nlist`, `nprobe`, `n_total` (slots), `trained` (u8), `pq_distance` (u8), coarse centroids (`nlist * dim`, or empty if untrained), PQ flag (u8) + `PQCodebook` and `fast_scan` (u8, version 4+) if set, then `nlist` lists in cluster order `0..nlist-1`, each slot `ids` + `codes` (PQ: `n * m` bytes, or `ceil(n / 32) * m * 16` in fast-scan blocks) or `vecs` (no PQ), empty lists written as empty vectors; id map; `use_precomputed` (u8, version 3+) |
 | `Refine` (3) | `k_factor`, `count` (slots), the base index (full header + body, same version), `data` (`count * dim` floats), id map |
 
 The id map (`IdMap::save`, version 2+) is `custom_ids` (u8), the slot count, `next_id` (i64, version 3+), `labels` (empty while ids equal slots) and one deleted flag (u8) per slot. It ends each body (in IVF, only the `use_precomputed` flag follows it). For version 1, `load_body` skips it and starts from a map with every slot live and no custom ids; for version 2, `next_id` is the slot count and auto ids carry no labels. Version 3 added `next_id` and auto-id labels for compaction, and IVF's `use_precomputed` flag (version 2 files load with the tables on).
 
 `PQCodebook` (inside IVF, no header): `dim`, `num_subspaces`, `centroids_per_subspace`, `centroids_`. `centroids_t_` and `sdc_table_` are derived and rebuilt on load by `build_tables()`, the same code `train()` runs, so they come out bit-identical.
 
-**Validation on load.** Files are untrusted input, so every loader checks before allocating or indexing: `read_vec` takes a `max_len` and callers then require the exact expected length; sizes are checked against overflow (`count > UINT64_MAX / dim`); IVF ids must be `< n_total` and list sizes must sum to `n_total`; the PQ codebook's `dim` must match the index; a Refine's `count` must equal its base's `slots()` (queries index the raw vectors by base slot), its base's ids must equal its slots and it must have the same format version. A Refine base must be Flat or IVF, which also stops a crafted file from nesting Refines until the stack overflows. The id map must match its index's slot count, with no duplicate live ids; auto-id labels must be strictly increasing, `>= 0` and below `next_id`, and without labels `next_id` must equal the slot count (or the index must be empty). Any failure throws `runtime_error`.
+**Validation on load.** Files are untrusted input, so every loader checks before allocating or indexing: `read_vec` takes a `max_len` and callers then require the exact expected length; sizes are checked against overflow (`count > UINT64_MAX / dim`); IVF ids must be `< n_total` and list sizes must sum to `n_total`; the PQ codebook's `dim` must match the index, and a fast-scan flag needs 16 centroids, an even `m <= 256` and ADC; a Refine's `count` must equal its base's `slots()` (queries index the raw vectors by base slot), its base's ids must equal its slots and it must have the same format version. A Refine base must be Flat or IVF, which also stops a crafted file from nesting Refines until the stack overflows. The id map must match its index's slot count, with no duplicate live ids; auto-id labels must be strictly increasing, `>= 0` and below `next_id`, and without labels `next_id` must equal the slot count (or the index must be empty). Any failure throws `runtime_error`.
 
-**Changing the format.** `IndexKind` values are append-only: never renumber or reuse one. Bump `kFormatVersion` whenever an existing type's layout changes, and read older versions explicitly in each `load_body` (as version 3 does for versions 1 and 2). `tests/data/` holds files saved by 0.1.0a4 (version 1) and by 0.1.0a6 (version 2, with deletions and custom ids) with the results they returned; the C++ and Python tests load them to catch compatibility breaks, and the version-2 test also compacts and re-saves them.
+**Changing the format.** `IndexKind` values are append-only: never renumber or reuse one. Bump `kFormatVersion` whenever an existing type's layout changes, and read older versions explicitly in each `load_body` (as version 4 does for versions 1 to 3). `tests/data/` holds files saved by 0.1.0a4 (version 1), 0.1.0a6 (version 2, with deletions and custom ids) and 0.1.0a7 (version 3, compacted, with precomputed tables off on the IVF file) with the results they returned; the C++ and Python tests load them to catch compatibility breaks, and re-save them in the current version.
 
 ---
 
 ## Benchmarks (`benchmarks/bench_indexes.py`)
 
-Recall@10 (overlap of the returned top 10 with the true top 10), QPS on all cores (`query_batch`) and bytes per vector for Flat, IVF, IVF + PQ (ADC and SDC, m ∈ {8, 16, 32}) and IVF + PQ + re-ranking (`k_factor` ∈ {4, 16}), sweeping `nprobe` from 1 to 128. Training uses each dataset's `learn` set; `nlist ≈ √N`. Each configuration's QPS is the best of 3 full passes, so cold caches after a build don't distort the first measurement. Writes `benchmarks/results/<dataset>.csv` and a recall-vs-QPS plot.
+Recall@10 (overlap of the returned top 10 with the true top 10), QPS on all cores (`query_batch`) and bytes per vector for Flat, IVF, IVF + PQ (ADC and SDC, m ∈ {8, 16, 32}), IVF + fast-scan PQ (m ∈ {32, 64}, 4-bit) and IVF + PQ + re-ranking (`k_factor` ∈ {4, 16}), sweeping `nprobe` from 1 to 128. Training uses each dataset's `learn` set; `nlist ≈ √N`. Each configuration's QPS is the best of 3 full passes, so cold caches after a build don't distort the first measurement. Writes `benchmarks/results/<dataset>.csv` and a recall-vs-QPS plot.
 
 ```bash
 PYTHONPATH=build python3 benchmarks/bench_indexes.py                    # siftsmall (10k)
@@ -327,6 +345,8 @@ Thread scaling at `nprobe = 16` (`set_num_threads`):
 **Precomputed tables** (`profile_query`, `nprobe = 16`, 1 thread, both paths in one run): the ADC table build drops from 37.8 to 9.0 µs per query, taking IVF + PQ16 from 131 to 108 µs (+21% QPS). The code scan (~70 µs) is now most of a PQ query.
 
 **Batched coarse search** (`profile_query`, which uses `query_batch`, 1 thread, `VECLIB_MAXIMUM_THREADS=1`): coarse search drops from about 19 µs to 7.5 µs per query. Together with precomputed tables, IVF + PQ16 goes from 131 to 103 µs per query and IVF + PQ16 + R16 from 188 to 149 µs. The machine was loaded (load average 6), so treat the totals as approximate; the coarse section is the reliable comparison. The thread-scaling table above predates both changes.
+
+**Fast-scan** (`profile_query`, 1 thread, `VECLIB_MAXIMUM_THREADS=1`, `nprobe = 16`, IVF-PQ64×4fs vs IVF-PQ16 in the same run, load average 3 to 6): 49 vs 91 µs per query (1.9×), with the code scan at 33.5 vs 66 µs (2.0×); with re-ranking 102 vs 159 µs. In an earlier, more loaded run, `nprobe = 64` gave 184 vs 351 µs (1.9×). PQ64×4fs is also the more accurate of the two after re-ranking (see the fast-scan section). The scan is about half of PQ16's rather than the kernel's 6×: the kernel is ~19 µs per query, rounding the 16 lists' tables ~3 µs (NEON `quantize_lut`; ~10 µs scalar), and the rest is building the tables and pushing survivors. `fast_scan_block_mask` compares each block's sums with the threshold in registers, so blocks with no survivor (most of them once the top k fills) cost nothing beyond the kernel. Coarse search, re-ranking and result handling don't change, which bounds the end-to-end gain (~3.6× at most without re-ranking, ~2.8× with it, even if the scan took no time).
 
 The PQ rows of `benchmarks/results/sift.csv` from this run are ~20% low: other jobs loaded the machine during its second half. The thread-scaling numbers above come from a separate clean run.
 

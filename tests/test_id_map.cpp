@@ -701,6 +701,43 @@ TEST_CASE("files from format version 2 (0.1.0a6) still load", "[serialize][compa
     }
 }
 
+TEST_CASE("files from format version 3 (0.1.0a7) still load", "[serialize][compat]") {
+    // Saved by 0.1.0a7 after compaction: flat has auto-id labels and more
+    // deletions after compacting; ivf_pq has precomputed tables turned off;
+    // refine uses custom ids.
+    const std::filesystem::path dir = QANN_TEST_DATA_DIR;
+    struct Expect { const char* name; size_t size; size_t slots; bool custom; };
+    for (const Expect e : {Expect{"v3_flat.qann", 1300, 1500, false}, Expect{"v3_ivf_pq.qann", 1500, 1500, false},
+                           Expect{"v3_refine.qann", 1500, 1500, true}}) {
+        CAPTURE(e.name);
+        auto index = load_index(dir / e.name);
+        REQUIRE(index->size() == e.size);
+        REQUIRE(index->slots() == e.slots);
+        REQUIRE(index->custom_ids() == e.custom);
+        REQUIRE(index->dim() == 16);
+        if (auto* ivf = dynamic_cast<IVFIndex*>(index.get())) {
+            REQUIRE_FALSE(ivf->precomputed_tables());
+            REQUIRE_FALSE(ivf->fast_scan());
+        }
+
+        auto query = random_matrix(1, 16, 23);
+        const auto before = index->query(query, 10);
+        REQUIRE(before.size() == 10);
+
+        // Re-saving writes the current version and keeps results.
+        std::stringstream s;
+        index->save(s);
+        REQUIRE(read_header(s).version == kFormatVersion);
+        s.seekg(0);
+        auto reloaded = load_index(s);
+        const auto again = reloaded->query(query, 10);
+        for (size_t i = 0; i < before.size(); ++i) {
+            REQUIRE(again[i].index == before[i].index);
+            REQUIRE(again[i].distance == before[i].distance);
+        }
+    }
+}
+
 TEST_CASE("load rejects bad versions and misaligned id maps", "[serialize][ids]") {
     const size_t dim = 4;
     auto data = random_matrix(10, dim, 24);
