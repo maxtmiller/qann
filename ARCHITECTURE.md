@@ -324,9 +324,26 @@ PYTHONPATH=build python3 benchmarks/bench_indexes.py --max-queries 1000
 
 Datasets come from `ftp://ftp.irisa.fr/local/texmex/corpus/` (`siftsmall.tar.gz`, `sift.tar.gz`), extracted into `benchmarks/data/`.
 
-**SIFT1M findings** (Apple M3, 4 performance + 4 efficiency cores, `nlist = 1000`, 10k queries, seed 1, idle machine):
+**SIFT1M on all cores, 0.1.0a9** (Apple M3, 4 performance + 4 efficiency cores, `nlist = 1000`, 10k queries, seed 1). The machine was in use during this run, so absolute QPS is low (plain IVF 6.5k at `nprobe = 16` vs 10.2k on an idle machine earlier, Flat 146 vs 196); compare rows within the table.
 
-Thread scaling at `nprobe = 16` (`set_num_threads`):
+| Index | B/vec | `nprobe = 16` recall@10 | QPS | `nprobe = 64` recall@10 | QPS |
+|---|---|---|---|---|---|
+| Flat | 512 | 0.999 (exact scan) | 146 | | |
+| Plain IVF | 516 | 0.932 | 6.5k | 0.995 | 1.5k |
+| IVF + PQ16 | 20 | 0.555 | 34.5k | 0.565 | 9.7k |
+| IVF + PQ64×4 fast-scan | 36 | 0.635 | 74.1k | 0.651 | 18.8k |
+| IVF + PQ16 + R16 | 532 | 0.929 | 27.5k | 0.988 | 9.2k |
+| IVF + PQ32 + R16 | 548 | 0.932 | 16.9k | 0.995 | 5.1k |
+| IVF + PQ32×4 fast-scan + R16 | 532 | 0.912 | 66.8k | 0.962 | 32.0k |
+| IVF + PQ64×4 fast-scan + R16 | 548 | 0.931 | 48.5k | 0.995 | 18.6k |
+
+- At 0.93 recall, PQ64×4 fast-scan + R16 is 7.5× plain IVF and 1.8× PQ16 + R16. At 0.995 it is 12× plain IVF and 3.7× PQ32 + R16, the regular-PQ configuration with the same recall.
+- PQ32×4 fast-scan is the fastest but tops out at 0.96 recall with R16; use PQ64×4 when recall matters.
+- Fast-scan builds fastest of the PQ indexes: PQ64×4 trains in 3.2 s and adds 1M vectors in 1.8 s (PQ16: 4.6 s and 3.3 s, PQ32: 7.0 s and 4.2 s).
+
+The rest of this section is from earlier releases on an idle machine.
+
+Thread scaling at `nprobe = 16` (`set_num_threads`, 0.1.0a5, before precomputed tables and fast-scan):
 
 | threads | Plain IVF (recall 0.93) | IVF + PQ16 (0.56) | IVF + PQ16 + R16 (0.93) |
 |---|---|---|---|
@@ -348,8 +365,6 @@ Thread scaling at `nprobe = 16` (`set_num_threads`):
 **Batched coarse search** (`profile_query`, which uses `query_batch`, 1 thread, `VECLIB_MAXIMUM_THREADS=1`): coarse search drops from about 19 µs to 7.5 µs per query. Together with precomputed tables, IVF + PQ16 goes from 131 to 103 µs per query and IVF + PQ16 + R16 from 188 to 149 µs. The machine was loaded (load average 6), so treat the totals as approximate; the coarse section is the reliable comparison. The thread-scaling table above predates both changes.
 
 **Fast-scan** (`profile_query`, 1 thread, `VECLIB_MAXIMUM_THREADS=1`, `nprobe = 16`, IVF-PQ64×4fs vs IVF-PQ16 in the same run, load average 3 to 6): 49 vs 91 µs per query (1.9×), with the code scan at 33.5 vs 66 µs (2.0×); with re-ranking 102 vs 159 µs. In an earlier, more loaded run, `nprobe = 64` gave 184 vs 351 µs (1.9×). PQ64×4fs is also the more accurate of the two after re-ranking (see the fast-scan section). The scan is about half of PQ16's rather than the kernel's 6×: the kernel is ~19 µs per query, rounding the 16 lists' tables ~3 µs (NEON `quantize_lut`; ~10 µs scalar), and the rest is building the tables and pushing survivors. `fast_scan_block_mask` compares each block's sums with the threshold in registers, so blocks with no survivor (most of them once the top k fills) cost nothing beyond the kernel. Coarse search, re-ranking and result handling don't change, which bounds the end-to-end gain (~3.6× at most without re-ranking, ~2.8× with it, even if the scan took no time).
-
-The PQ rows of `benchmarks/results/sift.csv` from this run are ~20% low: other jobs loaded the machine during its second half. The thread-scaling numbers above come from a separate clean run.
 
 ---
 
