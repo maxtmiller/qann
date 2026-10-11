@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include "vecengine/distance.hpp"
 #include "vecengine/flat_index.hpp"
 #include "vecengine/id_map.hpp"
 #include "vecengine/index_factory.hpp"
@@ -493,6 +494,54 @@ TEST_CASE("RefineIndex: save/load round-trip returns identical results", "[refin
         auto loaded = index_roundtrip(refine);
         REQUIRE(dynamic_cast<RefineIndex*>(loaded.get()) != nullptr);
         require_same_results(refine, *loaded, queries, nq, k);
+    }
+}
+
+TEST_CASE("RefineIndex: returns only real results when the base finds fewer than k", "[refine]") {
+    const size_t dim = 8, k = 10;
+
+    // Every result is a distinct stored vector at its exact distance, nearest first.
+    auto require_real = [&](const std::vector<Neighbor>& got, const std::vector<float>& data, const float* q) {
+        for (size_t i = 0; i < got.size(); ++i) {
+            REQUIRE(got[i].distance == l2_distance(q, data.data() + got[i].index * dim, dim));
+            if (i > 0) REQUIRE(got[i - 1].distance <= got[i].distance);
+            for (size_t j = 0; j < i; ++j) REQUIRE(got[i].index != got[j].index);
+        }
+    };
+
+    SECTION("fewer live vectors than k") {
+        const size_t n = 5;
+        auto data = random_vectors(n, dim, 30);
+        auto queries = random_vectors(3, dim, 31);
+        FlatIndex flat(dim);
+        RefineIndex refine(flat, 4);
+        refine.add_batch(data, n);
+
+        const auto batch = refine.query_batch(queries, 3, k);
+        for (size_t q = 0; q < 3; ++q) {
+            const auto single = refine.query({queries.data() + q * dim, dim}, k);
+            REQUIRE(single.size() == n);
+            REQUIRE(batch[q].size() == n);
+            require_real(single, data, queries.data() + q * dim);
+        }
+    }
+
+    SECTION("probed IVF lists hold fewer than k") {
+        const size_t n = 200, nq = 20;   // ~2 vectors per list
+        auto data = random_vectors(n, dim, 32);
+        auto queries = random_vectors(nq, dim, 33);
+        IVFIndex ivf(dim, 100, 1);
+        ivf.train(data, n, 5, 1);
+        RefineIndex refine(ivf, 2);
+        refine.add_batch(data, n);
+
+        bool short_seen = false;
+        for (size_t q = 0; q < nq; ++q) {
+            const auto got = refine.query({queries.data() + q * dim, dim}, k);
+            short_seen |= got.size() < k;
+            require_real(got, data, queries.data() + q * dim);
+        }
+        REQUIRE(short_seen);
     }
 }
 

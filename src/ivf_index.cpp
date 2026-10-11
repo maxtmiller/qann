@@ -216,11 +216,14 @@ vector<IVFIndex::Probe> IVFIndex::coarse(span<const float> vec) const {
         }
     }
 
-    vector<Probe> probes;
-    probes.reserve(maxCentroidHeap.size());
+    // the heap pops farthest first, so fill from the back: lists are scanned
+    // nearest first, which tightens the top-k threshold sooner
+    size_t i = maxCentroidHeap.size() - 1;
+    vector<Probe> probes(i + 1);
     while (!maxCentroidHeap.empty()) {
-        probes.push_back({maxCentroidHeap.top().first, maxCentroidHeap.top().second});
+        probes[i] = {maxCentroidHeap.top().first, maxCentroidHeap.top().second};
         maxCentroidHeap.pop();
+        --i;
     }
     return probes;
 }
@@ -253,10 +256,16 @@ void IVFIndex::coarse_batch(const float* queries, size_t n, Probe* out) const {
 
         // the scores lose precision to cancellation, so A is recomputed exactly
         const float* q = queries + i * dim_;
+        Probe* probes = out + i * nprobe_;
         for (size_t j = 0; j < nprobe_; ++j) {
             const uint16_t list = scored[j].second;
-            out[i * nprobe_ + j] = {l2_distance(q, coarse_centroids_.data() + list * dim_, dim_), list};
+            probes[j] = {l2_distance(q, coarse_centroids_.data() + list * dim_, dim_), list};
         }
+
+        // nearest first, ordered by exact distance like coarse()
+        std::sort(probes, probes + nprobe_, [](const Probe& a, const Probe& b) {
+            return a.dist < b.dist || (a.dist == b.dist && a.list < b.list);
+        });
     });
 }
 #endif
