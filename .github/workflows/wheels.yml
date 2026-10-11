@@ -16,7 +16,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, macos-15-intel]
+        # Ubuntu pinned like ci.yml
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, macos-15-intel]
     steps:
       - uses: actions/checkout@v7
 
@@ -28,7 +29,7 @@ jobs:
           path: wheelhouse/*.whl
 
   sdist:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
 
@@ -42,7 +43,7 @@ jobs:
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [wheels, sdist]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment:
       name: pypi
       url: https://pypi.org/p/qann
@@ -58,7 +59,7 @@ jobs:
 
   github-release:
     needs: publish
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
