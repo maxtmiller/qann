@@ -11,7 +11,6 @@
 #include <span>
 #include <cassert>
 #include <stdexcept>
-#include <queue>
 #include <utility>
 #include <algorithm>
 
@@ -80,19 +79,23 @@ vector<Neighbor> RefineIndex::rerank(span<const float> vec, const vector<Neighbo
     candidates.reserve(candidatesRaw.size());
 
     for (size_t i = 0; i < candidatesRaw.size(); ++i) {
+        constexpr size_t kAhead = 8;   // how many candidates ahead to prefetch
+        if (i + kAhead < candidatesRaw.size()) {
+            const char* p = reinterpret_cast<const char*>(data_.data() + candidatesRaw[i + kAhead].index * dim());
+            for (size_t b = 0; b < dim() * sizeof(float); b += 64) __builtin_prefetch(p + b);
+        }
         float dst = l2_distance(vec.data(), data_.data() + (candidatesRaw[i].index * dim()), dim());
         candidates.emplace_back(dst, candidatesRaw[i].index);
     }
 
-    std::priority_queue<pair<float, size_t>, vector<pair<float, size_t>>, std::less<pair<float, size_t>>> maxHeap(candidates.begin(), candidates.end());
-    while (maxHeap.size() > k) maxHeap.pop();
+    const size_t keep = std::min(k, candidates.size());
+    std::nth_element(candidates.begin(), candidates.begin() + keep, candidates.end());
+    std::sort(candidates.begin(), candidates.begin() + keep);
 
-    const size_t n = maxHeap.size();
-    vector<Neighbor> results(n);
-    for (int i = static_cast<int>(n) - 1; i >= 0; --i) {
-        auto [distance, index] = maxHeap.top();
+    vector<Neighbor> results(keep);
+    for (size_t i = 0; i < keep; ++i) {
+        auto [distance, index] = candidates[i];
         results[i] = {static_cast<size_t>(id_map_.label(static_cast<uint32_t>(index))), distance};
-        maxHeap.pop();
     }
 
     VECENGINE_PROF_STOP(t_rerank, kProfRerank);
