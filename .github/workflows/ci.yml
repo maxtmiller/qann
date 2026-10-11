@@ -14,7 +14,9 @@ jobs:
       matrix:
         # ubuntu exercises the find_package(BLAS) path with OpenBLAS;
         # macos-14 (arm64) uses Accelerate like local development.
-        os: [ubuntu-latest, macos-14]
+        # Ubuntu is pinned so the move of ubuntu-latest to 26 (from 2026-10-19)
+        # happens on purpose, not under us.
+        os: [ubuntu-24.04, macos-14]
     steps:
       - uses: actions/checkout@v7
 
