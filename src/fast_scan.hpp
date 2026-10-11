@@ -33,9 +33,14 @@ inline uint8_t fs_get(const uint8_t* block, size_t pos, size_t s) noexcept {
     return pos < 16 ? static_cast<uint8_t>(b & 0x0F) : static_cast<uint8_t>(b >> 4);
 }
 
+// Largest lut entry. 63 rather than 255 so the kernels can add four
+// subspaces' lookups in bytes (4 * 63 = 252) before widening to 16 bits, which
+// cuts their widening adds by 4x; on SIFT1M it costs no recall after re-ranking.
+inline constexpr uint8_t kLutMax = 63;
+
 // Rounds an m x 16 float ADC table to bytes: lut[s * 16 + j] =
 // round((table[s * 16 + j] - min_s) * scale), with min_s the row's minimum and
-// one scale for all rows chosen so the widest row spans 0..255. A distance is
+// one scale for all rows chosen so the widest row spans 0..kLutMax. A distance is
 // then recovered as sum / scale + offset, where offset is the sum of the row
 // minimums; the error is at most m / (2 * scale). A table whose rows are all
 // constant gets scale 1.
@@ -46,7 +51,8 @@ void quantize_lut_scalar(const float* table, size_t m, uint8_t* lut, float& scal
 
 // Sums of the lut entries picked by each of the block's 32 vectors: out[v] =
 // sum over s of lut[s * 16 + code(v, s)]. m <= 256 keeps the sums within
-// uint16_t. Uses NEON or SSSE3 when the build has them.
+// uint16_t. Uses NEON or SSSE3 when the build has them, which need every entry
+// <= kLutMax (quantize_lut guarantees it); the scalar version takes any table.
 void fast_scan_block(const uint8_t* lut, const uint8_t* block, size_t m, uint16_t* out);
 
 // Portable version of fast_scan_block; the SIMD versions must match it exactly.
