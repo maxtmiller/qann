@@ -25,6 +25,7 @@ struct IndexOptions {
     size_t nprobe = 10;     // IVFIndex: clusters scanned per query
     size_t pq_subspaces = 0;   // IVFIndex: PQ subspaces, 0 = PQ off
     size_t pq_centroids = 256; // IVFIndex: PQ centroids per subspace
+    int ivf_sq_bits = 0;       // IVFIndex: 4 or 8 stores SQ codes of that many bits instead of floats; 0 = floats
     size_t hnsw_m = 16;            // HNSWIndex: neighbors per node (2x on level 0)
     size_t ef_construction = 200;  // HNSWIndex: beam width while inserting
     size_t ef_search = 64;         // HNSWIndex: beam width per query

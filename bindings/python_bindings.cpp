@@ -334,6 +334,13 @@ NB_MODULE(qann, m) {
              "256, or 16 with fast_scan=True, which stores 4-bit codes and scores 32 vectors per SIMD instruction "
              "(much faster; distances are approximate, so pair it with a RefineIndex). fast_scan needs an even "
              "num_subspaces <= 256 and ADC")
+        .def("enable_sq", [](vecengine::IVFIndex& self, int bits) { write_locked(self, [&] { self.enable_sq(bits); }); },
+             nb::arg("bits") = 8,
+             "Store vectors as scalar codes of 8 bits (4x smaller than floats) or 4 bits (8x smaller) per "
+             "dimension instead of raw floats. Call before train()/add(); not with enable_pq(). Distances become "
+             "approximate; 8 bits loses little recall, 4 bits should be wrapped in a RefineIndex")
+        .def_prop_ro("sq_bits", [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.sq_bits(); }); },
+                     "Bits per dimension set by enable_sq() (4 or 8), or 0 without SQ")
         .def_prop_ro("fast_scan",
                      [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.fast_scan(); }); },
                      "Whether enable_pq(..., fast_scan=True) was used")
@@ -407,6 +414,7 @@ NB_MODULE(qann, m) {
         .def_rw("nprobe", &vecengine::IndexOptions::nprobe)
         .def_rw("pq_subspaces", &vecengine::IndexOptions::pq_subspaces)
         .def_rw("pq_centroids", &vecengine::IndexOptions::pq_centroids)
+        .def_rw("ivf_sq_bits", &vecengine::IndexOptions::ivf_sq_bits)
         .def_rw("hnsw_m", &vecengine::IndexOptions::hnsw_m)
         .def_rw("ef_construction", &vecengine::IndexOptions::ef_construction)
         .def_rw("ef_search", &vecengine::IndexOptions::ef_search)

@@ -1,4 +1,4 @@
-"""Recall vs QPS benchmark for FlatIndex, IVFIndex, IVFIndex+PQ and HNSWIndex (float, SQ8 and SQ4) on SIFT and GloVe.
+"""Recall vs QPS benchmark for FlatIndex, IVFIndex (floats, PQ, SQ8, SQ4) and HNSWIndex (float, SQ8 and SQ4) on SIFT and GloVe.
 
 Run from the repo root after a Release build:
     PYTHONPATH=build python3 benchmarks/bench_indexes.py                       # siftsmall
@@ -47,6 +47,7 @@ REFINE_K_FACTORS = [4, 16]  # re-rank k * k_factor ADC candidates with exact dis
 HNSW_M = 16
 HNSW_EF_CONSTRUCTION = 200
 EF_SEARCHES = [10, 16, 32, 64, 128, 256]
+IVF_SQ4_K_FACTOR = 8  # 4-bit codes lose too much alone; 8 recovers float recall on SIFT and GloVe
 # SQ bits -> re-rank k_factor that recovers the float graph's recall on SIFT1M
 HNSW_SQ_K_FACTORS = {8: 2, 4: 4}
 
@@ -91,16 +92,18 @@ def time_queries(index, queries: np.ndarray, k: int, repeats: int = 3):
     return ids, len(queries) / best
 
 
-def build_ivf(dim, nlist, base, learn, metric, pq_m=None, seed=None, fast_scan=False):
-    # With PQ, vectors are added through a RefineIndex so one build serves both
-    # the plain PQ rows (query idx) and the re-ranked rows (query refine).
+def build_ivf(dim, nlist, base, learn, metric, pq_m=None, seed=None, fast_scan=False, sq_bits=0):
+    # With PQ (or SQ4), vectors are added through a RefineIndex so one build serves
+    # both the plain rows (query idx) and the re-ranked rows (query refine).
     idx = qann.IVFIndex(dim, nlist, metric=metric)
     if pq_m is not None:
         idx.enable_pq(pq_m, fast_scan=fast_scan)
+    if sq_bits:
+        idx.enable_sq(sq_bits)
     start = time.perf_counter()
     idx.train(learn, seed=seed)
     train_s = time.perf_counter() - start
-    refine = qann.RefineIndex(idx) if pq_m is not None else None
+    refine = qann.RefineIndex(idx) if pq_m is not None or sq_bits == 4 else None
     start = time.perf_counter()
     (refine or idx).add(base)
     add_s = time.perf_counter() - start
@@ -164,6 +167,25 @@ def run(dataset: str, max_queries: int | None, seed: int | None = None):
                     ids, qps = time_queries(refine, queries, K)
                     record(f"{name}-ADC+R{kf}", f"nprobe={nprobe}", ids, qps,
                            bytes_per_vec + dim * 4, train_s, add_s)
+        print()
+
+    # SQ codes of each vector: 8 bits alone (near float recall), 4 bits also re-ranked
+    for bits in (8, 4):
+        idx, refine, train_s, add_s = build_ivf(dim, nlist, base, learn, metric, seed=seed, sq_bits=bits)
+        name = f"IVF-SQ{bits}"
+        print(f"{name}  (train {train_s:.1f}s, add {add_s:.1f}s)")
+        bytes_per_vec = (dim * bits + 7) // 8 + 4  # codes + uint32 id
+        for nprobe in (p for p in NPROBES if p <= nlist):
+            idx.nprobe = nprobe
+            ids, qps = time_queries(idx, queries, K)
+            record(name, f"nprobe={nprobe}", ids, qps, bytes_per_vec, train_s, add_s)
+        if refine is not None:
+            refine.k_factor = IVF_SQ4_K_FACTOR
+            for nprobe in (p for p in NPROBES if p <= nlist):
+                idx.nprobe = nprobe
+                ids, qps = time_queries(refine, queries, K)
+                record(f"{name}+R{IVF_SQ4_K_FACTOR}", f"nprobe={nprobe}", ids, qps, bytes_per_vec + dim * 4,
+                       train_s, add_s)
         print()
 
     links = (2 * HNSW_M + 1) * 4  # bottom-level links; upper levels add ~1/M of that
