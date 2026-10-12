@@ -120,7 +120,7 @@ index.ef_search = 128   # trade speed for recall
 ids, dists = index.batch_query(q, 10)
 ```
 
-On SIFT1M (1M vectors), `M=16, ef_construction=200` reaches recall@10 0.958 at `ef_search=64` (about 95 µs per query on one thread) and 0.994 at 256 (about 275 µs). On all cores, with the machine busy, it built in 90 s and reached 0.995 at 5.7k queries/s, while IVF + fast-scan + `RefineIndex` reached 0.995 at 11.8k/s in the same run and built in 9 s. So IVF + fast-scan + `RefineIndex` is the faster choice in qann today when you can train on representative data. Choose HNSW when you can't train up front, or when vectors keep arriving that the IVF clusters were not trained on.
+On SIFT1M (1M vectors), `M=16, ef_construction=200` reaches recall@10 0.960 at `ef_search=64` (about 80 µs per query on one thread) and 0.995 at 256 (about 340 µs). On all cores, with the machine busy, the float graph built in 75 s and reached 0.996 at 11.4k queries/s; with 8-bit SQ and re-ranking (below) it reached 0.996 at 15.8k/s, close to IVF + fast-scan + `RefineIndex` at 0.995 and 16.9k/s, which built in 5 s. Below 0.96 recall HNSW is the faster of the two. Choose IVF + fast-scan when you can train on representative data and build time matters; choose HNSW when you can't train up front, or when vectors keep arriving that the IVF clusters were not trained on.
 
 - **Deleting** marks vectors deleted; queries still route through them, so the graph stays connected, but never return them. `compact()` rebuilds the graph from the remaining vectors, which takes about as long as building it again, so call it after many deletes rather than after each one.
 - **Builds are parallel,** so the graph differs slightly from run to run. With `seed` and `qann.set_num_threads(1)`, the build is reproducible.
@@ -135,7 +135,7 @@ refine = qann.RefineIndex(index, k_factor=2)
 refine.add(x)
 ```
 
-On SIFT1M with the machine busy, at `ef_search=128`: 8 bits + `RefineIndex(k_factor=2)` matched the float graph's recall (0.987) at about 1.25x its queries per second, and 4 bits + `k_factor=4` did the same (0.986) at the same speed. The `RefineIndex` keeps full vectors too, so the memory saving needs the plain SQ index: 8 bits alone reaches 0.978, 4 bits alone only 0.85, so 4 bits really needs re-ranking. 4 bits is no faster than 8, since searches wait on memory latency rather than bytes moved; choose it to halve code memory.
+On SIFT1M with the machine busy, at `ef_search=256`: 8 bits + `RefineIndex(k_factor=2)` matched the float graph's recall (0.996) at 1.4x its queries per second on all cores (15.8k vs 11.4k) and 1.7x on one thread, and 4 bits + `k_factor=4` did nearly the same (0.995, 15.6k). The `RefineIndex` keeps full vectors too, so the memory saving needs the plain SQ index: 8 bits alone reaches 0.986, 4 bits alone only 0.86, so 4 bits really needs re-ranking. 4 bits is no faster than 8, since searches wait on memory latency rather than bytes moved; choose it to halve code memory.
 
 ### `RefineIndex(base, k_factor=10, *, custom_ids=False)`
 

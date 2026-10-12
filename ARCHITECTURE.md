@@ -286,9 +286,9 @@ Every candidate goes through one `push` lambda that checks the `TopK` threshold 
 
 **Memory access.** A search is limited by memory, not arithmetic: on SIFT1M a query at `ef_search = 64` computes about 1,210 distances and expands 76 nodes, and each neighbor's vector is a random 512-byte read from a 512 MB array (~125 ns per distance before prefetching, against ~17 ns for the arithmetic on data in cache). So `search_layer` expands a node in two passes: the first marks its unvisited neighbors and calls `prefetch_vector` on each, so their reads overlap; the second computes the distances. On level 0 it also prefetches the neighbor list of the node it will most likely expand next (the new top of the candidate heap). The upper levels only need the single closest node, so `greedy_closest` walks to whichever neighbor is closer until none is, with the same prefetching and no heaps. Together these took a single-threaded query from 152–157 to 94–95 µs at `ef_search = 64` (recall 0.958) and from 513–596 to 263–287 µs at 256 (0.994), with identical results; builds, which are mostly searches, got faster too.
 
-**Measured** (SIFT1M, `M = 16`, `ef_construction = 200`, all 8 cores, machine busy, IVF in the same run): the build takes 90 s (IVF + PQ64×4 fast-scan + R16: 9.2 s). Recall@10 and QPS by `ef_search`: 16: 0.794 / 37.4k, 32: 0.897 / 30.4k, 64: 0.958 / 21.2k, 128: 0.986 / 8.7k, 256: 0.995 / 5.7k. IVF + fast-scan + R16 at `nprobe` 16 / 32 / 64: 0.931 / 36.1k, 0.977 / 22.6k, 0.995 / 11.8k. So at 0.995 recall HNSW is about 2× slower than IVF + fast-scan + re-ranking (it was 3× before the prefetching). The remaining gap is mostly the size of the vectors it reads, which SQ storage (below) cuts from 512 to 128 bytes (8 bits) or 64 (4 bits).
+**Measured** (SIFT1M, `M = 16`, `ef_construction = 200`, all 8 cores, machine busy, IVF in the same run; full tables under Benchmarks): the float graph builds in 75 s (IVF + PQ64×4 fast-scan + R16: 5.3 s). At 0.995 recall it reaches 11.4k QPS against 16.9k for IVF + fast-scan + R16, 0.67× (it was 0.5× in 0.1.0a10, and 0.33× before the prefetching). Most of the gap is the size of the vectors it reads, which SQ storage (below) cuts from 512 to 128 bytes (8 bits) or 64 (4 bits).
 
-**SQ storage** (`enable_sq(bits)` with `bits` 8 or 4, before `train()` and any add, like `IVFIndex::enable_pq`). `train()` learns a `detail::SQ` from a sample (unit vectors for Cosine, like IVF's training), and adds encode into `codes_` (`code_bytes_` per slot; `data_` stays empty). Everything goes through two helpers: `distance(q, slot)` uses `SQ::distance` on the slot's code, and `vector_of(slot, buf)` returns a pointer into `data_`, or decodes the code into the caller's `buf`. Inserts and neighbor selection use `vector_of` for the node being linked, so the graph is built and searched entirely with SQ distances, and `compact()` rebuilds from the codes. `prefetch_vector` fetches `stored_bytes()` (on SIFT 2 cache lines for SQ8, 1 for SQ4, instead of 8). Query distances are approximate; a `RefineIndex` over the SQ graph restores exact ranking: `k_factor = 2` is enough for SQ8 on SIFT1M because it ranks nearly like the floats, and SQ4 needs 4. Measured on SIFT1M (all cores, machine busy, same run, first-try numbers before the full refresh): float `ef_search` 64 / 128: 0.960 / 46.9k, 0.987 / 26.4k; SQ8 alone: 0.953 / 59.1k, 0.978 / 35.9k; SQ8 + R2: 0.960 / 57.1k, 0.987 / 33.7k. So SQ8 + re-ranking gives the float graph's recall at about 1.25× the speed, and plain SQ8 uses about 40% of the float graph's memory (128 + 132 bytes of level-0 links per vector vs 512 + 132). SQ4 in a separate run (load ~14): alone 0.840 / 60.8k at 64 and 0.853 / 33.2k at 128 (16 levels lose too much to use alone), with R4 0.957 / 57.4k and 0.986 / 33.7k: the same recall and speed as SQ8 + R2, at 64 code bytes instead of 128. It is not faster than SQ8 because a search waits on the latency of each random read (the vector and its 132-byte link list), not on the bytes moved.
+**SQ storage** (`enable_sq(bits)` with `bits` 8 or 4, before `train()` and any add, like `IVFIndex::enable_pq`). `train()` learns a `detail::SQ` from a sample (unit vectors for Cosine, like IVF's training), and adds encode into `codes_` (`code_bytes_` per slot; `data_` stays empty). Everything goes through two helpers: `distance(q, slot)` uses `SQ::distance` on the slot's code, and `vector_of(slot, buf)` returns a pointer into `data_`, or decodes the code into the caller's `buf`. Inserts and neighbor selection use `vector_of` for the node being linked, so the graph is built and searched entirely with SQ distances, and `compact()` rebuilds from the codes. `prefetch_vector` fetches `stored_bytes()` (on SIFT 2 cache lines for SQ8, 1 for SQ4, instead of 8). Query distances are approximate; a `RefineIndex` over the SQ graph restores exact ranking: `k_factor = 2` is enough for SQ8 on SIFT1M because it ranks nearly like the floats, and SQ4 needs 4. Measured on SIFT1M (all cores, machine busy; tables under Benchmarks), at 0.995 recall: SQ8 + R2 15.8k QPS and SQ4 + R4 15.6k, against 11.4k for the float graph and 16.9k for IVF + fast-scan + R16. Single-threaded, SQ8 + R2 is 1.6 to 1.7× the float graph at the same recall. Plain SQ8 uses about 40% of the float graph's memory (128 + 132 bytes of level-0 links per vector vs 512 + 132) and loses a little recall (0.978 vs 0.987 at `ef_search = 128`); SQ4 alone levels off near 0.86, so it needs re-ranking. SQ4 is not faster than SQ8 because a search waits on the latency of each random read (the vector and its 132-byte link list), not on the bytes moved.
 
 ### `refine_index.hpp`: `RefineIndex`
 
@@ -358,41 +358,57 @@ PYTHONPATH=build python3 benchmarks/bench_indexes.py --max-queries 1000
 
 Datasets come from `ftp://ftp.irisa.fr/local/texmex/corpus/` (`siftsmall.tar.gz`, `sift.tar.gz`), extracted into `benchmarks/data/`.
 
-**SIFT1M on all cores, 0.1.0a9** (Apple M3, 4 performance + 4 efficiency cores, `nlist = 1000`, 10k queries, seed 1). The machine was in use during this run, so absolute QPS is low (plain IVF 6.5k at `nprobe = 16` vs 10.2k on an idle machine earlier, Flat 146 vs 196); compare rows within the table.
+**SIFT1M on all cores, after 0.1.0a11** (`main` at `ecea2bb`, with SQ HNSW; Apple M3, 4 performance + 4 efficiency cores, `nlist = 1000`, 10k queries, seed 1). The machine was busy during this run (load average 13 to 138), so absolute QPS is low (Flat 106 vs 196 on an idle machine, plain IVF 6.9k at `nprobe = 16` vs 10.2k); compare rows within the table.
 
 | Index | B/vec | `nprobe = 16` recall@10 | QPS | `nprobe = 64` recall@10 | QPS |
 |---|---|---|---|---|---|
-| Flat | 512 | 0.999 (exact scan) | 146 | | |
-| Plain IVF | 516 | 0.932 | 6.5k | 0.995 | 1.5k |
-| IVF + PQ16 | 20 | 0.555 | 34.5k | 0.565 | 9.7k |
-| IVF + PQ64×4 fast-scan | 36 | 0.635 | 74.1k | 0.651 | 18.8k |
-| IVF + PQ16 + R16 | 532 | 0.929 | 27.5k | 0.988 | 9.2k |
-| IVF + PQ32 + R16 | 548 | 0.932 | 16.9k | 0.995 | 5.1k |
-| IVF + PQ32×4 fast-scan + R16 | 532 | 0.912 | 66.8k | 0.962 | 32.0k |
-| IVF + PQ64×4 fast-scan + R16 | 548 | 0.931 | 48.5k | 0.995 | 18.6k |
+| Flat | 512 | 0.999 (exact scan) | 106 | | |
+| Plain IVF | 516 | 0.932 | 6.9k | 0.995 | 1.7k |
+| IVF + PQ16 | 20 | 0.555 | 31.5k | 0.565 | 8.9k |
+| IVF + PQ64×4 fast-scan | 36 | 0.635 | 53.9k | 0.651 | 14.1k |
+| IVF + PQ16 + R16 | 532 | 0.929 | 24.5k | 0.988 | 7.7k |
+| IVF + PQ32 + R16 | 548 | 0.932 | 15.0k | 0.995 | 4.5k |
+| IVF + PQ32×4 fast-scan + R16 | 532 | 0.912 | 60.1k | 0.962 | 30.2k |
+| IVF + PQ64×4 fast-scan + R16 | 548 | 0.931 | 39.4k | 0.995 | 16.9k |
 
-- At 0.93 recall, PQ64×4 fast-scan + R16 is 7.5× plain IVF and 1.8× PQ16 + R16. At 0.995 it is 12× plain IVF and 3.7× PQ32 + R16, the regular-PQ configuration with the same recall.
-- PQ32×4 fast-scan is the fastest but tops out at 0.96 recall with R16; use PQ64×4 when recall matters.
-- Fast-scan builds fastest of the PQ indexes: PQ64×4 trains in 3.2 s and adds 1M vectors in 1.8 s (PQ16: 4.6 s and 3.3 s, PQ32: 7.0 s and 4.2 s).
+HNSW in the same run (`M = 16`, `ef_construction = 200`; B/vec counts the vector or its codes plus level-0 links, and re-ranked rows add the raw floats):
 
-The rest of this section is from earlier releases on an idle machine.
+| Index | B/vec | `ef = 32` recall@10 | QPS | `ef = 64` | QPS | `ef = 128` | QPS | `ef = 256` | QPS | build |
+|---|---|---|---|---|---|---|---|---|---|---|
+| HNSW (floats) | 644 | 0.897 | 70.4k | 0.960 | 40.8k | 0.987 | 22.4k | 0.996 | 11.4k | 75 s |
+| HNSW-SQ8 | 260 | 0.892 | 92.2k | 0.953 | 51.5k | 0.978 | 27.6k | 0.986 | 14.7k | 50 s |
+| HNSW-SQ8 + R2 | 772 | 0.896 | 83.7k | 0.960 | 50.7k | 0.987 | 28.6k | 0.996 | 15.8k | |
+| HNSW-SQ4 | 196 | 0.805 | 87.0k | 0.840 | 52.1k | 0.853 | 28.9k | 0.857 | 15.3k | 64 s |
+| HNSW-SQ4 + R4 | 708 | 0.920 | 70.6k | 0.957 | 47.7k | 0.986 | 28.3k | 0.995 | 15.6k | |
 
-Thread scaling at `nprobe = 16` (`set_num_threads`, 0.1.0a5, before precomputed tables and fast-scan):
-
-| threads | Plain IVF (recall 0.93) | IVF + PQ16 (0.56) | IVF + PQ16 + R16 (0.93) |
-|---|---|---|---|
-| 1 | 3.3k QPS | 5.7k | 3.6k |
-| 2 | 6.4k (1.9×) | 11.0k (1.9×) | 7.4k (2.0×) |
-| 4 | 7.6k (2.3×) | 19.2k (3.4×) | 13.3k (3.7×) |
-| 8 | 10.6k (3.2×) | 24.5k (4.3×) | 18.0k (4.9×) |
-
-- Plain IVF stalls between 2 and 4 threads while PQ keeps scaling: IVF streams 512-byte raw vectors and is limited by memory bandwidth, PQ scans 16-byte codes. The efficiency cores add 25 to 40% on top of 4 threads.
-- On all cores, IVF + PQ16 + re-ranking is 1.7× faster than plain IVF at the same 0.93 recall. Single-threaded, plain IVF was faster; PQ's smaller scan wins once bandwidth is the bottleneck.
-- Plain IVF on all cores: 10.2k QPS at 0.93 recall (`nprobe = 16`), 5.3k at 0.98 (`nprobe = 32`), 2.6k at 0.995 (`nprobe = 64`); Flat is 196 QPS.
-- PQ alone plateaus at 0.38 / 0.57 / 0.73 recall for m = 8 / 16 / 32; re-ranking lifts m = 16 to 0.99 and m = 32 to 0.999.
+- At 0.93 recall, PQ64×4 fast-scan + R16 is 5.7× plain IVF and 1.6× PQ16 + R16. At 0.995 it is 10× plain IVF and 3.8× PQ32 + R16, the regular-PQ configuration with the same recall.
+- PQ32×4 fast-scan is the fastest IVF configuration but tops out at 0.96 recall with R16; use PQ64×4 when recall matters.
+- At 0.995, compressed HNSW nearly closes the gap to IVF: SQ8 + R2 at 15.8k and SQ4 + R4 at 15.6k against fast-scan + R16 at 16.9k (0.93×), where the float graph is at 11.4k (0.67×). Around 0.96 recall HNSW is ahead: SQ8 + R2 reaches 0.960 at 50.7k, while fast-scan + R4 reaches 0.956 at `nprobe = 64` with 17.2k.
+- SQ8 alone loses little recall (0.978 vs 0.987 at `ef = 128`) at 40% of the float graph's memory; SQ4 alone levels off near 0.86, so it needs re-ranking. SQ4 is no faster than SQ8: a search waits on the latency of each random read, not on the bytes moved.
+- PQ alone plateaus at 0.38 / 0.56 / 0.73 recall for m = 8 / 16 / 32; re-ranking lifts m = 16 to 0.99 and m = 32 to 0.995.
 - SDC recall *falls* as `nprobe` grows, because more candidates expose its query-side quantization error.
 
-**Build times** on all cores: IVF trains in 2.5 s and adds 1M vectors in 1.3 s (`add_batch`); IVF + PQ16 trains in 3.4 s (8.6 s on one thread) and adds in 3.0 s. Before `assign_nearest`, IVF training took 37 s and IVF + PQ16 55 s.
+Thread scaling (`set_num_threads`, same commit, every index built once on all cores; QPS by thread count). The machine was busy here too (load average 22 to 90), so the steps are noisy; the HNSW-SQ8 `ef = 256` drop at 8 threads is noise, not a real slowdown.
+
+| Index | recall@10 | 1 thread | 2 | 4 | 8 |
+|---|---|---|---|---|---|
+| Plain IVF, `nprobe = 16` | 0.932 | 2.3k | 3.7k (1.6×) | 4.2k (1.8×) | 4.7k (2.0×) |
+| IVF + PQ16, `nprobe = 16` | 0.555 | 10.3k | 19.1k (1.9×) | 24.9k (2.4×) | 29.0k (2.8×) |
+| IVF + PQ16 + R16, `nprobe = 16` | 0.929 | 8.6k | 9.8k (1.1×) | 18.3k (2.1×) | 26.3k (3.1×) |
+| IVF + PQ64×4 fast-scan + R16, `nprobe = 16` | 0.931 | 11.1k | 22.8k (2.1×) | 30.5k (2.7×) | 33.2k (3.0×) |
+| IVF + PQ64×4 fast-scan + R16, `nprobe = 64` | 0.995 | 5.3k | 9.5k (1.8×) | 12.4k (2.4×) | 14.7k (2.8×) |
+| HNSW, `ef = 64` | 0.960 | 12.7k | 19.4k (1.5×) | 26.1k (2.1×) | 32.9k (2.6×) |
+| HNSW, `ef = 256` | 0.995 | 3.0k | 6.0k (2.0×) | 8.6k (2.9×) | 9.9k (3.3×) |
+| HNSW-SQ8 + R2, `ef = 64` | 0.960 | 20.3k | 31.1k (1.5×) | 34.7k (1.7×) | 42.8k (2.1×) |
+| HNSW-SQ8 + R2, `ef = 256` | 0.996 | 5.2k | 8.5k (1.6×) | 11.7k (2.3×) | 9.8k |
+
+- Single-threaded, SQ8 is where compression pays most: HNSW-SQ8 + R2 is 1.6× the float graph at `ef = 64` and 1.7× at 256, with the same recall. On all cores the gain shrinks (about 1.3×), as threads already overlap the memory waits that SQ8 shortens.
+- Plain IVF barely scales: it streams 512-byte raw vectors and is limited by memory bandwidth, while PQ and fast-scan scan small codes and keep scaling. The efficiency cores add less than the performance cores.
+- On one thread, fast-scan + R16 at 0.995 (5.3k) beats the float HNSW at the same recall (3.0k) and matches SQ8 + R2 (5.2k).
+
+**Build times** on all cores (this run, busy machine): IVF trains in 2.3 s and adds 1M vectors in 1.1 s (`add_batch`); IVF + PQ16 trains in 5.2 s and adds in 4.0 s; PQ64×4 fast-scan, the fastest PQ build, 3.4 s and 1.9 s; HNSW builds in 50 to 75 s. On an idle machine earlier, IVF + PQ16 trained in 3.4 s (8.6 s on one thread) and added in 3.0 s. Before `assign_nearest`, IVF training took 37 s and IVF + PQ16 55 s.
+
+The sections below are from earlier releases.
 
 **Precomputed tables** (`profile_query`, `nprobe = 16`, 1 thread, both paths in one run): the ADC table build drops from 37.8 to 9.0 µs per query, taking IVF + PQ16 from 131 to 108 µs (+21% QPS). The code scan (~70 µs) is now most of a PQ query.
 
