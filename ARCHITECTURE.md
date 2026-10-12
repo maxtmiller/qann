@@ -27,6 +27,7 @@ vecengine/
 │   ├── index.hpp                   # Index interface + Neighbor
 │   ├── flat_index.hpp              # exact brute-force index
 │   ├── ivf_index.hpp               # IVF index, optional PQ
+│   ├── hnsw_index.hpp              # HNSW graph index
 │   ├── pq.hpp                      # PQCodebook + PQDistance
 │   ├── refine_index.hpp            # exact re-ranking wrapper
 │   └── index_factory.hpp           # make_index() + IndexOptions, save_index() / load_index()
@@ -41,6 +42,7 @@ vecengine/
 │   ├── pq.cpp
 │   ├── flat_index.cpp
 │   ├── ivf_index.cpp
+│   ├── hnsw_index.cpp
 │   ├── refine_index.cpp
 │   └── index_factory.cpp
 ├── tests/
@@ -48,6 +50,7 @@ vecengine/
 │   ├── test_serialize.cpp          # save/load round trips and corrupt-file rejection
 │   ├── test_id_map.cpp             # IdMap, custom ids, deletion and compaction per index, format v2/v3
 │   ├── test_fast_scan.cpp          # fast-scan packing, kernels, table rounding, IVF fast-scan
+│   ├── test_hnsw.cpp               # HNSW recall, determinism, deletion, compaction, save/load, parallel build
 │   ├── test_python.py              # pytest smoke, save/load, ids and threading tests
 │   └── data/                       # index files saved by 0.1.0a4 (v1), 0.1.0a6 (v2) and 0.1.0a7 (v3) + their results
 ├── benchmarks/
@@ -257,6 +260,24 @@ Then `scan()` runs per query in `parallel_for`. Like `assign_nearest`, a near-ti
 
 Every candidate goes through one `push` lambda that checks the `TopK` threshold first and then `is_deleted`, and pushes the slot's id. `nprobe` and `pq_distance` both have setters and can be changed at any time after training; they only affect queries.
 
+### `hnsw_index.hpp`: `HNSWIndex`
+
+`HNSWIndex(dim, M = 16, ef_construction = 200, custom_ids = false, seed)` is a Hierarchical Navigable Small World graph (Malkov & Yashunin). Every vector is a node on level 0; a node's top level is drawn as `floor(-ln(U) / ln(M))`, so each level up holds about 1/M of the nodes. Vectors are stored in full, in slot order (`data_`), with ids from an `IdMap` like `FlatIndex`.
+
+**Storage.** Level 0 is one flat `vector<uint32_t>` with `2M + 1` entries per slot (a count, then up to `2M` neighbor slots), so the hot level is contiguous. Upper levels, which hold few nodes, are `upper_[slot][level - 1]`, a list per level. `levels_` holds each slot's top level; `entry_` is a node on the top level `max_level_` (`-1` while empty).
+
+**Search** (`search_layer(q, entry_points, ef, level)`): a beam search with a min-heap of nodes to expand and a max-heap of the best `ef` so far; it stops when the nearest unexpanded node is farther than the worst result and the results are full. Visited nodes are tracked with a per-thread array of generation tags, so nothing is cleared between searches. `query()` descends greedily through the upper levels (`ef = 1`), then searches level 0 with `max(ef_search, k)`. With `skip_deleted`, deleted nodes are still expanded (they keep the graph connected) but never enter the results heap, so a query's beam fills with live nodes even when most nodes are deleted.
+
+**Insert.** Descend to the new node's level, then on each level from there down: search with `ef_construction`, pick up to `M` neighbors with the paper's heuristic (`select_neighbors`: sorted nearest first, a candidate is kept only if it is closer to the new node than to every neighbor already kept, which favors neighbors in different directions), and add the reverse links (`add_link`), re-selecting a neighbor's list with the same heuristic when it is full. Candidates sort as `(distance, slot)` pairs, so ties break the same way everywhere.
+
+**Parallel build** (`build(first, n)`, used by `add_batch` and `compact`): levels are drawn serially in slot order first, so a seed fixes them, and storage for the batch is sized before any thread starts, so nothing reallocates. The first `kSerialBuild` (1024) slots of a graph are inserted serially, because vectors inserted at the same time cannot see each other and that costs recall while the graph is small; the rest are inserted with `parallel_for`. Neighbor lists are guarded by a pool of `kLockStripes` (1024) mutexes indexed by `slot % kLockStripes`. A thread holds at most one of them at a time, so threads cannot deadlock waiting on each other: `add_link` holds the neighbor's lock throughout, and a search during an insert copies each list under its lock and computes distances unlocked. Queries never run during an add (the Python bindings lock the index), so they skip the locks. `top_lock_` guards `entry_` and `max_level_`; an insert that raises the top level holds it for its whole insert. A node can be reached through an upper level before its insert reaches the lower ones, so other threads may already have linked into a lower level; `set_own_neighbors` merges those links instead of overwriting them. The test suite was run under ThreadSanitizer clean. Parallel builds lose little quality (on 20k random vectors, 0.21% of vectors fail to find themselves vs 0.17% serially), but they are not reproducible run to run; with `set_num_threads(1)` and a seed they are.
+
+**Deletion and compaction.** `remove()` only marks slots deleted. `compact()` drops deleted vectors and rebuilds the graph from the live ones (`build(0, slots)`): repairing a graph in place is complex and degrades it, and compaction is meant for occasional cleanup. Ids are kept; results can shift slightly because the graph is new.
+
+**Memory access.** A search is limited by memory, not arithmetic: on SIFT1M a query at `ef_search = 64` computes about 1,210 distances and expands 76 nodes, and each neighbor's vector is a random 512-byte read from a 512 MB array (~125 ns per distance before prefetching, against ~17 ns for the arithmetic on data in cache). So `search_layer` expands a node in two passes: the first marks its unvisited neighbors and calls `prefetch_vector` on each, so their reads overlap; the second computes the distances. On level 0 it also prefetches the neighbor list of the node it will most likely expand next (the new top of the candidate heap). The upper levels only need the single closest node, so `greedy_closest` walks to whichever neighbor is closer until none is, with the same prefetching and no heaps. Together these took a single-threaded query from 152–157 to 94–95 µs at `ef_search = 64` (recall 0.958) and from 513–596 to 263–287 µs at 256 (0.994), with identical results; builds, which are mostly searches, got faster too.
+
+**Measured** (SIFT1M, `M = 16`, `ef_construction = 200`, all 8 cores, machine busy, IVF in the same run): the build takes 90 s (IVF + PQ64×4 fast-scan + R16: 9.2 s). Recall@10 and QPS by `ef_search`: 16: 0.794 / 37.4k, 32: 0.897 / 30.4k, 64: 0.958 / 21.2k, 128: 0.986 / 8.7k, 256: 0.995 / 5.7k. IVF + fast-scan + R16 at `nprobe` 16 / 32 / 64: 0.931 / 36.1k, 0.977 / 22.6k, 0.995 / 11.8k. So at 0.995 recall HNSW is about 2× slower than IVF + fast-scan + re-ranking (it was 3× before the prefetching). The remaining gap is mostly the size of the vectors it reads: storing 8-bit codes in the graph (compressed HNSW, below) would cut each read from 512 to 128 bytes.
+
 ### `refine_index.hpp`: `RefineIndex`
 
 `RefineIndex(base, k_factor = 10, custom_ids = false)` wraps an approximate index with **no slots and ids equal to its slots** (`ids_are_slots()`: no custom ids, never compacted) by reference and keeps its own row-major copy of the raw vectors. User ids live in the `RefineIndex`'s `IdMap`; the base gets plain slots, so base slot `i` and refine slot `i` are always the same vector. (Checking `base.slots()` rather than `size()` matters: a base whose vectors were all deleted has size 0 but its slots are taken.)
@@ -275,9 +296,9 @@ It only helps when `base` ranks with approximate distances (IVF + PQ). It restor
 
 ### `index_factory.hpp`: `make_index`
 
-`make_index(IndexType, dim, IndexOptions)` returns `unique_ptr<Index>`. `IndexOptions` holds `capacity` (Flat), `nlist`, `nprobe`, `pq_subspaces` (0 = PQ off) and `pq_centroids` (IVF), and `custom_ids` (both). IVF-specific calls like `train()` require the concrete `IVFIndex`.
+`make_index(IndexType, dim, IndexOptions)` returns `unique_ptr<Index>`. `IndexOptions` holds `capacity` (Flat), `nlist`, `nprobe`, `pq_subspaces` (0 = PQ off) and `pq_centroids` (IVF), `hnsw_m`, `ef_construction` and `ef_search` (HNSW), and `custom_ids` (all). IVF-specific calls like `train()` require the concrete `IVFIndex`.
 
-`load_index(std::istream&)` reads a file header and dispatches to `FlatIndex::load_body`, `IVFIndex::load_body` or `RefineIndex::load_body`. The path overloads wrap it for files:
+`load_index(std::istream&)` reads a file header and dispatches to `FlatIndex::load_body`, `IVFIndex::load_body`, `HNSWIndex::load_body` or `RefineIndex::load_body`. The path overloads wrap it for files:
 
 - `save_index(index, path)` writes to `path + ".tmp"`, checks the stream after `close()` (write errors don't throw on their own), then renames into place; on any failure it removes the `.tmp` file and rethrows.
 - `load_index(path)` opens in binary mode, rethrows `invalid_argument` from constructors and setters (bad `nlist`, `nprobe`, ...) as `runtime_error("corrupt file: ...")` so every bad file reports the same way, and rejects trailing bytes after the index.
@@ -295,12 +316,13 @@ Every index starts with a 9-byte header: magic `QANN` (`uint32`), format version
 | `Flat` (1) | `dim`, `count` (slots), `data` (`count * dim` floats), id map |
 | `IVF` (2) | `dim`, `nlist`, `nprobe`, `n_total` (slots), `trained` (u8), `pq_distance` (u8), coarse centroids (`nlist * dim`, or empty if untrained), PQ flag (u8) + `PQCodebook` and `fast_scan` (u8, version 4+) if set, then `nlist` lists in cluster order `0..nlist-1`, each slot `ids` + `codes` (PQ: `n * m` bytes, or `ceil(n / 32) * m * 16` in fast-scan blocks) or `vecs` (no PQ), empty lists written as empty vectors; id map; `use_precomputed` (u8, version 3+) |
 | `Refine` (3) | `k_factor`, `count` (slots), the base index (full header + body, same version), `data` (`count * dim` floats), id map |
+| `HNSW` (4) | `dim`, `M`, `ef_construction`, `ef_search`, `count` (slots), `max_level` (i32), `entry` (u32), the generator's state (`std::mt19937`'s standard text form, so adds after a load draw the same levels), `data` (`count * dim` floats), `levels` (u8 per slot), level 0 (`count * (2M + 1)` u32), then each slot's upper-level lists in slot and level order, id map |
 
 The id map (`IdMap::save`, version 2+) is `custom_ids` (u8), the slot count, `next_id` (i64, version 3+), `labels` (empty while ids equal slots) and one deleted flag (u8) per slot. It ends each body (in IVF, only the `use_precomputed` flag follows it). For version 1, `load_body` skips it and starts from a map with every slot live and no custom ids; for version 2, `next_id` is the slot count and auto ids carry no labels. Version 3 added `next_id` and auto-id labels for compaction, and IVF's `use_precomputed` flag (version 2 files load with the tables on).
 
 `PQCodebook` (inside IVF, no header): `dim`, `num_subspaces`, `centroids_per_subspace`, `centroids_`. `centroids_t_` and `sdc_table_` are derived and rebuilt on load by `build_tables()`, the same code `train()` runs, so they come out bit-identical.
 
-**Validation on load.** Files are untrusted input, so every loader checks before allocating or indexing: `read_vec` takes a `max_len` and callers then require the exact expected length; sizes are checked against overflow (`count > UINT64_MAX / dim`); IVF ids must be `< n_total` and list sizes must sum to `n_total`; the PQ codebook's `dim` must match the index, and a fast-scan flag needs 16 centroids, an even `m <= 256` and ADC; a Refine's `count` must equal its base's `slots()` (queries index the raw vectors by base slot), its base's ids must equal its slots and it must have the same format version. A Refine base must be Flat or IVF, which also stops a crafted file from nesting Refines until the stack overflows. The id map must match its index's slot count, with no duplicate live ids; auto-id labels must be strictly increasing, `>= 0` and below `next_id`, and without labels `next_id` must equal the slot count (or the index must be empty). Any failure throws `runtime_error`.
+**Validation on load.** Files are untrusted input, so every loader checks before allocating or indexing: `read_vec` takes a `max_len` and callers then require the exact expected length; sizes are checked against overflow (`count > UINT64_MAX / dim`); IVF ids must be `< n_total` and list sizes must sum to `n_total`; the PQ codebook's `dim` must match the index, and a fast-scan flag needs 16 centroids, an even `m <= 256` and ADC; a Refine's `count` must equal its base's `slots()` (queries index the raw vectors by base slot), its base's ids must equal its slots and it must have the same format version. A Refine base must be Flat, IVF or HNSW, which also stops a crafted file from nesting Refines until the stack overflows. An HNSW file's neighbor lists must be within capacity and point at real slots, and its entry point must sit on the top level. The id map must match its index's slot count, with no duplicate live ids; auto-id labels must be strictly increasing, `>= 0` and below `next_id`, and without labels `next_id` must equal the slot count (or the index must be empty). Any failure throws `runtime_error`.
 
 **Changing the format.** `IndexKind` values are append-only: never renumber or reuse one. Bump `kFormatVersion` whenever an existing type's layout changes, and read older versions explicitly in each `load_body` (as version 4 does for versions 1 to 3). `tests/data/` holds files saved by 0.1.0a4 (version 1), 0.1.0a6 (version 2, with deletions and custom ids) and 0.1.0a7 (version 3, compacted, with precomputed tables off on the IVF file) with the results they returned; the C++ and Python tests load them to catch compatibility breaks, and re-save them in the current version.
 
@@ -308,7 +330,7 @@ The id map (`IdMap::save`, version 2+) is `custom_ids` (u8), the slot count, `ne
 
 ## Benchmarks (`benchmarks/bench_indexes.py`)
 
-Recall@10 (overlap of the returned top 10 with the true top 10), QPS on all cores (`query_batch`) and bytes per vector for Flat, IVF, IVF + PQ (ADC and SDC, m ∈ {8, 16, 32}), IVF + fast-scan PQ (m ∈ {32, 64}, 4-bit) and IVF + PQ + re-ranking (`k_factor` ∈ {4, 16}), sweeping `nprobe` from 1 to 128. Training uses each dataset's `learn` set; `nlist ≈ √N`. Each configuration's QPS is the best of 3 full passes, so cold caches after a build don't distort the first measurement. Writes `benchmarks/results/<dataset>.csv` and a recall-vs-QPS plot.
+Recall@10 (overlap of the returned top 10 with the true top 10), QPS on all cores (`query_batch`) and bytes per vector for Flat, IVF, IVF + PQ (ADC and SDC, m ∈ {8, 16, 32}), IVF + fast-scan PQ (m ∈ {32, 64}, 4-bit), IVF + PQ + re-ranking (`k_factor` ∈ {4, 16}), sweeping `nprobe` from 1 to 128, and HNSW (`M = 16`, `ef_construction = 200`), sweeping `ef_search` from 10 to 256. Training uses each dataset's `learn` set; `nlist ≈ √N`. Each configuration's QPS is the best of 3 full passes, so cold caches after a build don't distort the first measurement. Writes `benchmarks/results/<dataset>.csv` and a recall-vs-QPS plot.
 
 ```bash
 PYTHONPATH=build python3 benchmarks/bench_indexes.py                    # siftsmall (10k)
@@ -429,10 +451,10 @@ pip install .               # builds the Python module into a wheel (no C++ test
 - Link-time optimization was tried and left off: no query speedup, and k-means training got ~35% slower.
 - `CMAKE_EXPORT_COMPILE_COMMANDS=ON` writes `build/compile_commands.json` for clangd.
 - Targets: `vecengine_core` (static lib), `test_vecengine`, `bench_vecengine`, `vecengine_py` (Python module), `qann_stub` (`qann.pyi`).
-- CI (`.github/workflows/ci.yml`, on pushes to `main` and on PRs): builds and runs `ctest` on `ubuntu-latest` (with OpenBLAS) and `macos-14`, then runs the siftsmall recall gate on macOS only, since the baseline was recorded with Accelerate. siftsmall is cached between runs.
+- CI (`.github/workflows/ci.yml`, on pushes to `main` and on PRs): builds and runs `ctest` on `ubuntu-24.04` (with OpenBLAS) and `macos-14`, then runs the siftsmall recall gate on macOS only, since the baseline was recorded with Accelerate. siftsmall is cached between runs.
 
 ---
 
 ## Not Yet Implemented
 
-- **HNSW**: graph index; slot reserved in `IndexType`.
+- **Compressed HNSW**: storing SQ8 or PQ codes in the graph instead of full vectors, with a `RefineIndex` for exact ranking.

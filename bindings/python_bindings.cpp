@@ -16,6 +16,7 @@
 #include "vecengine/distance.hpp"
 #include "vecengine/flat_index.hpp"
 #include "vecengine/ivf_index.hpp"
+#include "vecengine/hnsw_index.hpp"
 #include "vecengine/pq.hpp"
 #include "vecengine/refine_index.hpp"
 #include "vecengine/index_factory.hpp"
@@ -337,6 +338,21 @@ NB_MODULE(qann, m) {
                      "Whether ADC queries use per-list tables precomputed at train time (on by default). "
                      "True only once they exist: PQ enabled, trained, and within the 256 MB cap");
 
+    nb::class_<vecengine::HNSWIndex, vecengine::Index>(m, "HNSWIndex")
+        .def(nb::init<std::size_t, std::size_t, std::size_t, bool, std::optional<uint32_t>>(), nb::arg("dim"),
+             nb::arg("M") = 16, nb::arg("ef_construction") = 200, nb::kw_only(), nb::arg("custom_ids") = false,
+             nb::arg("seed") = nb::none(),
+             "Construct an HNSW graph index. No training: add() builds the graph on all cores. M is the neighbors "
+             "per node (2 * M on the bottom level); ef_construction the search width while inserting. A seed makes "
+             "the build reproducible when qann.set_num_threads(1) is set")
+        .def_prop_rw("ef_search",
+                     [](const vecengine::HNSWIndex& self) { return read_locked(self, [&] { return self.ef_search(); }); },
+                     [](vecengine::HNSWIndex& self, std::size_t v) { write_locked(self, [&] { self.set_ef_search(v); }); },
+                     "Search width per query (queries use max(ef_search, k)); higher is more accurate and slower")
+        .def_prop_ro("M", [](const vecengine::HNSWIndex& self) { return self.M(); }, "Neighbors per node (fixed at construction)")
+        .def_prop_ro("ef_construction", [](const vecengine::HNSWIndex& self) { return self.ef_construction(); },
+                     "Search width used while inserting (fixed at construction)");
+
     // Holds `base` by reference; keep_alive ties base's lifetime to the
     // RefineIndex so Python can't free it first.
     nb::class_<vecengine::RefineIndex, vecengine::Index>(m, "RefineIndex")
@@ -358,7 +374,8 @@ NB_MODULE(qann, m) {
 
     nb::enum_<vecengine::IndexType>(m, "IndexType")
         .value("Flat", vecengine::IndexType::Flat)
-        .value("IVF", vecengine::IndexType::IVF);
+        .value("IVF", vecengine::IndexType::IVF)
+        .value("HNSW", vecengine::IndexType::HNSW);
 
     nb::class_<vecengine::IndexOptions>(m, "IndexOptions")
         .def(nb::init<>())
@@ -367,6 +384,9 @@ NB_MODULE(qann, m) {
         .def_rw("nprobe", &vecengine::IndexOptions::nprobe)
         .def_rw("pq_subspaces", &vecengine::IndexOptions::pq_subspaces)
         .def_rw("pq_centroids", &vecengine::IndexOptions::pq_centroids)
+        .def_rw("hnsw_m", &vecengine::IndexOptions::hnsw_m)
+        .def_rw("ef_construction", &vecengine::IndexOptions::ef_construction)
+        .def_rw("ef_search", &vecengine::IndexOptions::ef_search)
         .def_rw("custom_ids", &vecengine::IndexOptions::custom_ids);
 
     nb::class_<vecengine::PQCodebook>(m, "PQCodebook")
@@ -387,9 +407,9 @@ NB_MODULE(qann, m) {
         .def("centroids_per_subspace", &vecengine::PQCodebook::centroids_per_subspace);
 
     m.def("make_index", &vecengine::make_index, nb::arg("type"), nb::arg("dim"), nb::arg("opts") = vecengine::IndexOptions{},
-          "Construct a FlatIndex or IVFIndex from an IndexType and IndexOptions");
+          "Construct a FlatIndex, IVFIndex or HNSWIndex from an IndexType and IndexOptions");
 
     m.def("load", nb::overload_cast<const std::filesystem::path&>(&vecengine::load_index), nb::arg("path"),
           nb::call_guard<nb::gil_scoped_release>(),
-          "Load an index saved with Index.save(path); returns a FlatIndex, IVFIndex or RefineIndex");
+          "Load an index saved with Index.save(path); returns a FlatIndex, IVFIndex, HNSWIndex or RefineIndex");
 }

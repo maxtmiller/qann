@@ -1,4 +1,4 @@
-"""Recall vs QPS benchmark for FlatIndex, IVFIndex and IVFIndex+PQ on SIFT.
+"""Recall vs QPS benchmark for FlatIndex, IVFIndex, IVFIndex+PQ and HNSWIndex on SIFT.
 
 Run from the repo root after a Release build:
     PYTHONPATH=build python3 benchmarks/bench_indexes.py                  # siftsmall
@@ -34,6 +34,9 @@ NPROBES = [1, 2, 4, 8, 16, 32, 64, 128]
 PQ_SUBSPACES = [8, 16, 32]
 FAST_SCAN_SUBSPACES = [32, 64]  # 4-bit codes: 16 and 32 bytes per vector, like PQ16 and PQ32
 REFINE_K_FACTORS = [4, 16]  # re-rank k * k_factor ADC candidates with exact distances
+HNSW_M = 16
+HNSW_EF_CONSTRUCTION = 200
+EF_SEARCHES = [10, 16, 32, 64, 128, 256]
 
 
 def read_vecs(path: Path, dtype) -> np.ndarray:
@@ -140,6 +143,19 @@ def run(dataset: str, max_queries: int | None, seed: int | None = None):
                            bytes_per_vec + dim * 4, train_s, add_s)
         print()
 
+    hnsw = qann.HNSWIndex(dim, M=HNSW_M, ef_construction=HNSW_EF_CONSTRUCTION, seed=seed)
+    start = time.perf_counter()
+    hnsw.add(base)
+    add_s = time.perf_counter() - start
+    name = f"HNSW-M{HNSW_M}"
+    print(f"{name}  (add {add_s:.1f}s)")
+    bytes_per_vec = dim * 4 + (2 * HNSW_M + 1) * 4  # vector + bottom-level links; upper levels add ~1/M of that
+    for ef in EF_SEARCHES:
+        hnsw.ef_search = ef
+        ids, qps = time_queries(hnsw, queries, K)
+        record(name, f"ef={ef}", ids, qps, bytes_per_vec, 0.0, add_s)
+    print()
+
     return rows
 
 
@@ -157,7 +173,7 @@ def plot(rows, path: Path, title: str, threads: int):
 
     fig, ax = plt.subplots(figsize=(8, 5.5))
     for name in dict.fromkeys(r["index"] for r in rows):
-        pts = [(r["recall"], r["qps"]) for r in rows if r["index"] == name]  # nprobe order
+        pts = [(r["recall"], r["qps"]) for r in rows if r["index"] == name]  # sweep order (nprobe or ef)
         xs, ys = zip(*pts)
         ax.plot(xs, ys, marker="o", markersize=3 if len(pts) > 1 else 6, label=name)
     ax.set_yscale("log")

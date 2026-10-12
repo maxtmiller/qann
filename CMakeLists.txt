@@ -78,6 +78,7 @@ add_library(vecengine_core STATIC
   src/index_factory.cpp
   src/id_map.cpp
   src/fast_scan.cpp
+  src/hnsw_index.cpp
 )
 
 target_include_directories(vecengine_core PUBLIC
@@ -127,6 +128,7 @@ add_executable(test_vecengine
   tests/test_serialize.cpp
   tests/test_id_map.cpp
   tests/test_fast_scan.cpp
+  tests/test_hnsw.cpp
 )
 
 target_link_libraries(test_vecengine PRIVATE
