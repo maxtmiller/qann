@@ -1,15 +1,17 @@
-"""Recall vs QPS benchmark for FlatIndex, IVFIndex, IVFIndex+PQ and HNSWIndex (float, SQ8 and SQ4) on SIFT.
+"""Recall vs QPS benchmark for FlatIndex, IVFIndex, IVFIndex+PQ and HNSWIndex (float, SQ8 and SQ4) on SIFT and GloVe.
 
 Run from the repo root after a Release build:
-    PYTHONPATH=build python3 benchmarks/bench_indexes.py                  # siftsmall
-    PYTHONPATH=build python3 benchmarks/bench_indexes.py --dataset sift   # SIFT1M
+    PYTHONPATH=build python3 benchmarks/bench_indexes.py                       # siftsmall
+    PYTHONPATH=build python3 benchmarks/bench_indexes.py --dataset sift        # SIFT1M
+    PYTHONPATH=build python3 benchmarks/bench_indexes.py --dataset glove-100   # GloVe-100, cosine (needs h5py)
 
 Recall regression gate (used by CI): --write-baseline saves recall for every
 row with a fixed seed; --check fails if any row's recall drops below it.
     PYTHONPATH=build python3 benchmarks/bench_indexes.py --seed 1 --write-baseline benchmarks/baseline_siftsmall.json
     PYTHONPATH=build python3 benchmarks/bench_indexes.py --check benchmarks/baseline_siftsmall.json
 
-Datasets go in benchmarks/data/<name>/ (see ftp://ftp.irisa.fr/local/texmex/corpus/).
+Datasets go in benchmarks/data/<name>/: SIFT from ftp://ftp.irisa.fr/local/texmex/corpus/,
+GloVe as benchmarks/data/glove-100/glove-100-angular.hdf5 from http://ann-benchmarks.com/.
 batch_query and PQ training run on all cores by default (detail::parallel_for);
 --threads N limits that (--threads 1 is fully serial). add uses add_batch.
 """
@@ -31,8 +33,16 @@ DATA_DIR = BENCH_DIR / "data"
 RESULTS_DIR = BENCH_DIR / "results"
 K = 10
 NPROBES = [1, 2, 4, 8, 16, 32, 64, 128]
-PQ_SUBSPACES = [8, 16, 32]
-FAST_SCAN_SUBSPACES = [32, 64]  # 4-bit codes: 16 and 32 bytes per vector, like PQ16 and PQ32
+# Per dataset: the metric, PQ subspace counts (each must divide dim) and
+# fast-scan ones (even). SIFT's 4-bit fast-scan codes take 16 and 32 bytes, like
+# PQ16 and PQ32; GloVe's (dim 100) take 10 and 25 bytes, like PQ10 and PQ25.
+SIFT = dict(metric="L2", pq=[8, 16, 32], fast_scan=[32, 64])
+DATASETS = {
+    "siftsmall": SIFT,
+    "sift": SIFT,
+    "glove-100": dict(metric="Cosine", pq=[10, 20, 25], fast_scan=[20, 50]),
+}
+GLOVE_LEARN = 100_000  # GloVe has no learn set: train on this many base vectors, sampled with a fixed seed
 REFINE_K_FACTORS = [4, 16]  # re-rank k * k_factor ADC candidates with exact distances
 HNSW_M = 16
 HNSW_EF_CONSTRUCTION = 200
@@ -50,6 +60,14 @@ def read_vecs(path: Path, dtype) -> np.ndarray:
 
 def load_dataset(name: str):
     d = DATA_DIR / name
+    if name == "glove-100":
+        import h5py
+        with h5py.File(d / "glove-100-angular.hdf5", "r") as f:
+            base = np.ascontiguousarray(f["train"][:], dtype=np.float32)
+            queries = np.ascontiguousarray(f["test"][:], dtype=np.float32)
+            gt = f["neighbors"][:].astype(np.int32)
+        learn = base[np.random.default_rng(0).choice(len(base), GLOVE_LEARN, replace=False)]
+        return base, learn, queries, gt
     base = read_vecs(d / f"{name}_base.fvecs", np.float32)
     learn = read_vecs(d / f"{name}_learn.fvecs", np.float32)
     queries = read_vecs(d / f"{name}_query.fvecs", np.float32)
@@ -73,10 +91,10 @@ def time_queries(index, queries: np.ndarray, k: int, repeats: int = 3):
     return ids, len(queries) / best
 
 
-def build_ivf(dim, nlist, base, learn, pq_m=None, seed=None, fast_scan=False):
+def build_ivf(dim, nlist, base, learn, metric, pq_m=None, seed=None, fast_scan=False):
     # With PQ, vectors are added through a RefineIndex so one build serves both
     # the plain PQ rows (query idx) and the re-ranked rows (query refine).
-    idx = qann.IVFIndex(dim, nlist)
+    idx = qann.IVFIndex(dim, nlist, metric=metric)
     if pq_m is not None:
         idx.enable_pq(pq_m, fast_scan=fast_scan)
     start = time.perf_counter()
@@ -95,7 +113,10 @@ def run(dataset: str, max_queries: int | None, seed: int | None = None):
         queries, gt = queries[:max_queries], gt[:max_queries]
     n, dim = base.shape
     nlist = min(65535, max(100, round(math.sqrt(n))))
-    print(f"{dataset}: base {base.shape}, learn {learn.shape}, queries {queries.shape}, nlist {nlist}\n")
+    cfg = DATASETS[dataset]
+    metric = getattr(qann.Metric, cfg["metric"])
+    print(f"{dataset}: base {base.shape}, learn {learn.shape}, queries {queries.shape}, nlist {nlist}, "
+          f"metric {cfg['metric']}\n")
 
     rows = []
 
@@ -106,17 +127,17 @@ def run(dataset: str, max_queries: int | None, seed: int | None = None):
         print(f"  {name:<18} {params:<14} recall@{K} {r:.3f}   {qps:>9.0f} qps   {bytes_per_vec:>4} B/vec")
 
     print("Flat")
-    flat = qann.FlatIndex(dim)
+    flat = qann.FlatIndex(dim, metric=metric)
     start = time.perf_counter()
     flat.add(base)
     add_s = time.perf_counter() - start
     ids, qps = time_queries(flat, queries, K)
     record("Flat", "-", ids, qps, dim * 4, add_s=add_s)
 
-    configs = ([("IVF", None, False)] + [(f"IVF-PQ{m}", m, False) for m in PQ_SUBSPACES]
-               + [(f"IVF-PQ{m}x4fs", m, True) for m in FAST_SCAN_SUBSPACES])
+    configs = ([("IVF", None, False)] + [(f"IVF-PQ{m}", m, False) for m in cfg["pq"]]
+               + [(f"IVF-PQ{m}x4fs", m, True) for m in cfg["fast_scan"]])
     for name, m, fast in configs:
-        idx, refine, train_s, add_s = build_ivf(dim, nlist, base, learn, m, seed, fast)
+        idx, refine, train_s, add_s = build_ivf(dim, nlist, base, learn, metric, m, seed, fast)
         print(f"{name}  (train {train_s:.1f}s, add {add_s:.1f}s)")
         code_bytes = 0 if m is None else (m // 2 if fast else m)
         bytes_per_vec = (dim * 4 if m is None else code_bytes) + 4  # + uint32 id
@@ -149,7 +170,7 @@ def run(dataset: str, max_queries: int | None, seed: int | None = None):
     for bits in (0, 8, 4):
         # As with PQ, an SQ graph is filled through a RefineIndex so one build
         # serves both the plain rows and the re-ranked ones.
-        hnsw = qann.HNSWIndex(dim, M=HNSW_M, ef_construction=HNSW_EF_CONSTRUCTION, seed=seed)
+        hnsw = qann.HNSWIndex(dim, M=HNSW_M, ef_construction=HNSW_EF_CONSTRUCTION, seed=seed, metric=metric)
         train_s = 0.0
         if bits:
             hnsw.enable_sq(bits)
@@ -233,7 +254,7 @@ def check_baseline(rows, baseline: dict, tolerance: float) -> bool:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="siftsmall", help="siftsmall or sift")
+    parser.add_argument("--dataset", default="siftsmall", choices=list(DATASETS))
     parser.add_argument("--max-queries", type=int, default=None, help="use only the first N queries")
     parser.add_argument("--seed", type=int, default=None, help="seed k-means for reproducible recall")
     parser.add_argument("--out-dir", type=Path, default=RESULTS_DIR, help="where to write the CSV and plot")

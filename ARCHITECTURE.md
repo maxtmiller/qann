@@ -350,13 +350,14 @@ PYTHONPATH=build python3 benchmarks/bench_indexes.py --check benchmarks/baseline
 PYTHONPATH=build python3 benchmarks/bench_indexes.py --threads 1       # single-threaded (default 0 = all cores)
 python3 benchmarks/compare.py [ref] [--dataset sift] [--rounds N]       # ref (default HEAD) vs working tree
 PYTHONPATH=build python3 benchmarks/bench_indexes.py --dataset sift     # SIFT1M
+PYTHONPATH=build python3 benchmarks/bench_indexes.py --dataset glove-100  # GloVe-100, cosine (pip install h5py)
 PYTHONPATH=build python3 benchmarks/bench_indexes.py --max-queries 1000
 ```
 
 - **Recall gate**: `--seed N --write-baseline FILE` records recall for every row; `--check FILE` reruns with the baseline's dataset and seed and exits 1 if any row drops more than `--tolerance` (default 0.02). `benchmarks/baseline_siftsmall.json` (seed 1) is the committed baseline. Regenerate it when a change is *meant* to move recall.
 - **`compare.py`**: builds `ref` in a temporary copy (reusing `build/_deps` sources), runs each side's own `bench_indexes.py` alternately for `--rounds`, keeps the best QPS and fastest build per row, and prints recall, QPS ratios and build times. Speed is compared locally rather than in CI because shared CI runners vary 10 to 20% run to run.
 
-Datasets come from `ftp://ftp.irisa.fr/local/texmex/corpus/` (`siftsmall.tar.gz`, `sift.tar.gz`), extracted into `benchmarks/data/`.
+Datasets come from `ftp://ftp.irisa.fr/local/texmex/corpus/` (`siftsmall.tar.gz`, `sift.tar.gz`), extracted into `benchmarks/data/`, and from ann-benchmarks (`http://ann-benchmarks.com/glove-100-angular.hdf5`, saved as `benchmarks/data/glove-100/glove-100-angular.hdf5`). Each dataset sets its metric and PQ sizes in `DATASETS`: PQ subspace counts must divide `dim`, so GloVe (dim 100) uses PQ10 / 20 / 25 and fast-scan 20 / 50 (10 and 25 bytes). GloVe has no learn set, so training uses a fixed random sample of 100k base vectors.
 
 **SIFT1M on all cores, after 0.1.0a11** (`main` at `ecea2bb`, with SQ HNSW; Apple M3, 4 performance + 4 efficiency cores, `nlist = 1000`, 10k queries, seed 1). The machine was busy during this run (load average 13 to 138), so absolute QPS is low (Flat 106 vs 196 on an idle machine, plain IVF 6.9k at `nprobe = 16` vs 10.2k); compare rows within the table.
 
@@ -405,6 +406,30 @@ Thread scaling (`set_num_threads`, same commit, every index built once on all co
 - Single-threaded, SQ8 is where compression pays most: HNSW-SQ8 + R2 is 1.6× the float graph at `ef = 64` and 1.7× at 256, with the same recall. On all cores the gain shrinks (about 1.3×), as threads already overlap the memory waits that SQ8 shortens.
 - Plain IVF barely scales: it streams 512-byte raw vectors and is limited by memory bandwidth, while PQ and fast-scan scan small codes and keep scaling. The efficiency cores add less than the performance cores.
 - On one thread, fast-scan + R16 at 0.995 (5.3k) beats the float HNSW at the same recall (3.0k) and matches SQ8 + R2 (5.2k).
+
+**GloVe-100 on all cores, cosine** (1,183,514 word vectors, dim 100, 10k queries, ground truth from ann-benchmarks' angular neighbors, `nlist = 1088`, seed 1, same commit as the SIFT1M run plus the GloVe loader). The machine was even busier (load average 80 to 135), so QPS is rough; compare within the table. Flat returns recall 1.000, which checks the cosine metric against the dataset's own ground truth.
+
+| Index | B/vec | recall@10 / QPS at `nprobe` 16 | 64 | 128 |
+|---|---|---|---|---|
+| Plain IVF | 404 | 0.784 / 5.9k | 0.903 / 1.4k | 0.947 / 0.8k |
+| IVF + PQ25 + R16 | 429 | 0.783 / 16.9k | 0.900 / 5.6k | 0.942 / 3.0k |
+| IVF + PQ50×4 fast-scan + R16 | 429 | 0.782 / 47.6k | 0.897 / 18.6k | 0.938 / 9.5k |
+
+| Index | B/vec | recall@10 / QPS at `ef` 64 | 256 | 512 | 1024 |
+|---|---|---|---|---|---|
+| HNSW (floats) | 532 | 0.761 / 28.2k | 0.884 / 8.7k | 0.926 / 4.4k | 0.956 / 2.3k |
+| HNSW-SQ8 | 232 | 0.756 / 34.5k | 0.875 / 10.4k | | |
+| HNSW-SQ8 + R2 | 632 | 0.761 / 27.0k | 0.885 / 9.6k | 0.926 / 4.1k | 0.956 / 2.7k |
+| HNSW-SQ4 | 182 | 0.624 / 35.3k | 0.697 / 11.1k | | |
+| HNSW-SQ4 + R4 | 582 | 0.747 / 34.4k | 0.871 / 10.7k | | |
+| HNSW-SQ4 + R8 | 582 | 0.774 / 28.7k | 0.875 / 10.5k | 0.917 / 5.9k | 0.950 / 3.1k |
+
+(`ef` 512 and 1024 come from a second run on the same busy machine; with `k_factor = 8` the base searches with `ef = max(ef_search, 80)`, which is why SQ4 + R8 beats the floats at 64.)
+
+- GloVe is much harder than SIFT: at the same settings every index loses 0.05 to 0.1 recall, and reaching 0.95 takes `nprobe = 128` or `ef_search = 1024` rather than 64 and 256.
+- Here IVF + fast-scan + re-ranking is the fastest path up to about 0.94 recall (0.897 at 18.6k vs HNSW's 0.884 at 8.7k), the opposite of SIFT1M. HNSW with `M = 16` reaches 0.95 only at `ef = 1024` (2.3k); a larger `M` is the usual fix for GloVe and was not swept.
+- SQ8 holds up on real embeddings: alone it loses 0.01 against the floats, and with `k_factor = 2` it matches them exactly at every `ef`.
+- SQ4 does not: 16 levels per dimension are coarse for GloVe's continuous values, so alone it levels off near 0.70 (0.86 on SIFT), and `k_factor = 4` stays 0.01 short. `k_factor = 8` matches the floats within 0.01, so use 8 for SQ4 on embeddings like these.
 
 **Build times** on all cores (this run, busy machine): IVF trains in 2.3 s and adds 1M vectors in 1.1 s (`add_batch`); IVF + PQ16 trains in 5.2 s and adds in 4.0 s; PQ64×4 fast-scan, the fastest PQ build, 3.4 s and 1.9 s; HNSW builds in 50 to 75 s. On an idle machine earlier, IVF + PQ16 trained in 3.4 s (8.6 s on one thread) and added in 3.0 s. Before `assign_nearest`, IVF training took 37 s and IVF + PQ16 55 s.
 
@@ -485,4 +510,4 @@ pip install .               # builds the Python module into a wheel (no C++ test
 
 ## Not Yet Implemented
 
-- **PQ-compressed HNSW**: PQ codes in the graph, for more compression than SQ4.
+Future work and ideas are tracked as GitHub issues, not here: see the [open `idea` issues](https://github.com/maxtmiller/qann/issues?q=is%3Aissue+is%3Aopen+label%3Aidea). Each one records what was measured or decided so far.

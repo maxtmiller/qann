@@ -120,12 +120,12 @@ index.ef_search = 128   # trade speed for recall
 ids, dists = index.batch_query(q, 10)
 ```
 
-On SIFT1M (1M vectors), `M=16, ef_construction=200` reaches recall@10 0.960 at `ef_search=64` (about 80 µs per query on one thread) and 0.995 at 256 (about 340 µs). On all cores, with the machine busy, the float graph built in 75 s and reached 0.996 at 11.4k queries/s; with 8-bit SQ and re-ranking (below) it reached 0.996 at 15.8k/s, close to IVF + fast-scan + `RefineIndex` at 0.995 and 16.9k/s, which built in 5 s. Below 0.96 recall HNSW is the faster of the two. Choose IVF + fast-scan when you can train on representative data and build time matters; choose HNSW when you can't train up front, or when vectors keep arriving that the IVF clusters were not trained on.
+On SIFT1M (1M vectors), `M=16, ef_construction=200` reaches recall@10 0.960 at `ef_search=64` (about 80 µs per query on one thread) and 0.995 at 256 (about 340 µs). On all cores, with the machine busy, the float graph built in 75 s and reached 0.996 at 11.4k queries/s; with 8-bit SQ and re-ranking (below) it reached 0.996 at 15.8k/s, close to IVF + fast-scan + `RefineIndex` at 0.995 and 16.9k/s, which built in 5 s. Below 0.96 recall HNSW is the faster of the two on SIFT1M. On GloVe-100 word embeddings (cosine) the order flips: IVF + fast-scan + `RefineIndex` was about twice as fast up to 0.94 recall, and HNSW with `M=16` needed `ef_search=1024` to reach 0.95. Benchmark on your own data before choosing. Choose IVF + fast-scan when you can train on representative data and build time matters; choose HNSW when you can't train up front, or when vectors keep arriving that the IVF clusters were not trained on.
 
 - **Deleting** marks vectors deleted; queries still route through them, so the graph stays connected, but never return them. `compact()` rebuilds the graph from the remaining vectors, which takes about as long as building it again, so call it after many deletes rather than after each one.
 - **Builds are parallel,** so the graph differs slightly from run to run. With `seed` and `qann.set_num_threads(1)`, the build is reproducible.
 
-**Scalar quantization (compressed HNSW).** `enable_sq(8)` maps each dimension's trained range onto 256 evenly spaced values, so a vector takes `dim` bytes instead of `4 * dim` (on SIFT, 128 instead of 512); `enable_sq(4)` uses 16 values packed two per byte (64 bytes on SIFT). Distances become approximate, so wrap the index in a `RefineIndex` to re-rank with exact ones: `k_factor=2` is usually enough for 8 bits, 4 for 4 bits. Values outside the training sample's range are clamped, so train on a representative sample (or on the vectors themselves).
+**Scalar quantization (compressed HNSW).** `enable_sq(8)` maps each dimension's trained range onto 256 evenly spaced values, so a vector takes `dim` bytes instead of `4 * dim` (on SIFT, 128 instead of 512); `enable_sq(4)` uses 16 values packed two per byte (64 bytes on SIFT). Distances become approximate, so wrap the index in a `RefineIndex` to re-rank with exact ones: `k_factor=2` is enough for 8 bits; 4 bits needs 4 on SIFT and 8 on GloVe word embeddings. Values outside the training sample's range are clamped, so train on a representative sample (or on the vectors themselves).
 
 ```python
 index = qann.HNSWIndex(128)
@@ -135,7 +135,7 @@ refine = qann.RefineIndex(index, k_factor=2)
 refine.add(x)
 ```
 
-On SIFT1M with the machine busy, at `ef_search=256`: 8 bits + `RefineIndex(k_factor=2)` matched the float graph's recall (0.996) at 1.4x its queries per second on all cores (15.8k vs 11.4k) and 1.7x on one thread, and 4 bits + `k_factor=4` did nearly the same (0.995, 15.6k). The `RefineIndex` keeps full vectors too, so the memory saving needs the plain SQ index: 8 bits alone reaches 0.986, 4 bits alone only 0.86, so 4 bits really needs re-ranking. 4 bits is no faster than 8, since searches wait on memory latency rather than bytes moved; choose it to halve code memory.
+On SIFT1M with the machine busy, at `ef_search=256`: 8 bits + `RefineIndex(k_factor=2)` matched the float graph's recall (0.996) at 1.4x its queries per second on all cores (15.8k vs 11.4k) and 1.7x on one thread, and 4 bits + `k_factor=4` did nearly the same (0.995, 15.6k). The `RefineIndex` keeps full vectors too, so the memory saving needs the plain SQ index: 8 bits alone reaches 0.986, 4 bits alone only 0.86, so 4 bits really needs re-ranking. 4 bits is no faster than 8, since searches wait on memory latency rather than bytes moved; choose it to halve code memory. On GloVe-100 (cosine), 8 bits + `k_factor=2` again matched the floats exactly, while 4 bits alone reached only 0.70 and needed `k_factor=8`.
 
 ### `RefineIndex(base, k_factor=10, *, custom_ids=False)`
 
