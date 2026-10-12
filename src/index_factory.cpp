@@ -25,7 +25,7 @@ std::unique_ptr<Index> make_index(IndexType type, size_t dim, const IndexOptions
             auto idx = std::make_unique<HNSWIndex>(dim, opts.hnsw_m, opts.ef_construction, opts.custom_ids, std::nullopt,
                                                     opts.metric);
             idx->set_ef_search(opts.ef_search);
-            if (opts.hnsw_sq8) idx->enable_sq8();
+            if (opts.hnsw_sq_bits) idx->enable_sq(opts.hnsw_sq_bits);
             return idx;
         }
     }

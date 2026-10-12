@@ -355,17 +355,19 @@ NB_MODULE(qann, m) {
         .def(nb::init<std::size_t, std::size_t, std::size_t, bool, std::optional<uint32_t>, vecengine::Metric>(),
              nb::arg("dim"), nb::arg("M") = 16, nb::arg("ef_construction") = 200, nb::kw_only(),
              nb::arg("custom_ids") = false, nb::arg("seed") = nb::none(), nb::arg("metric") = vecengine::Metric::L2,
-             "Construct an HNSW graph index. add() builds the graph on all cores; no training unless enable_sq8() is "
+             "Construct an HNSW graph index. add() builds the graph on all cores; no training unless enable_sq() is "
              "used. M is the neighbors per node (2 * M on the bottom level); ef_construction the search width while "
              "inserting. A seed makes the build reproducible when qann.set_num_threads(1) is set")
-        .def("enable_sq8", [](vecengine::HNSWIndex& self) { write_locked(self, [&] { self.enable_sq8(); }); },
-             "Store vectors as 8-bit codes (1 byte per dimension instead of 4). Call before train()/add(). "
-             "Distances become approximate; wrap the index in a RefineIndex to re-rank with exact ones")
+        .def("enable_sq", [](vecengine::HNSWIndex& self, int bits) { write_locked(self, [&] { self.enable_sq(bits); }); },
+             nb::arg("bits") = 8,
+             "Store vectors as scalar codes of 8 bits (4x smaller than floats) or 4 bits (8x smaller) per "
+             "dimension. Call before train()/add(). Distances become approximate; wrap the index in a "
+             "RefineIndex to re-rank with exact ones")
         .def("train", &hnsw_train, nb::arg("data"),
-             "Learn each dimension's SQ8 range from sample vectors; required after enable_sq8(), before add(). "
+             "Learn each dimension's SQ range from sample vectors; required after enable_sq(), before add(). "
              "Values outside the sample's range are clamped, so use a representative sample")
-        .def_prop_ro("sq8", [](const vecengine::HNSWIndex& self) { return read_locked(self, [&] { return self.sq8(); }); },
-                     "Whether enable_sq8() was used")
+        .def_prop_ro("sq_bits", [](const vecengine::HNSWIndex& self) { return read_locked(self, [&] { return self.sq_bits(); }); },
+                     "Bits per dimension set by enable_sq() (4 or 8), or 0 when vectors are stored as floats")
         .def_prop_rw("ef_search",
                      [](const vecengine::HNSWIndex& self) { return read_locked(self, [&] { return self.ef_search(); }); },
                      [](vecengine::HNSWIndex& self, std::size_t v) { write_locked(self, [&] { self.set_ef_search(v); }); },
@@ -408,7 +410,7 @@ NB_MODULE(qann, m) {
         .def_rw("hnsw_m", &vecengine::IndexOptions::hnsw_m)
         .def_rw("ef_construction", &vecengine::IndexOptions::ef_construction)
         .def_rw("ef_search", &vecengine::IndexOptions::ef_search)
-        .def_rw("hnsw_sq8", &vecengine::IndexOptions::hnsw_sq8)
+        .def_rw("hnsw_sq_bits", &vecengine::IndexOptions::hnsw_sq_bits)
         .def_rw("custom_ids", &vecengine::IndexOptions::custom_ids)
         .def_rw("metric", &vecengine::IndexOptions::metric);
 

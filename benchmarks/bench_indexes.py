@@ -1,4 +1,4 @@
-"""Recall vs QPS benchmark for FlatIndex, IVFIndex, IVFIndex+PQ and HNSWIndex (float and SQ8) on SIFT.
+"""Recall vs QPS benchmark for FlatIndex, IVFIndex, IVFIndex+PQ and HNSWIndex (float, SQ8 and SQ4) on SIFT.
 
 Run from the repo root after a Release build:
     PYTHONPATH=build python3 benchmarks/bench_indexes.py                  # siftsmall
@@ -37,7 +37,8 @@ REFINE_K_FACTORS = [4, 16]  # re-rank k * k_factor ADC candidates with exact dis
 HNSW_M = 16
 HNSW_EF_CONSTRUCTION = 200
 EF_SEARCHES = [10, 16, 32, 64, 128, 256]
-HNSW_REFINE_K_FACTORS = [2]  # SQ8 distances are close: re-ranking 2k candidates recovers the float graph's recall
+# SQ bits -> re-rank k_factor that recovers the float graph's recall on SIFT1M
+HNSW_SQ_K_FACTORS = {8: 2, 4: 4}
 
 
 def read_vecs(path: Path, dtype) -> np.ndarray:
@@ -145,34 +146,32 @@ def run(dataset: str, max_queries: int | None, seed: int | None = None):
         print()
 
     links = (2 * HNSW_M + 1) * 4  # bottom-level links; upper levels add ~1/M of that
-    for sq8 in (False, True):
-        # As with PQ, the SQ8 graph is filled through a RefineIndex so one build
+    for bits in (0, 8, 4):
+        # As with PQ, an SQ graph is filled through a RefineIndex so one build
         # serves both the plain rows and the re-ranked ones.
         hnsw = qann.HNSWIndex(dim, M=HNSW_M, ef_construction=HNSW_EF_CONSTRUCTION, seed=seed)
         train_s = 0.0
-        if sq8:
-            hnsw.enable_sq8()
+        if bits:
+            hnsw.enable_sq(bits)
             start = time.perf_counter()
             hnsw.train(learn)
             train_s = time.perf_counter() - start
-        refine = qann.RefineIndex(hnsw) if sq8 else None
+        refine = qann.RefineIndex(hnsw, HNSW_SQ_K_FACTORS[bits]) if bits else None
         start = time.perf_counter()
         (refine or hnsw).add(base)
         add_s = time.perf_counter() - start
-        name = f"HNSW-M{HNSW_M}" + ("-SQ8" if sq8 else "")
+        name = f"HNSW-M{HNSW_M}" + (f"-SQ{bits}" if bits else "")
         print(f"{name}  (add {add_s:.1f}s)")
-        bytes_per_vec = (dim if sq8 else dim * 4) + links
+        bytes_per_vec = (dim * bits + 7) // 8 + links if bits else dim * 4 + links
         for ef in EF_SEARCHES:
             hnsw.ef_search = ef
             ids, qps = time_queries(hnsw, queries, K)
             record(name, f"ef={ef}", ids, qps, bytes_per_vec, train_s, add_s)
         if refine is not None:
-            for kf in HNSW_REFINE_K_FACTORS:
-                refine.k_factor = kf
-                for ef in EF_SEARCHES:
-                    hnsw.ef_search = ef
-                    ids, qps = time_queries(refine, queries, K)
-                    record(f"{name}+R{kf}", f"ef={ef}", ids, qps, bytes_per_vec + dim * 4, train_s, add_s)
+            for ef in EF_SEARCHES:
+                hnsw.ef_search = ef
+                ids, qps = time_queries(refine, queries, K)
+                record(f"{name}+R{refine.k_factor}", f"ef={ef}", ids, qps, bytes_per_vec + dim * 4, train_s, add_s)
         print()
 
     return rows
