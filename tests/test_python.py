@@ -558,6 +558,38 @@ def test_hnsw_via_make_index_and_bad_settings():
         index.ef_search = 0
 
 
+def test_hnsw_sq8_with_refine(tmp_path, data):
+    flat = qann.FlatIndex(32)
+    flat.add(data)
+    queries = data[:200] + 0.01
+    truth, _ = flat.batch_query(queries, 10)
+
+    base = qann.HNSWIndex(32, M=16, ef_construction=100, seed=1)
+    base.enable_sq8()
+    assert base.sq8
+    with pytest.raises(RuntimeError):   # not trained yet
+        base.add(data)
+    with pytest.raises(ValueError):
+        base.train(data[:, :16])
+    base.train(data)
+    refine = qann.RefineIndex(base, k_factor=4)
+    refine.add(data)
+    ids, dists = refine.batch_query(queries, 10)
+    assert np.mean([len(set(a) & set(b)) / 10 for a, b in zip(ids, truth)]) >= 0.97
+    np.testing.assert_allclose(dists[:, 0], ((queries - data[ids[:, 0]]) ** 2).sum(axis=1), rtol=1e-4)
+
+    refine.save(tmp_path / "sq8.qann")
+    loaded = qann.load(tmp_path / "sq8.qann")
+    assert loaded.base.sq8
+    assert_same_results(refine, loaded, queries[:50])
+
+    opts = qann.IndexOptions()
+    opts.hnsw_sq8 = True
+    assert qann.make_index(qann.IndexType.HNSW, 16, opts).sq8
+    with pytest.raises(RuntimeError):   # train() is only for SQ8
+        qann.HNSWIndex(32).train(data)
+
+
 def test_cosine_flat_matches_cosine_distance(data):
     index = qann.FlatIndex(32, metric=qann.Metric.Cosine)
     assert index.metric == qann.Metric.Cosine
@@ -626,3 +658,27 @@ def test_loads_files_from_0_1_0a10(name):
     ids, dists = index.batch_query(queries, 10)
     np.testing.assert_array_equal(ids, expected_ids)
     np.testing.assert_allclose(dists, expected_dists, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("name", ["flat", "hnsw"])
+def test_loads_files_from_0_1_0a11(name):
+    # Saved by qann 0.1.0a11 (format version 5): cosine flat and L2 HNSW, both with deletions.
+    index = qann.load(DATA / f"v5_{name}.qann")
+    queries = np.load(DATA / "v5_queries.npy")
+    expected_ids = np.load(DATA / f"v5_{name}_ids.npy")
+    expected_dists = np.load(DATA / f"v5_{name}_dists.npy")
+
+    assert index.metric == (qann.Metric.Cosine if name == "flat" else qann.Metric.L2)
+    ids, dists = index.batch_query(queries, 10)
+    np.testing.assert_array_equal(ids, expected_ids)
+    np.testing.assert_allclose(dists, expected_dists, rtol=1e-5, atol=1e-5)
+
+
+def test_loads_sq8_hnsw_saved_on_macos():
+    # Saved on macOS (format version 6): a RefineIndex over an SQ8 HNSWIndex,
+    # with deletions. Linux CI loading it checks the file is portable.
+    index = qann.load(DATA / "v6_hnsw_sq8.qann")
+    assert index.base.sq8
+    ids, dists = index.batch_query(np.load(DATA / "v6_queries.npy"), 10)
+    np.testing.assert_array_equal(ids, np.load(DATA / "v6_hnsw_sq8_ids.npy"))
+    np.testing.assert_allclose(dists, np.load(DATA / "v6_hnsw_sq8_dists.npy"), rtol=1e-5, atol=1e-5)

@@ -141,6 +141,18 @@
     "HNSW-M16 ef=32": 0.992,
     "HNSW-M16 ef=64": 0.994,
     "HNSW-M16 ef=128": 0.997,
-    "HNSW-M16 ef=256": 0.997
+    "HNSW-M16 ef=256": 0.997,
+    "HNSW-M16-SQ8 ef=10": 0.926,
+    "HNSW-M16-SQ8 ef=16": 0.959,
+    "HNSW-M16-SQ8 ef=32": 0.983,
+    "HNSW-M16-SQ8 ef=64": 0.987,
+    "HNSW-M16-SQ8 ef=128": 0.99,
+    "HNSW-M16-SQ8 ef=256": 0.99,
+    "HNSW-M16-SQ8+R2 ef=10": 0.982,
+    "HNSW-M16-SQ8+R2 ef=16": 0.982,
+    "HNSW-M16-SQ8+R2 ef=32": 0.992,
+    "HNSW-M16-SQ8+R2 ef=64": 0.996,
+    "HNSW-M16-SQ8+R2 ef=128": 0.999,
+    "HNSW-M16-SQ8+R2 ef=256": 0.999
   }
 }

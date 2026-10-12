@@ -28,6 +28,7 @@ struct IndexOptions {
     size_t hnsw_m = 16;            // HNSWIndex: neighbors per node (2x on level 0)
     size_t ef_construction = 200;  // HNSWIndex: beam width while inserting
     size_t ef_search = 64;         // HNSWIndex: beam width per query
+    bool hnsw_sq8 = false;         // HNSWIndex: store 8-bit codes (call train() before adding)
     bool custom_ids = false;   // all: add_batch() takes user ids
     Metric metric = Metric::L2; // all: how vectors are compared
 };
