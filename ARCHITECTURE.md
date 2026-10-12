@@ -60,6 +60,7 @@ vecengine/
 │   ├── bench_distance.cpp          # Google Benchmark distance kernels
 │   ├── bench_indexes.py            # recall vs QPS on SIFT
 │   ├── compare.py                  # ref vs working tree: recall, QPS, build times
+│   ├── hnsw_m_sweep.py             # HNSW recall and QPS by M on GloVe-100 and SIFT1M (issue #33)
 │   ├── profile_query.cpp           # per-section query time breakdown on SIFT1M (VECENGINE_PROFILE=ON)
 │   ├── fastscan_recall.py          # recall of 4-bit codes and uint8 tables on SIFT1M (fast-scan study)
 │   ├── fastscan_bench.cpp          # NEON fast-scan kernel vs the scalar ADC scan (ARM only)
@@ -430,6 +431,24 @@ Thread scaling (`set_num_threads`, same commit, every index built once on all co
 - Here IVF + fast-scan + re-ranking is the fastest path up to about 0.94 recall (0.897 at 18.6k vs HNSW's 0.884 at 8.7k), the opposite of SIFT1M. HNSW with `M = 16` reaches 0.95 only at `ef = 1024` (2.3k); a larger `M` is the usual fix for GloVe and was not swept.
 - SQ8 holds up on real embeddings: alone it loses 0.01 against the floats, and with `k_factor = 2` it matches them exactly at every `ef`.
 - SQ4 does not: 16 levels per dimension are coarse for GloVe's continuous values, so alone it levels off near 0.70 (0.86 on SIFT), and `k_factor = 4` stays 0.01 short. `k_factor = 8` matches the floats within 0.01, so use 8 for SQ4 on embeddings like these.
+
+**HNSW `M` sweep** (`benchmarks/hnsw_m_sweep.py`, issue #33): one float graph per (`M`, `ef_construction`) of (16, 200), (32, 300) and (48, 400), `ef_search` swept over 16 to 1024 (doubling), then the smallest `ef` reaching each recall target timed on all cores. The timings alternate between the three graphs in 3 rounds and keep each one's best, because load swung between about 40 and 390 during the run; a first run timed the configurations one after another and its QPS contradicted itself, so only its recall (identical) is used. Each `ef` step doubles, so a row can overshoot its target, which understates the gaps. SQ8 + R2 matched the float recall at every `M` and `ef` on both datasets (first run).
+
+| GloVe-100 | build | link bytes / vec | QPS at 0.90 | 0.95 | 0.99 |
+|---|---|---|---|---|---|
+| `M = 16` | 121 s | 132 | 4.4k (`ef` 512) | 2.4k (`ef` 1024) | not reached |
+| `M = 32` | 384 s | 260 | 5.1k (`ef` 256) | 2.7k (`ef` 512) | not reached |
+| `M = 48` | 625 s | 388 | 6.7k (`ef` 128) | 3.7k (`ef` 256) | 1.0k (`ef` 1024) |
+
+| SIFT1M | build | link bytes / vec | QPS at 0.90 | 0.95 | 0.99 |
+|---|---|---|---|---|---|
+| `M = 16` | 78 s | 132 | 29.6k (`ef` 64) | 30.1k (`ef` 64) | 9.6k (`ef` 256) |
+| `M = 32` | 169 s | 260 | 39.9k (`ef` 32) | 23.8k (`ef` 64) | 12.5k (`ef` 128) |
+| `M = 48` | 246 s | 388 | 34.2k (`ef` 32) | 36.4k (`ef` 32) | 11.2k (`ef` 128) |
+
+- On GloVe a larger `M` is clearly worth it: `M = 48` is about 1.5× `M = 16` at 0.90 and 0.95, and the only one to reach 0.99 within `ef = 1024`. Recall at `ef = 256` goes 0.884 / 0.941 / 0.962. The cost is a 5× longer build and 256 more bytes of links per vector (more than half the 400-byte vector).
+- On SIFT `M = 16` is enough up to 0.95 (the differences there are within one `ef` step); at 0.99 `M = 32` is 1.3× faster and `M = 48` adds nothing.
+- So the default stays `M = 16` (fast builds, right for SIFT-like data), and the README advises `M = 32` to 48 for high-dimensional embeddings like GloVe. Even at `M = 48`, IVF + PQ50×4 fast-scan + R16 stays ahead on GloVe up to 0.94 (18.6k at 0.897 in the earlier run, against 6.7k at 0.925 here, though from runs at different load).
 
 **Build times** on all cores (this run, busy machine): IVF trains in 2.3 s and adds 1M vectors in 1.1 s (`add_batch`); IVF + PQ16 trains in 5.2 s and adds in 4.0 s; PQ64×4 fast-scan, the fastest PQ build, 3.4 s and 1.9 s; HNSW builds in 50 to 75 s. On an idle machine earlier, IVF + PQ16 trained in 3.4 s (8.6 s on one thread) and added in 3.0 s. Before `assign_nearest`, IVF training took 37 s and IVF + PQ16 55 s.
 

@@ -124,6 +124,7 @@ On SIFT1M (1M vectors), `M=16, ef_construction=200` reaches recall@10 0.960 at `
 
 - **Deleting** marks vectors deleted; queries still route through them, so the graph stays connected, but never return them. `compact()` rebuilds the graph from the remaining vectors, which takes about as long as building it again, so call it after many deletes rather than after each one.
 - **Builds are parallel,** so the graph differs slightly from run to run. With `seed` and `qann.set_num_threads(1)`, the build is reproducible.
+- **Choosing `M`:** the default 16 suits data like SIFT. For high-dimensional embeddings (word or sentence vectors), use `M=32` to `48` with `ef_construction=300` to `400`: on GloVe-100, `M=48` answered 1.5x more queries per second than `M=16` at 0.90 and 0.95 recall, and only `M=48` reached 0.99. It builds about 5x slower and adds 256 bytes of links per vector.
 
 **Scalar quantization (compressed HNSW).** `enable_sq(8)` maps each dimension's trained range onto 256 evenly spaced values, so a vector takes `dim` bytes instead of `4 * dim` (on SIFT, 128 instead of 512); `enable_sq(4)` uses 16 values packed two per byte (64 bytes on SIFT). Distances become approximate, so wrap the index in a `RefineIndex` to re-rank with exact ones: `k_factor=2` is enough for 8 bits; 4 bits needs 4 on SIFT and 8 on GloVe word embeddings. Values outside the training sample's range are clamped, so train on a representative sample (or on the vectors themselves).
 
