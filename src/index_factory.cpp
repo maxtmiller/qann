@@ -1,6 +1,7 @@
 #include "vecengine/index_factory.hpp"
 #include "vecengine/flat_index.hpp"
 #include "vecengine/ivf_index.hpp"
+#include "vecengine/hnsw_index.hpp"
 #include "vecengine/refine_index.hpp"
 #include "serialize.hpp"
 
@@ -20,6 +21,11 @@ std::unique_ptr<Index> make_index(IndexType type, size_t dim, const IndexOptions
             if (opts.pq_subspaces > 0) idx->enable_pq(opts.pq_subspaces, opts.pq_centroids);
             return idx;
         }
+        case IndexType::HNSW: {
+            auto idx = std::make_unique<HNSWIndex>(dim, opts.hnsw_m, opts.ef_construction, opts.custom_ids);
+            idx->set_ef_search(opts.ef_search);
+            return idx;
+        }
     }
     throw std::invalid_argument("unknown IndexType");
 }
@@ -30,6 +36,7 @@ std::unique_ptr<Index> load_index(std::istream& in) {
         case detail::IndexKind::Flat:   return FlatIndex::load_body(in, header.version);
         case detail::IndexKind::IVF:    return IVFIndex::load_body(in, header.version);
         case detail::IndexKind::Refine: return RefineIndex::load_body(in, header.version);
+        case detail::IndexKind::HNSW:   return HNSWIndex::load_body(in, header.version);
     }
     throw std::runtime_error("unknown index kind");
 }

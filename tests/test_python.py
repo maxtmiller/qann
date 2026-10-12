@@ -230,6 +230,8 @@ def make_custom_index(kind, data, ids):
         index = qann.IVFIndex(32, nlist=100, nprobe=100, custom_ids=True)
         index.enable_pq(8)
         index.train(data, seed=1)
+    elif kind == "hnsw":
+        index = qann.HNSWIndex(32, custom_ids=True, seed=1)
     else:
         base = qann.IVFIndex(32, nlist=100, nprobe=100)
         base.enable_pq(8)
@@ -239,13 +241,13 @@ def make_custom_index(kind, data, ids):
     return index
 
 
-@pytest.mark.parametrize("kind", ["flat", "ivf", "refine"])
+@pytest.mark.parametrize("kind", ["flat", "ivf", "refine", "hnsw"])
 def test_custom_ids_and_remove(data, kind):
     ids = np.arange(len(data)) * 10 + 7
     index = make_custom_index(kind, data, ids)
 
     found, _ = index.batch_query(data[:20], 1)
-    if kind != "ivf":  # exact distances: each vector finds itself
+    if kind in ("flat", "refine"):  # exact search over exact distances: each vector finds itself
         np.testing.assert_array_equal(found[:, 0], ids[:20])
     assert np.isin(found, ids).all()
 
@@ -501,3 +503,56 @@ def test_fast_scan_rejects_bad_settings():
     ivf.enable_pq(16, fast_scan=True)
     with pytest.raises(ValueError):
         ivf.pq_distance = qann.PQDistance.SDC
+
+
+def test_hnsw_finds_neighbors(data):
+    index = qann.HNSWIndex(32, M=16, ef_construction=100, seed=1)
+    index.add(data)
+    assert index.size() == len(data)
+    assert (index.M, index.ef_construction, index.ef_search) == (16, 100, 64)
+
+    flat = qann.FlatIndex(32)
+    flat.add(data)
+    queries = data[:200] + 0.01
+    truth, _ = flat.batch_query(queries, 10)
+    for ef in (16, 128):
+        index.ef_search = ef
+        ids, dists = index.batch_query(queries, 10)
+        assert ids.shape == (200, 10)
+        assert np.all(np.diff(dists, axis=1) >= 0)
+        recall = np.mean([len(set(a) & set(b)) / 10 for a, b in zip(ids, truth)])
+        assert recall >= (0.9 if ef == 16 else 0.98)
+
+
+def test_hnsw_save_load_compact(tmp_path, data):
+    index = qann.HNSWIndex(32, M=12, ef_construction=80, seed=1)
+    index.add(data)
+    index.ef_search = 40
+    index.remove(range(0, len(data), 4))
+    index.save(tmp_path / "hnsw.qann")
+
+    loaded = qann.load(tmp_path / "hnsw.qann")
+    assert isinstance(loaded, qann.HNSWIndex)
+    assert (loaded.M, loaded.ef_construction, loaded.ef_search) == (12, 80, 40)
+    assert_same_results(index, loaded, data[:50])
+
+    assert loaded.compact() == len(range(0, len(data), 4))
+    assert loaded.size() == len(data) - len(range(0, len(data), 4))
+    ids, _ = loaded.batch_query(data[1:200:4], 1)   # live vectors find themselves, by their old ids
+    assert np.mean(ids[:, 0] == np.arange(1, 200, 4)) >= 0.98
+    assert not np.isin(loaded.batch_query(data[:50], 10)[0], np.arange(0, len(data), 4)).any()
+
+
+def test_hnsw_via_make_index_and_bad_settings():
+    opts = qann.IndexOptions()
+    opts.hnsw_m = 8
+    opts.ef_construction = 40
+    opts.ef_search = 20
+    index = qann.make_index(qann.IndexType.HNSW, 16, opts)
+    assert isinstance(index, qann.HNSWIndex)
+    assert (index.M, index.ef_construction, index.ef_search) == (8, 40, 20)
+
+    with pytest.raises(ValueError):
+        qann.HNSWIndex(16, M=1)
+    with pytest.raises(ValueError):
+        index.ef_search = 0

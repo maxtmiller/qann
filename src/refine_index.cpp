@@ -2,6 +2,7 @@
 #include "vecengine/distance.hpp"
 #include "vecengine/flat_index.hpp"
 #include "vecengine/ivf_index.hpp"
+#include "vecengine/hnsw_index.hpp"
 #include "parallel.hpp"
 #include "profile.hpp"
 #include "serialize.hpp"
@@ -164,7 +165,8 @@ std::unique_ptr<RefineIndex> RefineIndex::load_body(std::istream& in, uint32_t v
     switch (header.kind) {
         case IndexKind::Flat: base = FlatIndex::load_body(in, header.version); break;
         case IndexKind::IVF:  base = IVFIndex::load_body(in, header.version); break;
-        default: throw std::runtime_error("corrupt file: RefineIndex base must be Flat or IVF");
+        case IndexKind::HNSW: base = HNSWIndex::load_body(in, header.version); break;
+        default: throw std::runtime_error("corrupt file: RefineIndex base must be Flat, IVF or HNSW");
     }
     if (!base->ids_are_slots())
         throw std::runtime_error("corrupt file: RefineIndex base ids must equal its slots");

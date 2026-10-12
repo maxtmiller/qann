@@ -28,6 +28,7 @@ enum class IndexKind : uint8_t {
     Flat = 1,
     IVF = 2,
     Refine = 3,
+    HNSW = 4,
 };
 
 // Writes a trivially copyable value as raw bytes.
@@ -110,6 +111,8 @@ inline Header read_header(std::istream& in) {
             return {IndexKind::IVF, version};
         case static_cast<uint8_t>(IndexKind::Refine):
             return {IndexKind::Refine, version};
+        case static_cast<uint8_t>(IndexKind::HNSW):
+            return {IndexKind::HNSW, version};
         default:
             throw std::runtime_error("unknown index kind");
     }
