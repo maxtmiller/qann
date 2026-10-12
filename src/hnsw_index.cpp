@@ -7,7 +7,6 @@
 #include <cassert>
 #include <cmath>
 #include <random>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <queue>
@@ -47,7 +46,7 @@ thread_local VisitedTags t_visited;
 
 HNSWIndex::HNSWIndex(size_t dim, size_t M, size_t ef_construction, bool custom_ids, std::optional<uint32_t> seed, Metric metric)
     : Index(metric), dim_(dim), M_(M), M0_(2 * M), ef_construction_(ef_construction),
-      rng_(seed ? *seed : std::random_device{}()), id_map_(custom_ids) {
+      rng_state_(seed ? *seed : std::random_device{}()), id_map_(custom_ids) {
     if (dim == 0) throw std::invalid_argument("dim must be >= 1");
     if (M < 2) throw std::invalid_argument("M must be >= 2");
     if (ef_construction == 0) throw std::invalid_argument("ef_construction must be >= 1");
@@ -138,11 +137,8 @@ void HNSWIndex::save(std::ostream& out) const {
     write_pod(out, entry_);
 
     // the generator's state, so adds after a load draw the same levels as
-    // adds without the save; the standard fixes this text format
-    std::ostringstream rng_state;
-    rng_state << rng_;
-    const std::string text = rng_state.str();
-    write_vec(out, vector<char>(text.begin(), text.end()));
+    // adds without the save
+    write_pod(out, rng_state_);
 
     write_vec(out, data_);
     write_vec(out, levels_);
@@ -172,10 +168,16 @@ std::unique_ptr<HNSWIndex> HNSWIndex::load_body(std::istream& in, uint32_t versi
     auto index = std::make_unique<HNSWIndex>(dim, M, ef_construction);
     index->set_ef_search(ef_search);
 
-    const auto text = read_vec<char>(in, 1 << 16);
-    std::istringstream rng_state(std::string(text.begin(), text.end()));
-    rng_state >> index->rng_;
-    if (!rng_state) throw corrupt("invalid HNSWIndex generator state");
+    if (version >= 5) {
+        index->rng_state_ = read_pod<uint64_t>(in);
+    } else {
+        // version 4 stored std::mt19937's text form, which isn't portable;
+        // continue from a hash of it (FNV-1a) so loading works everywhere
+        const auto text = read_vec<char>(in, 1 << 16);
+        uint64_t h = 0xCBF29CE484222325ull;
+        for (char c : text) h = (h ^ static_cast<unsigned char>(c)) * 0x100000001B3ull;
+        index->rng_state_ = h;
+    }
 
     index->data_ = read_vec<float>(in, slots * dim);
     index->levels_ = read_vec<uint8_t>(in, slots);
@@ -425,7 +427,7 @@ void HNSWIndex::set_own_neighbors(uint32_t slot, int level, const vector<uint32_
 
 int HNSWIndex::random_level() {
     // u from the raw 32-bit draw, so the same seed gives the same levels on every platform
-    const double u = (static_cast<double>(rng_()) + 1.0) / 4294967296.0;
+    const double u = (static_cast<double>(next_random()) + 1.0) / 4294967296.0;
     return std::min(static_cast<int>(-std::log(u) * level_mult_), 255);
 }
 

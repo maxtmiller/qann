@@ -155,7 +155,17 @@ private:
     size_t ef_construction_;
     size_t ef_search_ = 64;
     double level_mult_;        // 1 / ln(M)
-    std::mt19937 rng_;
+
+    // Level draws come from splitmix64, whose whole state is this one number,
+    // so files store it as 8 bytes. (std::mt19937's text form differs between
+    // libc++ and libstdc++, which made 0.1.0a10 HNSW files platform-bound.)
+    uint64_t rng_state_;
+    uint32_t next_random() noexcept {
+        uint64_t z = (rng_state_ += 0x9E3779B97F4A7C15ull);
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+        return static_cast<uint32_t>((z ^ (z >> 31)) >> 32);
+    }
 
     vector<float> data_;       // row-major, one row per slot
     vector<uint32_t> level0_;  // per slot, M0_ + 1 entries: count, then neighbors
