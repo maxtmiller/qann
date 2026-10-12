@@ -69,6 +69,8 @@ Partitions vectors into `nlist` clusters with k-means and, at query time, scans 
 | `train(data, max_iters=25, seed=None)` | Learn the cluster centroids from a sample of at least `nlist` vectors. Call once, before `add`. Pass `seed` for reproducible results. |
 | `enable_pq(num_subspaces, centroids_per_subspace=None, *, fast_scan=False)` | Compress stored vectors with product quantization. Call before `train`. `centroids_per_subspace` defaults to 256 (one byte per slice), or 16 with `fast_scan`; see [Fast-scan](#fast-scan). |
 | `fast_scan` | Read-only property: whether `enable_pq(..., fast_scan=True)` was used. |
+| `enable_sq(bits=8)` | Store each vector as scalar codes of 8 or 4 bits per dimension instead of floats (see [SQ](#sq)). Call before `train`; not together with `enable_pq`. |
+| `sq_bits` | Read-only property: 8 or 4 after `enable_sq()`, else 0. |
 | `nprobe` | Property: clusters scanned per query. Can be changed at any time; higher means better recall and slower queries. |
 | `pq_distance` | Property: how PQ codes are scored, `qann.PQDistance.ADC` (default, more accurate) or `qann.PQDistance.SDC`. |
 | `precomputed_tables` | Property: whether ADC queries use lookup tables precomputed at train time, which makes PQ queries faster. On by default; reads `True` once the tables exist (PQ enabled, trained, and `nlist * num_subspaces * centroids_per_subspace * 4` bytes within 256 MB). Set to `False` to free them. |
@@ -100,6 +102,20 @@ refine.add(x)
 - On SIFT1M with re-ranking (`k_factor=16`), 64 subspaces with fast-scan match 32 regular subspaces (recall@10 0.931 at `nprobe=16`, 0.995 at `nprobe=64`) and beat 16 regular ones, while scanning several times faster.
 - Without a `RefineIndex`, recall is lower than regular PQ at the same memory, and the returned distances are approximate: the lookup tables are rounded to 6 bits.
 - `num_subspaces` must be even and at most 256, `centroids_per_subspace` must be 16 (the default with `fast_scan`), and `pq_distance` stays `ADC`: setting `SDC` raises `ValueError`.
+
+
+#### SQ
+
+`enable_sq(8)` stores each vector as one byte per dimension (on SIFT, 128 bytes instead of 512) and `enable_sq(4)` as half a byte; `train` also learns each dimension's range. Unlike PQ there are no codebooks, and 8 bits loses little recall, so it needs no `RefineIndex`: it is the IVF option for high recall without keeping the raw vectors in memory. 4 bits loses more and should be wrapped in a `RefineIndex(k_factor=8)`.
+
+```python
+ivf = qann.IVFIndex(128, nlist=1024, nprobe=16)
+ivf.enable_sq(8)
+ivf.train(x, seed=1)
+ivf.add(x)
+```
+
+On SIFT1M (all cores, busy machine), 8 bits reached recall@10 0.925 at `nprobe=16` and 0.985 at 64 (floats: 0.932 and 0.995) at 1.3 to 1.4x the queries per second of float lists, in a quarter of the memory; 4 bits + `RefineIndex(k_factor=8)` matched the floats' recall exactly at the same speed-up. On one thread the gain mostly disappears: SQ helps because the float scan is limited by memory bandwidth. For the fastest queries when raw vectors fit in memory, fast-scan PQ + `RefineIndex` is still quicker, and HNSW-SQ8 is faster at the same recall for about twice the memory.
 
 ### `HNSWIndex(dim, M=16, ef_construction=200, *, custom_ids=False, seed=None)`
 
@@ -155,7 +171,7 @@ ivf = qann.make_index(qann.IndexType.IVF, 128, opts)
 ivf.train(x)
 ```
 
-`IndexType` is `Flat`, `IVF` or `HNSW`. `IndexOptions` fields and defaults: `metric` (`Metric.L2`), plus `capacity` (Flat initial reserve, 1024), `nlist` (100), `nprobe` (10), `pq_subspaces` (0, meaning no PQ) and `pq_centroids` (256) for IVF, and `hnsw_m` (16), `ef_construction` (200), `ef_search` (64) and `hnsw_sq_bits` (0 for floats; 8 or 4 calls `enable_sq()`) for HNSW.
+`IndexType` is `Flat`, `IVF` or `HNSW`. `IndexOptions` fields and defaults: `metric` (`Metric.L2`), plus `capacity` (Flat initial reserve, 1024), `nlist` (100), `nprobe` (10), `pq_subspaces` (0, meaning no PQ), `pq_centroids` (256) and `ivf_sq_bits` (0; 8 or 4 calls `enable_sq()`) for IVF, and `hnsw_m` (16), `ef_construction` (200), `ef_search` (64) and `hnsw_sq_bits` (0 for floats; 8 or 4 calls `enable_sq()`) for HNSW.
 
 ## Metrics
 
@@ -206,7 +222,7 @@ ids, dists = index.batch_query(queries, 10)
 - **A `RefineIndex` file contains its base index**, so loading one restores both. Tune the base through `loaded.base`, e.g. `loaded.base.nprobe = 32`.
 - **Saving is safe to interrupt:** the file is written next to the target as `<path>.tmp` and renamed into place when complete, so a failed save never leaves a partial file or destroys an existing one.
 - **Bad files raise `RuntimeError`:** a missing, truncated or corrupted file, or one that isn't a QaNN index, is rejected instead of loading garbage.
-- **Files are versioned.** Newer releases keep loading files saved by older ones (files from 0.1.0a4, 0.1.0a6, 0.1.0a7, 0.1.0a10 and 0.1.0a11 still load). A file saved by a newer release than the one loading it raises `RuntimeError` rather than being misread.
+- **Files are versioned.** Newer releases keep loading files saved by older ones (files from 0.1.0a4, 0.1.0a6, 0.1.0a7, 0.1.0a10, 0.1.0a11 and 0.1.0a12 still load). A file saved by a newer release than the one loading it raises `RuntimeError` rather than being misread.
 
 `PQCodebook` on its own can't be saved yet; save the `IVFIndex` that uses it instead.
 

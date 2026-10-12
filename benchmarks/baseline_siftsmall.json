@@ -165,6 +165,27 @@
     "HNSW-M16-SQ4+R4 ef=32": 0.995,
     "HNSW-M16-SQ4+R4 ef=64": 0.999,
     "HNSW-M16-SQ4+R4 ef=128": 0.999,
-    "HNSW-M16-SQ4+R4 ef=256": 0.999
+    "HNSW-M16-SQ4+R4 ef=256": 0.999,
+    "IVF-SQ8 nprobe=1": 0.493,
+    "IVF-SQ8 nprobe=2": 0.684,
+    "IVF-SQ8 nprobe=4": 0.829,
+    "IVF-SQ8 nprobe=8": 0.946,
+    "IVF-SQ8 nprobe=16": 0.982,
+    "IVF-SQ8 nprobe=32": 0.991,
+    "IVF-SQ8 nprobe=64": 0.991,
+    "IVF-SQ4 nprobe=1": 0.482,
+    "IVF-SQ4 nprobe=2": 0.668,
+    "IVF-SQ4 nprobe=4": 0.789,
+    "IVF-SQ4 nprobe=8": 0.882,
+    "IVF-SQ4 nprobe=16": 0.914,
+    "IVF-SQ4 nprobe=32": 0.916,
+    "IVF-SQ4 nprobe=64": 0.916,
+    "IVF-SQ4+R8 nprobe=1": 0.493,
+    "IVF-SQ4+R8 nprobe=2": 0.685,
+    "IVF-SQ4+R8 nprobe=4": 0.831,
+    "IVF-SQ4+R8 nprobe=8": 0.951,
+    "IVF-SQ4+R8 nprobe=16": 0.991,
+    "IVF-SQ4+R8 nprobe=32": 1.0,
+    "IVF-SQ4+R8 nprobe=64": 1.0
   }
 }

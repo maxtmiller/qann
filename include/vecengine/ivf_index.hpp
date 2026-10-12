@@ -3,6 +3,7 @@
 #include "vecengine/index.hpp"
 #include "vecengine/pq.hpp"
 #include "vecengine/id_map.hpp"
+#include "vecengine/sq.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -23,13 +24,15 @@ using std::span;
 // The vectors assigned to one coarse cluster.
 struct InvertedList {
     vector<uint32_t> ids; // slot of each vector; id_map_ maps slots to user ids
-    vector<float> vecs; // populated when PQ is disabled
-    vector<uint8_t> codes; // populated when PQ is enabled: num_subspaces bytes per vector, encodes (vec - its cluster's coarse centroid)
+    vector<float> vecs; // populated without PQ or SQ
+    vector<uint8_t> codes; // with PQ: num_subspaces bytes per vector, encoding (vec - its cluster's coarse centroid);
+                           // with SQ: each vector's SQ codes (detail::SQ::code_bytes() per vector)
 };
 
 // Inverted-file index: k-means splits vectors into nlist clusters, and a
 // query scans only the nprobe clusters nearest to it. Optionally stores PQ
-// codes of each vector's residual instead of the raw floats.
+// codes of each vector's residual, or SQ codes of each vector, instead of the
+// raw floats.
 class IVFIndex : public Index {
 public:
     // nlist must be in [100, 65535] and nprobe in [1, nlist]; throws
@@ -40,7 +43,18 @@ public:
     // Enables PQ compression of residuals (vec - assigned coarse centroid).
     // Must be called before train()/add(). Once enabled, add() stores codes
     // in InvertedList::codes instead of raw floats in InvertedList::vecs.
+    // Throws std::logic_error after enable_sq().
     void enable_pq(size_t num_subspaces, size_t centroids_per_subspace = 256, bool fast_scan = false);
+
+    // Stores each vector as scalar codes of `bits` (4 or 8; std::invalid_argument
+    // otherwise) per dimension instead of raw floats: 8x or 4x less list
+    // memory, approximate distances. train() then also learns each
+    // dimension's range from its sample. Must be called before train()/add(),
+    // and not together with enable_pq(); throws std::logic_error otherwise.
+    void enable_sq(int bits = 8);
+
+    // Bits per dimension of the SQ codes: 4 or 8, or 0 without enable_sq().
+    int sq_bits() const noexcept { return sq_bits_; }
 
     // Clusters scanned per query. set_nprobe throws std::invalid_argument
     // unless 1 <= nprobe <= nlist; it can change at any time.
@@ -72,7 +86,7 @@ public:
     size_t remove(span<const int64_t> ids) override;
     size_t compact() override;
 
-    // Learns the nlist coarse centroids (and the PQ codebook, if enabled) from
+    // Learns the nlist coarse centroids (and the PQ codebook or SQ ranges, if enabled) from
     // num_vectors sample vectors (at least nlist). Call once, before any add.
     // A seed makes training reproducible: coarse k-means uses seed, the PQ
     // codebook (if enabled) uses seed + 1 onward.
@@ -112,6 +126,9 @@ private:
     // Whether enable_pq() was called.
     bool pq_enabled() const noexcept { return pq_ != nullptr; }
 
+    // Bytes of one vector's SQ codes (with SQ enabled).
+    size_t sq_code_bytes() const noexcept { return sq_bits_ == 8 ? dim_ : (dim_ + 1) / 2; }
+
     // Fills precomputed_ with PQCodebook::compute_list_term for every coarse
     // centroid, or leaves it empty if disabled, untrained, without PQ or over
     // the size cap. Called by train(), load_body() and set_precomputed_tables().
@@ -144,6 +161,8 @@ private:
     vector<float> coarse_centroids_; // coarse centroid vectors
     std::unordered_map<uint16_t,InvertedList> data_; // map of coarse centroid ID to inverted list
     std::unique_ptr<PQCodebook> pq_; // pointer to PQ LUT if using PQ
+    int sq_bits_ = 0; // 0 (no SQ), 4 or 8
+    detail::SQ sq_; // SQ ranges, learned by train() when SQ is enabled
     PQDistance pq_distance_ = PQDistance::ADC; // type of quantization used
     bool use_precomputed_ = true; // set_precomputed_tables() setting
     vector<float> precomputed_; // term B: nlist * m * K floats, list-major; empty when not in use

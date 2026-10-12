@@ -69,12 +69,21 @@ void IVFIndex::build_precomputed() {
 void IVFIndex::enable_pq(size_t num_subspaces, size_t centroids_per_subspace, bool fast_scan) {
     if (id_map_.slots() > 0 || trained_)
         throw std::logic_error("enable_pq must be called before train()/add()");
+    if (sq_bits_) throw std::logic_error("enable_pq cannot be combined with enable_sq");
     if (fast_scan && (centroids_per_subspace != 16 || num_subspaces % 2 != 0 || num_subspaces > 256))
         throw std::invalid_argument("fast_scan needs 16 centroids per subspace and an even num_subspaces <= 256");
     if (fast_scan && pq_distance_ == PQDistance::SDC)
         throw std::invalid_argument("cannot use SDC with fast-scan");
     fast_scan_= fast_scan;
     pq_ = std::make_unique<PQCodebook>(dim_, num_subspaces, centroids_per_subspace);
+}
+
+void IVFIndex::enable_sq(int bits) {
+    if (bits != 4 && bits != 8) throw std::invalid_argument("bits must be 4 or 8");
+    if (id_map_.slots() > 0 || trained_) throw std::logic_error("enable_sq must be called before train()/add()");
+    if (pq_enabled()) throw std::logic_error("enable_sq cannot be combined with enable_pq");
+    sq_bits_ = bits;
+    sq_.bits = bits;
 }
 
 void IVFIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) {
@@ -92,7 +101,10 @@ void IVFIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* i
     
     vector<uint8_t> codes(use_pq ? n * code_bytes : 0);
 
-    if (use_pq) {
+    if (sq_bits_) {
+        codes.resize(n * sq_code_bytes());
+        detail::parallel_for(n, [&](size_t i) { sq_.encode(vecs.data() + i * dim_, codes.data() + i * sq_code_bytes()); });
+    } else if (use_pq) {
         detail::parallel_for(n, [&](size_t i) {
             const float* src_vec = vecs.data() + i * dim_;
             const float* centroid = coarse_centroids_.data() + assign[i] * dim_;
@@ -109,7 +121,10 @@ void IVFIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* i
         InvertedList& list = data_[static_cast<uint16_t>(assign[i])];
         list.ids.push_back(first_slot + static_cast<uint32_t>(i));
 
-        if (use_pq) {
+        if (sq_bits_) {
+            const size_t w = sq_code_bytes();
+            list.codes.insert(list.codes.end(), codes.begin() + i * w, codes.begin() + (i + 1) * w);
+        } else if (use_pq) {
             if (fast_scan_) {
             const size_t m = pq_->num_subspaces(), pos = list.ids.size() - 1;
             if (pos % 32 == 0) list.codes.resize(list.codes.size() + m * 16, 0);
@@ -268,6 +283,14 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<const Probe> probes,
                 top.push(dist, id_map_.label(list.ids[j]));
         };
 
+        if (sq_bits_) {
+            VECENGINE_PROF_START(t_raw);
+            const size_t w = sq_code_bytes();
+            for (size_t j = 0; j < listSize; ++j) push(sq_.distance(vec.data(), list.codes.data() + j * w), j);
+            VECENGINE_PROF_STOP(t_raw, kProfRawScan);
+            continue;
+        }
+
         if (!pq_enabled()) {
             VECENGINE_PROF_START(t_raw);
             for (size_t j = 0; j < listSize; ++j) {
@@ -364,7 +387,8 @@ size_t IVFIndex::compact_impl(bool keep_ids) {
 }
 
 void IVFIndex::compact_storage(const vector<uint32_t>& remap) {
-    size_t m = pq_enabled() ? pq_->num_subspaces() : 0;
+    // bytes per vector in list.codes (PQ without fast-scan, or SQ)
+    const size_t m = pq_enabled() ? pq_->num_subspaces() : sq_bits_ ? sq_code_bytes() : 0;
     for (uint16_t i = 0; i < nlist_; ++i) {
         size_t write_slot = 0;
 
@@ -384,7 +408,7 @@ void IVFIndex::compact_storage(const vector<uint32_t>& remap) {
                     uint8_t* dst = list.codes.data() + (write_slot / detail::kFsBlock) * detail::fs_block_bytes(m);
                     for (size_t s = 0; s < m; ++s)
                         detail::fs_set(dst, write_slot % detail::kFsBlock, s, detail::fs_get(src, j % detail::kFsBlock, s));
-                } else if (pq_enabled()) {
+                } else if (m > 0) {
                     uint8_t* src = list.codes.data() + j * m;
                     uint8_t* dst = list.codes.data() + write_slot * m;
                     std::copy_n(src, m, dst);
@@ -400,7 +424,7 @@ void IVFIndex::compact_storage(const vector<uint32_t>& remap) {
 
         list.ids.resize(write_slot);
         list.ids.shrink_to_fit();
-        if (pq_enabled()) {
+        if (m > 0) {
             const size_t blocks = (write_slot + detail::kFsBlock - 1) / detail::kFsBlock;
             list.codes.resize(fast_scan_ ? blocks * detail::fs_block_bytes(m) : write_slot * m);
             list.codes.shrink_to_fit();
@@ -442,6 +466,7 @@ void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_i
 
         pq_->train(residuals, num_vectors, max_iters, seed ? std::optional<uint32_t>(*seed + 1) : std::nullopt);
     }
+    if (sq_bits_) sq_.train(vectors, num_vectors, dim_);
     trained_ = true;
     build_precomputed();
 }
@@ -462,13 +487,19 @@ void IVFIndex::save(std::ostream& out) const {
         pq_->save(out);
         write_pod(out, static_cast<uint8_t>(fast_scan_));
     }
+    // version 7: SQ bits per dimension (0 = off), then the ranges (empty until trained)
+    write_pod(out, static_cast<uint8_t>(sq_bits_));
+    if (sq_bits_) {
+        write_vec(out, sq_.vmin);
+        write_vec(out, sq_.step);
+    }
 
     static const InvertedList empty;
     for (uint16_t i = 0; i < nlist_; ++i) {
         auto it = data_.find(i);
         const InvertedList& list = it == data_.end() ? empty : it->second;
         write_vec(out, list.ids);
-        if (pq_) write_vec(out, list.codes); else write_vec(out, list.vecs);
+        if (pq_ || sq_bits_) write_vec(out, list.codes); else write_vec(out, list.vecs);
     }
     id_map_.save(out);
     write_pod(out, static_cast<uint8_t>(use_precomputed_));
@@ -512,13 +543,31 @@ std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version
         }
     }
 
+    if (version >= 7) {
+        const auto bits = read_pod<uint8_t>(in);
+        if ((bits != 0 && bits != 4 && bits != 8) || (bits && index->pq_))
+            throw std::runtime_error("corrupt file: invalid IVFIndex SQ settings");
+        if (bits) {
+            index->enable_sq(bits);
+            index->sq_.vmin = read_vec<float>(in, dim);
+            index->sq_.step = read_vec<float>(in, dim);
+            const size_t ranges = trained ? dim : 0;
+            if (index->sq_.vmin.size() != ranges || index->sq_.step.size() != ranges)
+                throw std::runtime_error("corrupt file: IVF SQ range length mismatch");
+        }
+    }
+
     const size_t num_subspaces = index->pq_ ? index->pq_->num_subspaces() : 0;
     uint64_t seen = 0;
     for (size_t i = 0; i < n_list; ++i) {
         InvertedList list;
         list.ids = read_vec<uint32_t>(in, n_total);
 
-        if (index->pq_) {
+        if (index->sq_bits_) {
+            const uint64_t expected = list.ids.size() * index->sq_code_bytes();
+            list.codes = read_vec<uint8_t>(in, expected);
+            if (list.codes.size() != expected) throw std::runtime_error("corrupt file: IVF code length mismatch");
+        } else if (index->pq_) {
             const uint64_t blocks = (list.ids.size() + detail::kFsBlock - 1) / detail::kFsBlock;
             const uint64_t expected = index->fast_scan_ ? blocks * detail::fs_block_bytes(num_subspaces)
                                                         : list.ids.size() * num_subspaces;

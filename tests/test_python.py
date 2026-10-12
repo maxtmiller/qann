@@ -691,3 +691,56 @@ def test_loads_sq_hnsw_saved_on_macos(bits):
     ids, dists = index.batch_query(np.load(DATA / "v6_queries.npy"), 10)
     np.testing.assert_array_equal(ids, np.load(DATA / f"v6_hnsw_sq{bits}_ids.npy"))
     np.testing.assert_allclose(dists, np.load(DATA / f"v6_hnsw_sq{bits}_dists.npy"), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("bits", [8, 4])
+def test_ivf_sq(tmp_path, data, bits):
+    flat = qann.FlatIndex(32)
+    flat.add(data)
+    queries = data[:200] + 0.01
+    truth, _ = flat.batch_query(queries, 10)
+
+    floats = qann.IVFIndex(32, nlist=100, nprobe=20)
+    floats.train(data, seed=1)
+    floats.add(data)
+    float_ids, _ = floats.batch_query(queries, 10)
+    float_recall = np.mean([len(set(a) & set(b)) / 10 for a, b in zip(float_ids, truth)])
+
+    ivf = qann.IVFIndex(32, nlist=100, nprobe=20)
+    assert ivf.sq_bits == 0
+    ivf.enable_sq(bits)
+    assert ivf.sq_bits == bits
+    with pytest.raises(RuntimeError):   # not with PQ
+        ivf.enable_pq(8)
+    with pytest.raises(RuntimeError):   # not trained yet
+        ivf.add(data)
+    ivf.train(data, seed=1)
+    index = qann.RefineIndex(ivf, k_factor=8) if bits == 4 else ivf
+    index.add(data)
+    ids, _ = index.batch_query(queries, 10)
+    assert np.mean([len(set(a) & set(b)) / 10 for a, b in zip(ids, truth)]) >= float_recall - 0.02
+
+    index.save(tmp_path / "ivf_sq.qann")
+    loaded = qann.load(tmp_path / "ivf_sq.qann")
+    assert (loaded.base if bits == 4 else loaded).sq_bits == bits
+    assert_same_results(index, loaded, queries[:50])
+
+
+def test_ivf_sq_options_and_bad_bits():
+    opts = qann.IndexOptions()
+    opts.ivf_sq_bits = 8
+    assert qann.make_index(qann.IndexType.IVF, 16, opts).sq_bits == 8
+    for bad in (0, 2, 16):
+        with pytest.raises(ValueError):
+            qann.IVFIndex(16, 100).enable_sq(bad)
+
+
+@pytest.mark.parametrize("bits", [8, 4])
+def test_loads_sq_ivf_saved_on_macos(bits):
+    # Saved on macOS (format version 7): SQ IVF with deletions (4 bits under a
+    # RefineIndex). Linux CI loading it checks the file is portable.
+    index = qann.load(DATA / f"v7_ivf_sq{bits}.qann")
+    assert (index.base if bits == 4 else index).sq_bits == bits
+    ids, dists = index.batch_query(np.load(DATA / "v7_queries.npy"), 10)
+    np.testing.assert_array_equal(ids, np.load(DATA / f"v7_ivf_sq{bits}_ids.npy"))
+    np.testing.assert_allclose(dists, np.load(DATA / f"v7_ivf_sq{bits}_dists.npy"), rtol=1e-5, atol=1e-5)
