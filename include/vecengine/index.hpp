@@ -14,10 +14,18 @@ using std::size_t;
 using std::vector;
 using std::span;
 
-// One query result: the vector's id and its squared L2 distance to the query.
+// One query result: the vector's id and its distance to the query under the
+// index's metric (squared L2, or 1 - cosine similarity).
 struct Neighbor {
     size_t index;
     float distance;
+};
+
+// How an index compares vectors. Values are part of the file format.
+enum class Metric : uint8_t {
+    L2 = 0,      // squared Euclidean distance
+    Cosine = 1,  // 1 - cosine similarity, in [0, 2]: vectors are scaled to unit
+                 // length on add and query, so squared L2 / 2 is the cosine distance
 };
 
 // Common interface every index type implements.
@@ -32,22 +40,30 @@ class Index {
 public:
     virtual ~Index() = default;
 
+    // add, add_batch, query and query_batch prepare vectors for the metric
+    // (scaling them to unit length for Cosine) exactly once, call the index's
+    // *_impl, and turn squared L2 into the metric's distance on the way out.
+
     // Adds one vector of dim() floats. Throws std::invalid_argument on an
     // index with custom ids, since there is no id to give it.
-    virtual void add(span<const float> vec) = 0;
+    void add(span<const float> vec);
 
     // Adds n vectors (n * dim() floats, row-major). ids must hold n ids (>= 0,
     // unique) when the index uses custom ids and be nullptr otherwise. On a bad
-    // id nothing is added. The default implementation calls add() per vector.
-    virtual void add_batch(span<const float> vecs, size_t n, const int64_t* ids = nullptr);
+    // id nothing is added. With Metric::Cosine, a zero vector throws
+    // std::invalid_argument (it has no direction) and nothing is added.
+    void add_batch(span<const float> vecs, size_t n, const int64_t* ids = nullptr);
 
     // Up to k nearest live vectors to vec, nearest first. Returns fewer than k
     // only when fewer are reachable (too few live vectors, or for IVF too few
     // in the probed lists).
-    virtual vector<Neighbor> query(span<const float> vec, size_t k) const = 0;
+    vector<Neighbor> query(span<const float> vec, size_t k) const;
 
     // query() for each of num_queries rows of queries, run in parallel.
-    virtual vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k) const;
+    vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k) const;
+
+    // How this index compares vectors (fixed at construction).
+    Metric metric() const noexcept { return metric_; }
 
     // Deletes the vectors with these ids; unknown and already deleted ids are
     // skipped. Returns how many were deleted. Their memory is kept, and
@@ -92,8 +108,26 @@ public:
     // add_batch() and remove() here.
     bool wrapped() const noexcept { return wrapped_.load(); }
 
+protected:
+    explicit Index(Metric metric = Metric::L2) : metric_(metric) {}
+
+    // A copy of the n rows of vecs (dim() floats each), each scaled to unit
+    // length. Throws std::invalid_argument on a zero row. Used for
+    // Metric::Cosine, by the public methods and by IVFIndex::train.
+    vector<float> normalize_rows(span<const float> vecs, size_t n) const;
+
+    Metric metric_; // set by the constructor, or by a load_body
+
 private:
-    friend class RefineIndex;  // sets and clears wrapped_; calls compact_as_base()
+    friend class RefineIndex;  // sets and clears wrapped_; calls compact_as_base() and the *_impl methods
+
+    // What each index implements. Vectors arrive already prepared for the
+    // metric, and distances go back as squared L2 between prepared vectors.
+    virtual void add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) = 0;
+    virtual vector<Neighbor> query_impl(span<const float> vec, size_t k) const = 0;
+
+    // Default: query_impl() for each row, in parallel.
+    virtual vector<vector<Neighbor>> query_batch_impl(span<const float> queries, size_t num_queries, size_t k) const;
 
     // compact() for the base of a RefineIndex: same storage compaction, but
     // ids become the new slots so they keep matching the RefineIndex's slots.

@@ -7,7 +7,6 @@
 #include <cassert>
 #include <cmath>
 #include <random>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <queue>
@@ -45,9 +44,9 @@ thread_local VisitedTags t_visited;
 } // namespace
 
 
-HNSWIndex::HNSWIndex(size_t dim, size_t M, size_t ef_construction, bool custom_ids, std::optional<uint32_t> seed)
-    : dim_(dim), M_(M), M0_(2 * M), ef_construction_(ef_construction),
-      rng_(seed ? *seed : std::random_device{}()), id_map_(custom_ids) {
+HNSWIndex::HNSWIndex(size_t dim, size_t M, size_t ef_construction, bool custom_ids, std::optional<uint32_t> seed, Metric metric)
+    : Index(metric), dim_(dim), M_(M), M0_(2 * M), ef_construction_(ef_construction),
+      rng_state_(seed ? *seed : std::random_device{}()), id_map_(custom_ids) {
     if (dim == 0) throw std::invalid_argument("dim must be >= 1");
     if (M < 2) throw std::invalid_argument("M must be >= 2");
     if (ef_construction == 0) throw std::invalid_argument("ef_construction must be >= 1");
@@ -59,12 +58,7 @@ void HNSWIndex::set_ef_search(size_t ef) {
     ef_search_ = ef;
 }
 
-void HNSWIndex::add(span<const float> vec) {
-    assert(vec.size() == dim_);
-    add_batch(vec, 1, nullptr);
-}
-
-void HNSWIndex::add_batch(span<const float> vecs, size_t n, const int64_t* ids) {
+void HNSWIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) {
     assert(vecs.size() == n * dim_);
     const uint32_t first = static_cast<uint32_t>(id_map_.slots());
     id_map_.add(n, ids);
@@ -77,7 +71,7 @@ void HNSWIndex::add_batch(span<const float> vecs, size_t n, const int64_t* ids) 
     build(first, n);
 }
 
-vector<Neighbor> HNSWIndex::query(span<const float> vec, size_t k) const {
+vector<Neighbor> HNSWIndex::query_impl(span<const float> vec, size_t k) const {
     assert(vec.size() == dim_);
     if (max_level_ < 0 || k == 0) return {};
 
@@ -87,7 +81,7 @@ vector<Neighbor> HNSWIndex::query(span<const float> vec, size_t k) const {
 
     vector<Neighbor> results;
     results.reserve(k);
-    for (auto [dist, slot] : search_layer(vec.data(), {&ep, 1}, std::max(ef_search_, k), 0, /*skip_deleted=*/true)) {
+    for (auto [dist, slot] : search_layer(vec.data(), {&ep, 1}, std::max(ef_search_, k), 0, true)) {
         results.push_back({static_cast<size_t>(id_map_.label(slot)), dist});
         if (results.size() == k) break;
     }
@@ -143,11 +137,8 @@ void HNSWIndex::save(std::ostream& out) const {
     write_pod(out, entry_);
 
     // the generator's state, so adds after a load draw the same levels as
-    // adds without the save; the standard fixes this text format
-    std::ostringstream rng_state;
-    rng_state << rng_;
-    const std::string text = rng_state.str();
-    write_vec(out, vector<char>(text.begin(), text.end()));
+    // adds without the save
+    write_pod(out, rng_state_);
 
     write_vec(out, data_);
     write_vec(out, levels_);
@@ -155,6 +146,7 @@ void HNSWIndex::save(std::ostream& out) const {
     for (size_t slot = 0; slot < upper_.size(); ++slot)
         for (const auto& list : upper_[slot]) write_vec(out, list);
     id_map_.save(out);
+    write_pod(out, static_cast<uint8_t>(metric_));
 }
 
 std::unique_ptr<HNSWIndex> HNSWIndex::load_body(std::istream& in, uint32_t version) {
@@ -176,10 +168,16 @@ std::unique_ptr<HNSWIndex> HNSWIndex::load_body(std::istream& in, uint32_t versi
     auto index = std::make_unique<HNSWIndex>(dim, M, ef_construction);
     index->set_ef_search(ef_search);
 
-    const auto text = read_vec<char>(in, 1 << 16);
-    std::istringstream rng_state(std::string(text.begin(), text.end()));
-    rng_state >> index->rng_;
-    if (!rng_state) throw corrupt("invalid HNSWIndex generator state");
+    if (version >= 5) {
+        index->rng_state_ = read_pod<uint64_t>(in);
+    } else {
+        // version 4 stored std::mt19937's text form, which isn't portable;
+        // continue from a hash of it (FNV-1a) so loading works everywhere
+        const auto text = read_vec<char>(in, 1 << 16);
+        uint64_t h = 0xCBF29CE484222325ull;
+        for (char c : text) h = (h ^ static_cast<unsigned char>(c)) * 0x100000001B3ull;
+        index->rng_state_ = h;
+    }
 
     index->data_ = read_vec<float>(in, slots * dim);
     index->levels_ = read_vec<uint8_t>(in, slots);
@@ -213,11 +211,11 @@ std::unique_ptr<HNSWIndex> HNSWIndex::load_body(std::istream& in, uint32_t versi
     index->entry_ = entry;
 
     index->id_map_ = IdMap::load(in, slots, version);
+    if (version >= 5) index->metric_ = read_metric(in);
     return index;
 }
 
-vector<HNSWIndex::Candidate> HNSWIndex::search_layer(const float* q, span<const uint32_t> entry_points, size_t ef, int level,
-                                                     bool skip_deleted, bool locked) const {
+vector<HNSWIndex::Candidate> HNSWIndex::search_layer(const float* q, span<const uint32_t> entry_points, size_t ef, int level, bool skip_deleted, bool locked) const {
     t_visited.begin(slots());
     vector<uint32_t> copy;   // a locked search's snapshot of the list being expanded
     if (locked) copy.reserve(capacity(level));
@@ -429,7 +427,7 @@ void HNSWIndex::set_own_neighbors(uint32_t slot, int level, const vector<uint32_
 
 int HNSWIndex::random_level() {
     // u from the raw 32-bit draw, so the same seed gives the same levels on every platform
-    const double u = (static_cast<double>(rng_()) + 1.0) / 4294967296.0;
+    const double u = (static_cast<double>(next_random()) + 1.0) / 4294967296.0;
     return std::min(static_cast<int>(-std::log(u) * level_mult_), 255);
 }
 

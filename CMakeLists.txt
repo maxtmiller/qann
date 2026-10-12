@@ -129,6 +129,7 @@ add_executable(test_vecengine
   tests/test_id_map.cpp
   tests/test_fast_scan.cpp
   tests/test_hnsw.cpp
+  tests/test_metric.cpp
 )
 
 target_link_libraries(test_vecengine PRIVATE

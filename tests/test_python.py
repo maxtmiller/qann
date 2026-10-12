@@ -556,3 +556,73 @@ def test_hnsw_via_make_index_and_bad_settings():
         qann.HNSWIndex(16, M=1)
     with pytest.raises(ValueError):
         index.ef_search = 0
+
+
+def test_cosine_flat_matches_cosine_distance(data):
+    index = qann.FlatIndex(32, metric=qann.Metric.Cosine)
+    assert index.metric == qann.Metric.Cosine
+    index.add(data * np.linspace(0.1, 10, len(data), dtype=np.float32)[:, None])   # lengths don't matter
+    queries = data[:20] + 0.05
+    ids, dists = index.batch_query(queries, 5)
+
+    for q, row_ids, row_dists in zip(queries, ids, dists):
+        expected = qann.cosine_distance(np.repeat(q[None, :], len(data), axis=0), data)
+        top = np.argsort(expected, kind="stable")[:5]
+        np.testing.assert_array_equal(row_ids, top)
+        np.testing.assert_allclose(row_dists, expected[top], atol=1e-5)
+
+
+def test_cosine_rejects_zero_vectors(data):
+    index = qann.FlatIndex(32, metric=qann.Metric.Cosine)
+    bad = data[:3].copy()
+    bad[1] = 0
+    with pytest.raises(ValueError, match="non-zero"):
+        index.add(bad)
+    assert index.size() == 0
+    index.add(data[:3])
+    with pytest.raises(ValueError):
+        index.query(np.zeros(32, dtype=np.float32), 1)
+
+
+@pytest.mark.parametrize("kind", ["flat", "ivf", "hnsw"])
+def test_cosine_metric_survives_save_load(tmp_path, data, kind):
+    if kind == "flat":
+        index = qann.FlatIndex(32, metric=qann.Metric.Cosine)
+        index.add(data)
+    elif kind == "ivf":
+        ivf = qann.IVFIndex(32, nlist=100, nprobe=20, metric=qann.Metric.Cosine)
+        ivf.enable_pq(16, fast_scan=True)
+        ivf.train(data, seed=1)
+        index = qann.RefineIndex(ivf, k_factor=10)
+        assert index.metric == qann.Metric.Cosine   # taken from the base
+        index.add(data)
+    else:
+        index = qann.HNSWIndex(32, metric=qann.Metric.Cosine)
+        index.add(data)
+
+    index.save(tmp_path / "cos.qann")
+    loaded = qann.load(tmp_path / "cos.qann")
+    assert loaded.metric == qann.Metric.Cosine
+    assert_same_results(index, loaded, data[:50])
+
+
+def test_metric_via_make_index():
+    opts = qann.IndexOptions()
+    opts.metric = qann.Metric.Cosine
+    for t in (qann.IndexType.Flat, qann.IndexType.IVF, qann.IndexType.HNSW):
+        assert qann.make_index(t, 16, opts).metric == qann.Metric.Cosine
+    assert qann.FlatIndex(16).metric == qann.Metric.L2
+
+
+@pytest.mark.parametrize("name", ["flat", "ivf_fs", "hnsw"])
+def test_loads_files_from_0_1_0a10(name):
+    # Saved by qann 0.1.0a10 (format version 4, before the metric), with the results it returned.
+    index = qann.load(DATA / f"v4_{name}.qann")
+    queries = np.load(DATA / "v4_queries.npy")
+    expected_ids = np.load(DATA / f"v4_{name}_ids.npy")
+    expected_dists = np.load(DATA / f"v4_{name}_dists.npy")
+
+    assert index.metric == qann.Metric.L2
+    ids, dists = index.batch_query(queries, 10)
+    np.testing.assert_array_equal(ids, expected_ids)
+    np.testing.assert_allclose(dists, expected_dists, rtol=1e-5, atol=1e-5)

@@ -22,7 +22,7 @@ using std::vector;
 using std::span;
 using std::pair;
 
-RefineIndex::RefineIndex(Index& base, size_t k_factor, bool custom_ids) : base_(base), k_factor_(k_factor), id_map_(custom_ids) {
+RefineIndex::RefineIndex(Index& base, size_t k_factor, bool custom_ids) : Index(base.metric()), base_(base), k_factor_(k_factor), id_map_(custom_ids) {
     if (base.slots() != 0) throw std::invalid_argument("base index must be empty");
     if (k_factor == 0) throw std::invalid_argument("k_factor must be >= 1");
     if (!base.ids_are_slots()) throw std::invalid_argument("base index must not use custom ids or have been compacted");
@@ -39,34 +39,25 @@ void RefineIndex::set_k_factor(size_t k_factor) {
     k_factor_ = k_factor;
 }
 
-void RefineIndex::add(span<const float> vec) {
-    assert(vec.size() == dim());
-
-    id_map_.check(1, nullptr);
-    base_.add(vec);
-    id_map_.add(1, nullptr);
-    data_.insert(data_.end(), vec.begin(), vec.end());
-}
-
-void RefineIndex::add_batch(span<const float> vecs, size_t n, const int64_t* ids) {
+void RefineIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) {
     id_map_.check(n, ids);
-    base_.add_batch(vecs, n);
+    base_.add_batch_impl(vecs, n, nullptr);
     id_map_.add(n, ids);
     data_.insert(data_.end(), vecs.begin(), vecs.end());
 }
 
-vector<Neighbor> RefineIndex::query(span<const float> vec, size_t k) const {
+vector<Neighbor> RefineIndex::query_impl(span<const float> vec, size_t k) const {
     assert(vec.size() == dim());
     if (id_map_.live() == 0) return {};
 
-    return rerank(vec, base_.query(vec, std::min(k * k_factor_, id_map_.live())), k);
+    return rerank(vec, base_.query_impl(vec, std::min(k * k_factor_, id_map_.live())), k);
 }
 
-vector<vector<Neighbor>> RefineIndex::query_batch(span<const float> queries, size_t num_queries, size_t k) const {
+vector<vector<Neighbor>> RefineIndex::query_batch_impl(span<const float> queries, size_t num_queries, size_t k) const {
     assert(queries.size() == num_queries * dim());
     if (id_map_.live() == 0) return vector<vector<Neighbor>>(num_queries);
 
-    auto candidates = base_.query_batch(queries, num_queries, std::min(k * k_factor_, id_map_.live()));
+    auto candidates = base_.query_batch_impl(queries, num_queries, std::min(k * k_factor_, id_map_.live()));
     vector<vector<Neighbor>> results(num_queries);
     detail::parallel_for(num_queries, [&](size_t i) {
         results[i] = rerank({queries.data() + i * dim(), dim()}, candidates[i], k);

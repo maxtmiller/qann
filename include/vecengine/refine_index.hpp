@@ -39,19 +39,15 @@ public:
     ~RefineIndex() override;
 
     // Index overrides; see Index for the contract of each. Adds go to the base
-    // too (without ids), and remove() deletes the same slots in the base.
-    void add(span<const float> vec) override;
-    void add_batch(span<const float> vecs, size_t n, const int64_t* ids = nullptr) override;
-    vector<Neighbor> query(span<const float> vec, size_t k) const override;
+    // too (without ids), and remove() deletes the same slots in the base. The
+    // metric is the base's. query_batch fetches every query's candidates with
+    // one base query_batch call (so IVFIndex's batched coarse search applies),
+    // then re-ranks in parallel.
     size_t remove(span<const int64_t> ids) override;
 
     // Compacts this index's ids and raw vectors and the base's storage with
     // the same remap, keeping them aligned.
     size_t compact() override;
-
-    // Fetches every query's candidates with one base query_batch() call (so
-    // IVFIndex's batched coarse search applies), then re-ranks in parallel.
-    vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k) const override;
 
     // Writes this index's header and fields with the base nested inside.
     void save(std::ostream& out) const override;
@@ -77,6 +73,12 @@ public:
     void set_k_factor(size_t k_factor);
 
 private:
+    // Index implementations: vectors already prepared for the metric, and
+    // passed to the base's *_impl so they are prepared only once.
+    void add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) override;
+    vector<Neighbor> query_impl(span<const float> vec, size_t k) const override;
+    vector<vector<Neighbor>> query_batch_impl(span<const float> queries, size_t num_queries, size_t k) const override;
+
     // A RefineIndex is never a base; throws std::logic_error.
     size_t compact_as_base() override;
 
@@ -86,7 +88,7 @@ private:
     // Used by load_body(): takes ownership of an already filled base and skips
     // the public constructor's empty-base check.
     RefineIndex(std::unique_ptr<Index> base, size_t k_factor)
-        : owned_base_(std::move(base)), base_(*owned_base_), k_factor_(k_factor) {
+        : Index(base->metric()), owned_base_(std::move(base)), base_(*owned_base_), k_factor_(k_factor) {
         base_.wrapped_ = true;
     }
 

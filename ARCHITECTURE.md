@@ -51,8 +51,9 @@ vecengine/
 │   ├── test_id_map.cpp             # IdMap, custom ids, deletion and compaction per index, format v2/v3
 │   ├── test_fast_scan.cpp          # fast-scan packing, kernels, table rounding, IVF fast-scan
 │   ├── test_hnsw.cpp               # HNSW recall, determinism, deletion, compaction, save/load, parallel build
+│   ├── test_metric.cpp             # cosine metric: exact ranking, normalize_rows, zero vectors, save/load, format v4 files
 │   ├── test_python.py              # pytest smoke, save/load, ids and threading tests
-│   └── data/                       # index files saved by 0.1.0a4 (v1), 0.1.0a6 (v2) and 0.1.0a7 (v3) + their results
+│   └── data/                       # index files saved by 0.1.0a4 (v1), 0.1.0a6 (v2), 0.1.0a7 (v3) and 0.1.0a10 (v4) + their results
 ├── benchmarks/
 │   ├── bench_distance.cpp          # Google Benchmark distance kernels
 │   ├── bench_indexes.py            # recall vs QPS on SIFT
@@ -77,7 +78,7 @@ float l2_distance(const float* a, const float* b, size_t n);      // squared L2
 float cosine_distance(const float* a, const float* b, size_t n);  // 1 - cos(a, b)
 ```
 
-`l2_distance` returns **squared** L2. It ranks neighbors identically to true L2 and skips the `sqrt`. Every index and PQ distance in this repo is squared L2.
+`l2_distance` returns **squared** L2. It ranks neighbors identically to true L2 and skips the `sqrt`. Every index and PQ distance in this repo is squared L2 internally; `Metric::Cosine` reuses it on unit vectors (see `Index`).
 
 The unsuffixed functions dispatch at compile time in `distance_inl.hpp`:
 
@@ -171,10 +172,11 @@ Measured on SIFT1M (`benchmarks/fastscan_recall.py`, with 8-bit tables): roundin
 ### `index.hpp`: `Index`
 
 ```cpp
-virtual void add(span<const float> vec) = 0;
-virtual void add_batch(span<const float> vecs, size_t n, const int64_t* ids = nullptr);
-virtual vector<Neighbor> query(span<const float> vec, size_t k) const = 0;
-virtual vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k) const;
+void add(span<const float> vec);                  // non-virtual: prepare for the metric, then *_impl
+void add_batch(span<const float> vecs, size_t n, const int64_t* ids = nullptr);
+vector<Neighbor> query(span<const float> vec, size_t k) const;
+vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k) const;
+Metric metric() const noexcept;
 virtual size_t remove(span<const int64_t> ids) = 0;
 virtual size_t compact() = 0;                   // frees deleted slots, ids unchanged
 virtual void save(std::ostream& out) const = 0;
@@ -186,6 +188,8 @@ virtual size_t dim() const noexcept = 0;
 ```
 
 `Neighbor { size_t index; float distance; }`. Results are sorted nearest first.
+
+**Metrics.** `Metric { L2, Cosine }` is fixed at construction (`metric_`, set by each constructor, a `RefineIndex` copying its base's). For unit vectors `‖a − b‖² = 2 (1 − cos(a, b))`, so cosine needs no new search code: the public `add`, `add_batch`, `query` and `query_batch` are non-virtual and, for `Cosine`, copy the input through `normalize_rows` (each row scaled to unit length; a zero row throws `invalid_argument`), call the index's private virtual `add_batch_impl` / `query_impl` / `query_batch_impl`, and halve the returned squared L2 into `1 − cos`. `IVFIndex::train` normalizes its training set the same way, so clusters are learned on unit vectors. Normalizing happens exactly once per vector: a `RefineIndex` (a friend of `Index`) passes its already prepared vectors to the base's `*_impl` methods rather than its public ones, and the default `query_batch_impl` calls `query_impl` per row. (Normalizing a unit vector again can change its last bits, which would make `query` and `query_batch` disagree.)
 
 **Slots and ids.** Every added vector gets a *slot*: its position in storage (0, 1, 2, ... in insertion order). Indexes store and scan slots internally (IVF lists hold slots; `RefineIndex` finds its raw vector by slot). Slots only change in `compact()`, which renumbers them in order. The id users see is separate: with `custom_ids` it is the id passed to `add_batch`; otherwise it is the slot until the first compaction, and the original slot number after it. `Neighbor::index` always reports the id. `add_batch` must keep slots in input order: row `i` of a batch gets the next slot.
 
@@ -309,14 +313,14 @@ It only helps when `base` ranks with approximate distances (IVF + PQ). It restor
 
 Binary, little-endian (a `static_assert` requires a little-endian host), every size and count stored as `uint64`. Vectors are stored as a `uint64` element count followed by the raw elements (`write_vec` / `read_vec`).
 
-Every index starts with a 9-byte header: magic `QANN` (`uint32`), format version (`uint32`, currently 4) and an `IndexKind` tag (`uint8`). `Index::save` writes header + body; `load_index` reads the header (`read_header` returns `{kind, version}`) and passes the version to the type's static `load_body`, which reads only the body. Versions `kMinFormatVersion` (1) through `kFormatVersion` (4) are readable.
+Every index starts with a 9-byte header: magic `QANN` (`uint32`), format version (`uint32`, currently 5) and an `IndexKind` tag (`uint8`). `Index::save` writes header + body; `load_index` reads the header (`read_header` returns `{kind, version}`) and passes the version to the type's static `load_body`, which reads only the body. Versions `kMinFormatVersion` (1) through `kFormatVersion` (5) are readable. Since version 5, Flat, IVF and HNSW bodies end with the metric (u8; `read_metric` rejects unknown values); older files load as L2. A Refine stores no metric of its own: it takes its base's.
 
 | Kind | Body |
 | --- | --- |
 | `Flat` (1) | `dim`, `count` (slots), `data` (`count * dim` floats), id map |
 | `IVF` (2) | `dim`, `nlist`, `nprobe`, `n_total` (slots), `trained` (u8), `pq_distance` (u8), coarse centroids (`nlist * dim`, or empty if untrained), PQ flag (u8) + `PQCodebook` and `fast_scan` (u8, version 4+) if set, then `nlist` lists in cluster order `0..nlist-1`, each slot `ids` + `codes` (PQ: `n * m` bytes, or `ceil(n / 32) * m * 16` in fast-scan blocks) or `vecs` (no PQ), empty lists written as empty vectors; id map; `use_precomputed` (u8, version 3+) |
 | `Refine` (3) | `k_factor`, `count` (slots), the base index (full header + body, same version), `data` (`count * dim` floats), id map |
-| `HNSW` (4) | `dim`, `M`, `ef_construction`, `ef_search`, `count` (slots), `max_level` (i32), `entry` (u32), the generator's state (`std::mt19937`'s standard text form, so adds after a load draw the same levels), `data` (`count * dim` floats), `levels` (u8 per slot), level 0 (`count * (2M + 1)` u32), then each slot's upper-level lists in slot and level order, id map |
+| `HNSW` (4) | `dim`, `M`, `ef_construction`, `ef_search`, `count` (slots), `max_level` (i32), `entry` (u32), the level generator's state (version 5: one u64, the splitmix64 state, so adds after a load draw the same levels; version 4 stored `std::mt19937`'s text form, which libc++ and libstdc++ write differently, so a version-4 file continues from an FNV-1a hash of that text), `data` (`count * dim` floats), `levels` (u8 per slot), level 0 (`count * (2M + 1)` u32), then each slot's upper-level lists in slot and level order, id map |
 
 The id map (`IdMap::save`, version 2+) is `custom_ids` (u8), the slot count, `next_id` (i64, version 3+), `labels` (empty while ids equal slots) and one deleted flag (u8) per slot. It ends each body (in IVF, only the `use_precomputed` flag follows it). For version 1, `load_body` skips it and starts from a map with every slot live and no custom ids; for version 2, `next_id` is the slot count and auto ids carry no labels. Version 3 added `next_id` and auto-id labels for compaction, and IVF's `use_precomputed` flag (version 2 files load with the tables on).
 
@@ -324,7 +328,7 @@ The id map (`IdMap::save`, version 2+) is `custom_ids` (u8), the slot count, `ne
 
 **Validation on load.** Files are untrusted input, so every loader checks before allocating or indexing: `read_vec` takes a `max_len` and callers then require the exact expected length; sizes are checked against overflow (`count > UINT64_MAX / dim`); IVF ids must be `< n_total` and list sizes must sum to `n_total`; the PQ codebook's `dim` must match the index, and a fast-scan flag needs 16 centroids, an even `m <= 256` and ADC; a Refine's `count` must equal its base's `slots()` (queries index the raw vectors by base slot), its base's ids must equal its slots and it must have the same format version. A Refine base must be Flat, IVF or HNSW, which also stops a crafted file from nesting Refines until the stack overflows. An HNSW file's neighbor lists must be within capacity and point at real slots, and its entry point must sit on the top level. The id map must match its index's slot count, with no duplicate live ids; auto-id labels must be strictly increasing, `>= 0` and below `next_id`, and without labels `next_id` must equal the slot count (or the index must be empty). Any failure throws `runtime_error`.
 
-**Changing the format.** `IndexKind` values are append-only: never renumber or reuse one. Bump `kFormatVersion` whenever an existing type's layout changes, and read older versions explicitly in each `load_body` (as version 4 does for versions 1 to 3). `tests/data/` holds files saved by 0.1.0a4 (version 1), 0.1.0a6 (version 2, with deletions and custom ids) and 0.1.0a7 (version 3, compacted, with precomputed tables off on the IVF file) with the results they returned; the C++ and Python tests load them to catch compatibility breaks, and re-save them in the current version.
+**Changing the format.** `IndexKind` values are append-only: never renumber or reuse one. Bump `kFormatVersion` whenever an existing type's layout changes, and read older versions explicitly in each `load_body` (as version 5 does for versions 1 to 4). `tests/data/` holds files saved by 0.1.0a4 (version 1), 0.1.0a6 (version 2, with deletions and custom ids) 0.1.0a7 (version 3, compacted, with precomputed tables off on the IVF file) and 0.1.0a10 (version 4: Flat with deletions, IVF fast-scan, and HNSW with deletions) with the results they returned; the C++ and Python tests load them to catch compatibility breaks, and re-save them in the current version.
 
 ---
 

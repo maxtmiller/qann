@@ -35,7 +35,7 @@ using std::vector;
 using std::span;
 using std::pair;
 
-IVFIndex::IVFIndex(size_t dim, size_t nlist, size_t nprobe, bool custom_ids): dim_(dim), nlist_(nlist), nprobe_(nprobe), id_map_(custom_ids)  {
+IVFIndex::IVFIndex(size_t dim, size_t nlist, size_t nprobe, bool custom_ids, Metric metric): Index(metric), dim_(dim), nlist_(nlist), nprobe_(nprobe), id_map_(custom_ids)  {
     if (nlist < 100 || nlist > 65535) throw std::invalid_argument("nlist must be in [100, 65535]");
     if (dim == 0) throw std::invalid_argument("dim must be >= 1");
     set_nprobe(nprobe);
@@ -77,44 +77,7 @@ void IVFIndex::enable_pq(size_t num_subspaces, size_t centroids_per_subspace, bo
     pq_ = std::make_unique<PQCodebook>(dim_, num_subspaces, centroids_per_subspace);
 }
 
-void IVFIndex::add(span<const float> vec) {
-    assert(vec.size() == dim_);
-    if (!trained_) throw std::logic_error("train() has not be run yet");
-
-    // add a vector to the inverted list of the closest coarse centroid
-    size_t closest_index = vecengine::detail::nearest_centroid(vec.data(), coarse_centroids_.data(), nlist_, dim_);
-
-    uint16_t cluster_id = static_cast<uint16_t>(closest_index);
-    const uint32_t slot = static_cast<uint32_t>(id_map_.slots());
-    id_map_.add(1, nullptr);
-
-    InvertedList& list = data_[cluster_id];
-    
-    list.ids.emplace_back(slot);
-
-    // adds quantized vectors if pq enabled else full dimensional vectors 
-    if (pq_enabled()) {
-        vector<float> residual(dim_);
-        const float* centroid_ptr = coarse_centroids_.data() + cluster_id * dim_;
-        for (size_t i = 0; i < dim_; ++i) {
-            residual[i] = vec[i] - centroid_ptr[i];
-        }
-
-        auto code = pq_->encode(residual);
-        if (fast_scan_) {
-            const size_t m = pq_->num_subspaces(), pos = list.ids.size() - 1;
-            if (pos % 32 == 0) list.codes.resize(list.codes.size() + m * 16, 0);
-            uint8_t* block = list.codes.data() + (pos / 32) * m * 16;
-            for (size_t s = 0; s < m; ++s) detail::fs_set(block, pos % 32, s, code[s]);
-        } else {
-            list.codes.insert(list.codes.end(), code.begin(), code.end());
-        }
-    } else {
-        list.vecs.insert(list.vecs.end(), vec.begin(), vec.end());
-    }
-}
-
-void IVFIndex::add_batch(span<const float> vecs, size_t n, const int64_t* ids) {
+void IVFIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) {
     assert(vecs.size() == n * dim());
     if (!trained_) throw std::logic_error("train() has not be run yet");
 
@@ -162,7 +125,7 @@ void IVFIndex::add_batch(span<const float> vecs, size_t n, const int64_t* ids) {
     }
 }
 
-vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
+vector<Neighbor> IVFIndex::query_impl(span<const float> vec, size_t k) const {
     assert(vec.size() == dim_);
     if (!trained_) throw std::logic_error("train() has not be run yet");
 
@@ -173,12 +136,12 @@ vector<Neighbor> IVFIndex::query(span<const float> vec, size_t k) const {
     return scan(vec, probes, k);
 }
 
-vector<vector<Neighbor>> IVFIndex::query_batch(span<const float> queries, size_t num_queries, size_t k) const {
+vector<vector<Neighbor>> IVFIndex::query_batch_impl(span<const float> queries, size_t num_queries, size_t k) const {
     assert(queries.size() == num_queries * dim_);
     if (!trained_) throw std::logic_error("train() has not be run yet");
 
 #ifndef VECENGINE_USE_BLAS
-    return Index::query_batch(queries, num_queries, k);
+    return Index::query_batch_impl(queries, num_queries, k);
 #else
     // coarse_batch holds block * nlist_ scores; cap them at 32 MB
     const size_t block = std::clamp<size_t>((size_t{32} << 20) / (nlist_ * sizeof(float)), 1, 1024);
@@ -454,6 +417,13 @@ void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_i
     if (trained_) throw std::logic_error("train() has already been called");
     if (num_vectors < nlist_) throw std::invalid_argument("training set must have at least nlist vectors");
 
+    // learn the clusters on the same unit vectors that adds and queries will use
+    vector<float> unit;
+    if (metric_ == Metric::Cosine) {
+        unit = normalize_rows(vectors, num_vectors);
+        vectors = unit;
+    }
+
     // run kmeans
     auto res = vecengine::detail::kmeans(vectors.data(), num_vectors, dim_, dim_, nlist_, max_iters, seed);
     coarse_centroids_ = std::move(res.centroids);
@@ -502,6 +472,7 @@ void IVFIndex::save(std::ostream& out) const {
     }
     id_map_.save(out);
     write_pod(out, static_cast<uint8_t>(use_precomputed_));
+    write_pod(out, static_cast<uint8_t>(metric_));
 }
 
 std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version) {
@@ -578,6 +549,7 @@ std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version
         if (use_precomputed > 1) throw std::runtime_error("corrupt file: invalid IVFIndex shape");
         index->use_precomputed_ = use_precomputed;
     }
+    if (version >= 5) index->metric_ = read_metric(in);
     index->build_precomputed();
 
     return index;

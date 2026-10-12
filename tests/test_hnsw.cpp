@@ -274,7 +274,7 @@ TEST_CASE("HNSW: load rejects truncated and corrupt data", "[hnsw][serialize]") 
         for (int i = 0; i < 5; ++i) (void)read_pod<uint64_t>(probe);
         (void)read_pod<int32_t>(probe);
         (void)read_pod<uint32_t>(probe);
-        (void)read_vec<char>(probe, 1 << 16);
+        (void)read_pod<uint64_t>(probe);
         (void)read_vec<float>(probe, n * dim);
         (void)read_vec<uint8_t>(probe, n);
         const auto level0_at = static_cast<size_t>(probe.tellg()) + sizeof(uint64_t);   // past its length

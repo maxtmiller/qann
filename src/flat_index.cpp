@@ -17,25 +17,20 @@ using std::vector;
 using std::span;
 using std::pair;
 
-FlatIndex::FlatIndex(size_t dim, size_t capacity, bool custom_ids): dim_(dim), id_map_(custom_ids) {
+FlatIndex::FlatIndex(size_t dim, size_t capacity, bool custom_ids, Metric metric)
+    : Index(metric), dim_(dim), id_map_(custom_ids) {
     if (dim == 0) throw std::invalid_argument("dim must be >= 1");
 
     data_.reserve(dim_ * capacity);
 }
 
-void FlatIndex::add(span<const float> vec) {
-    assert(vec.size() == dim_);
-    id_map_.add(1, nullptr);
-    data_.insert(data_.end(), vec.begin(), vec.end());
-}
-
-void FlatIndex::add_batch(span<const float> vecs, size_t n, const int64_t* ids) {
+void FlatIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) {
     assert(vecs.size() == n * dim_);
     id_map_.add(n, ids);
     data_.insert(data_.end(), vecs.begin(), vecs.end());
 }
 
-vector<Neighbor> FlatIndex::query(span<const float> vec, size_t k) const {
+vector<Neighbor> FlatIndex::query_impl(span<const float> vec, size_t k) const {
     std::priority_queue<pair<float, size_t>, vector<pair<float, size_t>>, std::less<pair<float, size_t>>> maxHeap;
     for (size_t i = 0; i < id_map_.slots(); ++i) {
         if (id_map_.is_deleted(static_cast<uint32_t>(i))) continue;
@@ -99,6 +94,7 @@ void FlatIndex::save(std::ostream& out) const {
     write_pod(out, static_cast<uint64_t>(id_map_.slots()));
     write_vec(out, data_);
     id_map_.save(out);
+    write_pod(out, static_cast<uint8_t>(metric_));
 }
 
 std::unique_ptr<FlatIndex> FlatIndex::load_body(std::istream& in, uint32_t version) {
@@ -116,6 +112,7 @@ std::unique_ptr<FlatIndex> FlatIndex::load_body(std::istream& in, uint32_t versi
     if (index->data_.size() != count * dim) throw std::runtime_error("corrupt file: FlatIndex data length mismatch");
     if (version >= 2) index->id_map_ = detail::IdMap::load(in, count, version);
     else index->id_map_.add(count, nullptr);
+    if (version >= 5) index->metric_ = read_metric(in);
 
     return index;
 }

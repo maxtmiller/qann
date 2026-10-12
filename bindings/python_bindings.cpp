@@ -275,6 +275,12 @@ NB_MODULE(qann, m) {
 
     // Methods bound on Index are inherited by FlatIndex, IVFIndex and RefineIndex,
     // and give type checkers the right methods for what load() and make_index() return.
+    // Registered before the index classes, which use it as a default argument.
+    nb::enum_<vecengine::Metric>(m, "Metric")
+        .value("L2", vecengine::Metric::L2, "Squared Euclidean distance")
+        .value("Cosine", vecengine::Metric::Cosine,
+               "1 - cosine similarity (0 to 2); vectors are scaled to unit length on add and query");
+
     nb::class_<vecengine::Index>(m, "Index")
         .def("save", [](const vecengine::Index& self, const std::filesystem::path& path) {
                  read_locked(self, [&] { vecengine::save_index(self, path); });
@@ -289,14 +295,15 @@ NB_MODULE(qann, m) {
              "Free the memory of deleted vectors; ids and results are unchanged. Returns how many were freed")
         .def("query", &index_query, nb::arg("query"), nb::arg("k"), "Query k-NN for a (dim,) vector; returns 1D (indices, distances)")
         .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), "Query k-NN for each row; returns (indices, distances) arrays of shape (num_queries, k), padded with -1 / inf")
+        .def_prop_ro("metric", &vecengine::Index::metric, "How vectors are compared (fixed at construction)")
         .def("size", &index_size, "Get number of indexed vectors")
         .def("dim", &vecengine::Index::dim, "Get vector dimension");
 
     nb::class_<vecengine::FlatIndex, vecengine::Index>(m, "FlatIndex")
-        .def("__init__", [](vecengine::FlatIndex* self, std::size_t dim, bool custom_ids) {
-                 new (self) vecengine::FlatIndex(dim, 1024, custom_ids);
+        .def("__init__", [](vecengine::FlatIndex* self, std::size_t dim, bool custom_ids, vecengine::Metric metric) {
+                 new (self) vecengine::FlatIndex(dim, 1024, custom_ids, metric);
              },
-             nb::arg("dim"), nb::kw_only(), nb::arg("custom_ids") = false,
+             nb::arg("dim"), nb::kw_only(), nb::arg("custom_ids") = false, nb::arg("metric") = vecengine::Metric::L2,
              "Construct FlatIndex with vector dimension; custom_ids=True makes add() take your own ids");
 
     nb::enum_<vecengine::PQDistance>(m, "PQDistance")
@@ -304,8 +311,8 @@ NB_MODULE(qann, m) {
         .value("SDC", vecengine::PQDistance::SDC);
 
     nb::class_<vecengine::IVFIndex, vecengine::Index>(m, "IVFIndex")
-        .def(nb::init<std::size_t, std::size_t, std::size_t, bool>(), nb::arg("dim"), nb::arg("nlist"), nb::arg("nprobe") = 10,
-             nb::kw_only(), nb::arg("custom_ids") = false,
+        .def(nb::init<std::size_t, std::size_t, std::size_t, bool, vecengine::Metric>(), nb::arg("dim"), nb::arg("nlist"),
+             nb::arg("nprobe") = 10, nb::kw_only(), nb::arg("custom_ids") = false, nb::arg("metric") = vecengine::Metric::L2,
              "Construct IVFIndex with vector dimension, number of coarse clusters, and search breadth")
         .def("train", &ivf_train, nb::arg("data"), nb::arg("max_iters") = 25, nb::arg("seed") = nb::none(),
              "Run k-means over sample vectors to compute coarse centroids")
@@ -339,9 +346,9 @@ NB_MODULE(qann, m) {
                      "True only once they exist: PQ enabled, trained, and within the 256 MB cap");
 
     nb::class_<vecengine::HNSWIndex, vecengine::Index>(m, "HNSWIndex")
-        .def(nb::init<std::size_t, std::size_t, std::size_t, bool, std::optional<uint32_t>>(), nb::arg("dim"),
-             nb::arg("M") = 16, nb::arg("ef_construction") = 200, nb::kw_only(), nb::arg("custom_ids") = false,
-             nb::arg("seed") = nb::none(),
+        .def(nb::init<std::size_t, std::size_t, std::size_t, bool, std::optional<uint32_t>, vecengine::Metric>(),
+             nb::arg("dim"), nb::arg("M") = 16, nb::arg("ef_construction") = 200, nb::kw_only(),
+             nb::arg("custom_ids") = false, nb::arg("seed") = nb::none(), nb::arg("metric") = vecengine::Metric::L2,
              "Construct an HNSW graph index. No training: add() builds the graph on all cores. M is the neighbors "
              "per node (2 * M on the bottom level); ef_construction the search width while inserting. A seed makes "
              "the build reproducible when qann.set_num_threads(1) is set")
@@ -387,7 +394,8 @@ NB_MODULE(qann, m) {
         .def_rw("hnsw_m", &vecengine::IndexOptions::hnsw_m)
         .def_rw("ef_construction", &vecengine::IndexOptions::ef_construction)
         .def_rw("ef_search", &vecengine::IndexOptions::ef_search)
-        .def_rw("custom_ids", &vecengine::IndexOptions::custom_ids);
+        .def_rw("custom_ids", &vecengine::IndexOptions::custom_ids)
+        .def_rw("metric", &vecengine::IndexOptions::metric);
 
     nb::class_<vecengine::PQCodebook>(m, "PQCodebook")
         .def(nb::init<std::size_t, std::size_t, std::size_t>(),
