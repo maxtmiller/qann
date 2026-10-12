@@ -2,6 +2,7 @@
 
 #include "vecengine/index.hpp"
 #include "vecengine/id_map.hpp"
+#include "vecengine/sq.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -25,7 +26,10 @@ using std::span;
 // vector is a node on level 0; a node also appears on levels 1..L with
 // probability falling by 1/M per level. A query descends greedily through the
 // sparse upper levels, then runs a beam search of width ef_search on level 0.
-// No training; vectors are stored in full, so distances are exact.
+// By default vectors are stored in full, so distances are exact and no
+// training is needed. With enable_sq() they are stored as 8- or 4-bit codes
+// per dimension (see detail::SQ): 4x or 8x less vector memory and faster
+// searches, with approximate distances that a RefineIndex can make exact again.
 class HNSWIndex : public Index {
 public:
     // dim floats per vector. M is the neighbors a node keeps per upper level
@@ -38,6 +42,7 @@ public:
 
     // Index overrides; see Index for the contract of each. add_batch inserts
     // the vectors on num_threads() threads.
+    // add_batch throws std::logic_error with SQ enabled but not trained.
     size_t remove(span<const int64_t> ids) override;
 
     // Drops deleted vectors and rebuilds the graph from the live ones, in slot
@@ -65,6 +70,25 @@ public:
 
     size_t M() const noexcept { return M_; }
     size_t ef_construction() const noexcept { return ef_construction_; }
+
+    // Stores vectors as scalar codes of `bits` (4 or 8; std::invalid_argument
+    // otherwise) per dimension instead of floats. Must be called before
+    // train() and before any add; throws std::logic_error otherwise. The graph
+    // is built and searched with the codes' distances.
+    void enable_sq(int bits = 8);
+
+    // Bits per dimension of the codes: 4 or 8, or 0 without enable_sq().
+    int sq_bits() const noexcept { return sq_bits_; }
+
+    // Learns each dimension's SQ range from num_vectors (>= 1) sample
+    // vectors; later vectors outside it are clamped to its ends, so the sample
+    // should cover the data. Call once, after enable_sq() and before any add.
+    // Throws std::logic_error without SQ, when already trained or after an
+    // add, and std::invalid_argument when num_vectors is 0.
+    void train(span<const float> vectors, size_t num_vectors);
+
+    // Whether train() has run (always false without SQ).
+    bool trained() const noexcept { return quant_.dim() > 0; }
 
 private:
     // Index implementations: vectors already prepared for the metric.
@@ -131,17 +155,27 @@ private:
     // Max neighbors a node keeps on level.
     size_t capacity(int level) const noexcept { return level == 0 ? M0_ : M_; }
 
-    // Squared L2 distance from q to the vector at slot.
+    // Squared L2 distance from q to the vector at slot (to its decoded code
+    // with SQ).
     float distance(const float* q, uint32_t slot) const;
 
-    const float* vec(uint32_t slot) const noexcept { return data_.data() + size_t{slot} * dim_; }
+    // The vector at slot as dim() floats: a pointer into data_, or with SQ
+    // its code decoded into buf (valid until buf is reused).
+    const float* vector_of(uint32_t slot, vector<float>& buf) const;
+
+    // Where slot's vector is stored and how many bytes it takes.
+    const char* stored(uint32_t slot) const noexcept {
+        return sq_bits_ ? reinterpret_cast<const char*>(codes_.data() + size_t{slot} * code_bytes_)
+                        : reinterpret_cast<const char*>(data_.data() + size_t{slot} * dim_);
+    }
+    size_t stored_bytes() const noexcept { return sq_bits_ ? code_bytes_ : dim_ * sizeof(float); }
 
     // Asks the CPU to start loading slot's vector into cache. Searches are
     // limited by these random reads, so issuing several before using any lets
     // them overlap.
     void prefetch_vector(uint32_t slot) const noexcept {
-        const char* p = reinterpret_cast<const char*>(vec(slot));
-        const size_t bytes = dim_ * sizeof(float);
+        const char* p = stored(slot);
+        const size_t bytes = stored_bytes();
         for (size_t b = 0; b < bytes; b += 64) __builtin_prefetch(p + b);
         __builtin_prefetch(p + bytes - 1);   // the last line, when the vector isn't 64-byte aligned
     }
@@ -167,7 +201,11 @@ private:
         return static_cast<uint32_t>((z ^ (z >> 31)) >> 32);
     }
 
-    vector<float> data_;       // row-major, one row per slot
+    int sq_bits_ = 0;          // 0 (floats), 4 or 8
+    size_t code_bytes_ = 0;    // with SQ: bytes of codes per slot
+    detail::SQ quant_;         // trained ranges; empty until train()
+    vector<float> data_;       // row-major, one row per slot; empty with SQ
+    vector<uint8_t> codes_;    // with SQ: code_bytes_ per slot, row-major
     vector<uint32_t> level0_;  // per slot, M0_ + 1 entries: count, then neighbors
     vector<vector<vector<uint32_t>>> upper_; // upper_[slot][level - 1]: neighbors on levels >= 1
     vector<uint8_t> levels_;   // top level of each slot

@@ -5,6 +5,7 @@
 #include "vecengine/hnsw_index.hpp"
 #include "vecengine/index_factory.hpp"
 #include "vecengine/refine_index.hpp"
+#include "vecengine/sq.hpp"
 #include "vecengine/threads.hpp"
 #include "serialize.hpp"
 
@@ -268,13 +269,14 @@ TEST_CASE("HNSW: load rejects truncated and corrupt data", "[hnsw][serialize]") 
     }
     SECTION("neighbor out of range") {
         // the first level-0 neighbor of slot 0 sits after the header, the shape
-        // fields, the generator state, the vectors and the levels
+        // fields, the generator state, the storage byte, the vectors and the levels
         std::stringstream probe(bytes);
         (void)read_header(probe);
         for (int i = 0; i < 5; ++i) (void)read_pod<uint64_t>(probe);
         (void)read_pod<int32_t>(probe);
         (void)read_pod<uint32_t>(probe);
         (void)read_pod<uint64_t>(probe);
+        (void)read_pod<uint8_t>(probe);
         (void)read_vec<float>(probe, n * dim);
         (void)read_vec<uint8_t>(probe, n);
         const auto level0_at = static_cast<size_t>(probe.tellg()) + sizeof(uint64_t);   // past its length
@@ -398,4 +400,245 @@ TEST_CASE("HNSW: a RefineIndex over HNSW saves and loads", "[hnsw][serialize][re
     auto loaded = hnsw_roundtrip(refine);
     REQUIRE(dynamic_cast<RefineIndex*>(loaded.get()) != nullptr);
     require_identical(loaded->query_batch(queries, nq, k), refine.query_batch(queries, nq, k));
+}
+
+// An SQ HNSWIndex with codes of `bits`, trained on data and holding all of it.
+static std::unique_ptr<HNSWIndex> sq_hnsw(int bits, const std::vector<float>& data, size_t n, size_t dim, uint32_t seed,
+                                          Metric metric = Metric::L2) {
+    auto hnsw = std::make_unique<HNSWIndex>(dim, 16, 100, false, seed, metric);
+    hnsw->enable_sq(bits);
+    hnsw->train(data, n);
+    hnsw->add_batch(data, n);
+    return hnsw;
+}
+
+TEST_CASE("SQ: codes round to the nearest level and the kernel matches the decoded vector", "[sq]") {
+    for (int bits : {8, 4}) {
+        // with and without SIMD tails, and odd sizes that leave a 4-bit code's high nibble unused
+        for (size_t dim : {size_t{3}, size_t{16}, size_t{33}, size_t{100}, size_t{128}}) {
+            CAPTURE(bits, dim);
+            auto data = hnsw_random(200, dim, 50);
+            SQ q;
+            q.bits = bits;
+            q.train(data, 200, dim);
+            REQUIRE(q.code_bytes() == (bits == 8 ? dim : (dim + 1) / 2));
+            std::vector<uint8_t> code(q.code_bytes());
+            std::vector<float> decoded(dim);
+            auto query = hnsw_random(1, dim, 51);
+            for (size_t i = 0; i < 200; ++i) {
+                const float* v = data.data() + i * dim;
+                q.encode(v, code.data());
+                q.decode(code.data(), decoded.data());
+                for (size_t d = 0; d < dim; ++d) REQUIRE(std::abs(decoded[d] - v[d]) <= q.step[d] * 0.5f + 1e-5f);
+                const float exact = l2_distance_scalar(query.data(), decoded.data(), dim);
+                REQUIRE(std::abs(q.distance(query.data(), code.data()) - exact) <= 1e-4f * (1.0f + exact));
+            }
+        }
+    }
+
+    // out-of-range values clamp to the end codes; a constant dimension decodes to its value
+    for (int bits : {8, 4}) {
+        CAPTURE(bits);
+        SQ q;
+        q.bits = bits;
+        const std::vector<float> train{0.0f, 5.0f, 1.0f, 1.0f, 5.0f, 1.0f};   // dims 1 and 2 constant
+        q.train(train, 2, 3);
+        uint8_t code[3] = {};
+        float back[3];
+        const float high[3] = {3.0f, 9.0f, 2.0f};
+        q.encode(high, code);
+        q.decode(code, back);
+        REQUIRE(back[0] == 1.0f);
+        REQUIRE(back[1] == 5.0f);
+        REQUIRE(back[2] == 1.0f);
+        if (bits == 4) {
+            REQUIRE(code[0] == 0x0F);   // dimension 0 at the top code, dimension 1 at 0
+            REQUIRE(code[1] == 0x00);   // dimension 2 alone in byte 1
+        }
+        const float low[3] = {-3.0f, 9.0f, 2.0f};
+        q.encode(low, code);
+        q.decode(code, back);
+        REQUIRE(back[0] == 0.0f);
+    }
+}
+
+TEST_CASE("HNSW SQ: recall close to the float graph, exact again under a RefineIndex", "[hnsw][sq]") {
+    const size_t n = 5000, dim = 32, nq = 200, k = 10;
+    auto data = hnsw_random(n, dim, 52);
+    auto queries = hnsw_random(nq, dim, 53);
+    FlatIndex flat(dim);
+    flat.add_batch(data, n);
+    const auto truth = flat.query_batch(queries, nq, k);
+
+    struct Case { int bits; double plain; size_t k_factor; };
+    for (const Case c : {Case{8, 0.9, 4}, Case{4, 0.5, 8}}) {
+        CAPTURE(c.bits);
+        auto owned = sq_hnsw(c.bits, data, n, dim, 7);
+        HNSWIndex& hnsw = *owned;
+        REQUIRE(hnsw.sq_bits() == c.bits);
+        REQUIRE(hnsw.trained());
+        hnsw.set_ef_search(64);
+        REQUIRE(hnsw_recall(hnsw.query_batch(queries, nq, k), truth) >= c.plain);
+
+        HNSWIndex base(dim, 16, 100, false, 7);
+        base.enable_sq(c.bits);
+        base.train(data, n);
+        base.set_ef_search(64);
+        RefineIndex refine(base, c.k_factor);
+        refine.add_batch(data, n);
+        const auto got = refine.query_batch(queries, nq, k);
+        REQUIRE(hnsw_recall(got, truth) >= 0.95);
+        for (size_t q = 0; q < nq; ++q)
+            for (const auto& nb : got[q])
+                REQUIRE(nb.distance == l2_distance(queries.data() + q * dim, data.data() + nb.index * dim, dim));
+    }
+}
+
+TEST_CASE("HNSW SQ: enable_sq and train are checked", "[hnsw][sq]") {
+    auto data = hnsw_random(100, 8, 54);
+    HNSWIndex plain(8);
+    REQUIRE(plain.sq_bits() == 0);
+    REQUIRE_THROWS_AS(plain.train(data, 100), std::logic_error);
+    REQUIRE_FALSE(plain.trained());
+    plain.add_batch(data, 100);
+    REQUIRE_THROWS_AS(plain.enable_sq(8), std::logic_error);
+
+    HNSWIndex hnsw(8);
+    for (int bad : {0, 1, 2, 6, 16}) REQUIRE_THROWS_AS(hnsw.enable_sq(bad), std::invalid_argument);
+    REQUIRE(hnsw.sq_bits() == 0);
+    hnsw.enable_sq(4);
+    REQUIRE_THROWS_AS(hnsw.add_batch(data, 100), std::logic_error);
+    REQUIRE(hnsw.size() == 0);
+    REQUIRE_THROWS_AS(hnsw.train(data, 0), std::invalid_argument);
+    hnsw.train(data, 100);
+    REQUIRE_THROWS_AS(hnsw.train(data, 100), std::logic_error);
+    REQUIRE_THROWS_AS(hnsw.enable_sq(8), std::logic_error);
+    hnsw.add_batch(data, 100);
+    REQUIRE(hnsw.size() == 100);
+
+    IndexOptions opts;
+    opts.hnsw_sq_bits = 4;
+    auto made = make_index(IndexType::HNSW, 8, opts);
+    REQUIRE(dynamic_cast<HNSWIndex&>(*made).sq_bits() == 4);
+    opts.hnsw_sq_bits = 5;
+    REQUIRE_THROWS_AS(make_index(IndexType::HNSW, 8, opts), std::invalid_argument);
+}
+
+TEST_CASE("HNSW SQ: save/load keeps codes, ranges and an untrained index", "[hnsw][sq][serialize]") {
+    OneThread one_thread;
+    const size_t n = 1500, dim = 17, nq = 50, k = 10;   // odd dim: 4-bit rows end in half a byte
+    auto data = hnsw_random(n + 200, dim, 55);
+    auto queries = hnsw_random(nq, dim, 56);
+    for (int bits : {8, 4}) {
+        CAPTURE(bits);
+        HNSWIndex hnsw(dim, 12, 100, false, 9);
+        hnsw.enable_sq(bits);
+        hnsw.train(data, n + 200);
+        hnsw.add_batch({data.data(), n * dim}, n);
+        std::vector<int64_t> dead{3, 30, 300};
+        hnsw.remove(dead);
+
+        auto loaded_base = hnsw_roundtrip(hnsw);
+        auto& loaded = dynamic_cast<HNSWIndex&>(*loaded_base);
+        REQUIRE(loaded.sq_bits() == bits);
+        REQUIRE(loaded.trained());
+        require_identical(loaded.query_batch(queries, nq, k), hnsw.query_batch(queries, nq, k));
+        hnsw.add_batch({data.data() + n * dim, 200 * dim}, 200);
+        loaded.add_batch({data.data() + n * dim, 200 * dim}, 200);
+        require_identical(loaded.query_batch(queries, nq, k), hnsw.query_batch(queries, nq, k));
+
+        HNSWIndex untrained(dim);
+        untrained.enable_sq(bits);
+        auto loaded_untrained = hnsw_roundtrip(untrained);
+        auto& u = dynamic_cast<HNSWIndex&>(*loaded_untrained);
+        REQUIRE(u.sq_bits() == bits);
+        REQUIRE_FALSE(u.trained());
+        u.train(data, n);
+        u.add_batch({data.data(), n * dim}, n);
+        REQUIRE(u.size() == n);
+
+        // a refined SQ graph nests the same way
+        HNSWIndex base(dim, 8, 50, false, 1);
+        base.enable_sq(bits);
+        base.train(data, n);
+        RefineIndex refine(base, 2);
+        refine.add_batch({data.data(), n * dim}, n);
+        auto loaded_refine = hnsw_roundtrip(refine);
+        require_identical(loaded_refine->query_batch(queries, nq, k), refine.query_batch(queries, nq, k));
+    }
+}
+
+TEST_CASE("HNSW SQ: load rejects a bad storage byte and a trained-less index with vectors", "[hnsw][sq][serialize]") {
+    const size_t n = 100, dim = 8;
+    auto data = hnsw_random(n, dim, 57);
+    auto owned = sq_hnsw(8, data, n, dim, 1);
+    HNSWIndex& hnsw = *owned;
+    std::stringstream s;
+    hnsw.save(s);
+    const std::string bytes = s.str();
+
+    // the storage byte (bits per dimension) follows the header, the shape fields and the generator state
+    const size_t storage_at = 9 + 5 * 8 + 4 + 4 + 8;
+    REQUIRE(bytes[storage_at] == 8);
+    for (char bad_bits : {1, 2, 5, 16}) {
+        std::string bad = bytes;
+        bad[storage_at] = bad_bits;
+        std::stringstream t(bad);
+        REQUIRE_THROWS_AS(load_index(t), std::runtime_error);
+    }
+
+    // 8-bit codes read as 4-bit: twice the code bytes the shape allows
+    std::string narrowed = bytes;
+    narrowed[storage_at] = 4;
+    std::stringstream t(narrowed);
+    REQUIRE_THROWS_AS(load_index(t), std::runtime_error);
+
+    // ranges cut to length 0 while slots hold codes
+    std::string no_ranges = bytes;
+    const uint64_t zero = 0;
+    std::memcpy(no_ranges.data() + storage_at + 1, &zero, sizeof(zero));
+    no_ranges.erase(storage_at + 1 + 8, dim * sizeof(float));
+    std::stringstream u(no_ranges);
+    REQUIRE_THROWS_AS(load_index(u), std::runtime_error);
+}
+
+TEST_CASE("HNSW SQ: compact rebuilds from the codes and keeps ids", "[hnsw][sq][compact]") {
+    const size_t n = 3000, dim = 16, nq = 100, k = 10;
+    auto data = hnsw_random(n, dim, 58);
+    auto queries = hnsw_random(nq, dim, 59);
+    FlatIndex flat(dim);
+    flat.add_batch(data, n);
+    std::vector<int64_t> dead;
+    for (int64_t id = 0; id < static_cast<int64_t>(n); id += 3) dead.push_back(id);
+    flat.remove(dead);
+    const auto truth = flat.query_batch(queries, nq, k);
+
+    for (int bits : {8, 4}) {
+        CAPTURE(bits);
+        auto owned = sq_hnsw(bits, data, n, dim, 4);
+        HNSWIndex& hnsw = *owned;
+        hnsw.remove(dead);
+        REQUIRE(hnsw.compact() == dead.size());
+        REQUIRE(hnsw.size() == n - dead.size());
+
+        const auto got = hnsw.query_batch(queries, nq, k);
+        for (const auto& row : got)
+            for (const auto& nb : row) REQUIRE(nb.index % 3 != 0);
+        REQUIRE(hnsw_recall(got, truth) >= (bits == 8 ? 0.9 : 0.5));
+    }
+}
+
+TEST_CASE("HNSW SQ: cosine trains on unit vectors", "[hnsw][sq][metric]") {
+    const size_t n = 2000, dim = 16, nq = 50, k = 10;
+    auto data = hnsw_random(n, dim, 60);
+    for (size_t i = 0; i < n * dim; ++i) data[i] *= 1.0f + static_cast<float>(i % 7);   // lengths don't matter
+    auto queries = hnsw_random(nq, dim, 61);
+    FlatIndex flat(dim, 1024, false, Metric::Cosine);
+    flat.add_batch(data, n);
+    const auto truth = flat.query_batch(queries, nq, k);
+    for (int bits : {8, 4}) {
+        CAPTURE(bits);
+        auto owned = sq_hnsw(bits, data, n, dim, 2, Metric::Cosine);
+        REQUIRE(hnsw_recall(owned->query_batch(queries, nq, k), truth) >= (bits == 8 ? 0.9 : 0.5));
+    }
 }

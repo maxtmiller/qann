@@ -58,12 +58,44 @@ void HNSWIndex::set_ef_search(size_t ef) {
     ef_search_ = ef;
 }
 
+void HNSWIndex::enable_sq(int bits) {
+    if (bits != 4 && bits != 8) throw std::invalid_argument("bits must be 4 or 8");
+    if (id_map_.slots() > 0 || trained()) throw std::logic_error("enable_sq must be called before train()/add()");
+    sq_bits_ = bits;
+    quant_.bits = bits;
+    code_bytes_ = bits == 8 ? dim_ : (dim_ + 1) / 2;
+}
+
+void HNSWIndex::train(span<const float> vectors, size_t num_vectors) {
+    if (!sq_bits_) throw std::logic_error("train() is only needed with enable_sq()");
+    if (id_map_.slots() > 0) throw std::logic_error("train() cannot be called after add()");
+    if (trained()) throw std::logic_error("train() has already been called");
+    if (num_vectors == 0) throw std::invalid_argument("training set must not be empty");
+    assert(vectors.size() == num_vectors * dim_);
+
+    // learn the ranges of the same unit vectors that adds and queries will use
+    if (metric_ == Metric::Cosine) {
+        const vector<float> unit = normalize_rows(vectors, num_vectors);
+        quant_.train(unit, num_vectors, dim_);
+    } else {
+        quant_.train(vectors, num_vectors, dim_);
+    }
+}
+
 void HNSWIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) {
     assert(vecs.size() == n * dim_);
+    if (sq_bits_ && !trained()) throw std::logic_error("train() has not been run yet");
     const uint32_t first = static_cast<uint32_t>(id_map_.slots());
     id_map_.add(n, ids);
 
-    data_.insert(data_.end(), vecs.begin(), vecs.end());
+    if (sq_bits_) {
+        codes_.resize(id_map_.slots() * code_bytes_);
+        detail::parallel_for(n, [&](size_t i) {
+            quant_.encode(vecs.data() + i * dim_, codes_.data() + (first + i) * code_bytes_);
+        });
+    } else {
+        data_.insert(data_.end(), vecs.begin(), vecs.end());
+    }
     level0_.resize(id_map_.slots() * (M0_ + 1), 0);
     upper_.resize(id_map_.slots());
     levels_.resize(id_map_.slots(), 0);
@@ -104,14 +136,18 @@ size_t HNSWIndex::compact_impl(bool keep_ids) {
         if (remap[i] == detail::IdMap::kRemoved) continue;
 
         if (new_slot != i) {
-            float* src = data_.data() + i * dim();
-            float* dst = data_.data() + new_slot * dim();
-            std::copy_n(src, dim(), dst);
+            if (sq_bits_) std::copy_n(codes_.data() + i * code_bytes_, code_bytes_, codes_.data() + new_slot * code_bytes_);
+            else std::copy_n(data_.data() + i * dim(), dim(), data_.data() + new_slot * dim());
         }
         ++write_slot;
     }
-    data_.resize(write_slot * dim());
-    data_.shrink_to_fit();
+    if (sq_bits_) {
+        codes_.resize(write_slot * code_bytes_);
+        codes_.shrink_to_fit();
+    } else {
+        data_.resize(write_slot * dim());
+        data_.shrink_to_fit();
+    }
 
     level0_.assign(write_slot * (M0_ + 1), 0);
     upper_.assign(write_slot, {});
@@ -139,6 +175,15 @@ void HNSWIndex::save(std::ostream& out) const {
     // the generator's state, so adds after a load draw the same levels as
     // adds without the save
     write_pod(out, rng_state_);
+
+    // storage (version 6): bits per dimension (0 = floats); with SQ, the
+    // ranges (empty until trained) and codes, and data_ is then empty
+    write_pod(out, static_cast<uint8_t>(sq_bits_));
+    if (sq_bits_) {
+        write_vec(out, quant_.vmin);
+        write_vec(out, quant_.step);
+        write_vec(out, codes_);
+    }
 
     write_vec(out, data_);
     write_vec(out, levels_);
@@ -179,10 +224,26 @@ std::unique_ptr<HNSWIndex> HNSWIndex::load_body(std::istream& in, uint32_t versi
         index->rng_state_ = h;
     }
 
-    index->data_ = read_vec<float>(in, slots * dim);
+    if (version >= 6) {
+        const auto bits = read_pod<uint8_t>(in);
+        if (bits != 0 && bits != 4 && bits != 8) throw corrupt("invalid HNSWIndex storage");
+        if (bits) index->enable_sq(bits);
+    }
+    const bool sq = index->sq_bits_ != 0;
+    if (sq) {
+        index->quant_.vmin = read_vec<float>(in, dim);
+        index->quant_.step = read_vec<float>(in, dim);
+        index->codes_ = read_vec<uint8_t>(in, slots * index->code_bytes_);
+        const size_t ranges = index->quant_.vmin.size();
+        if ((ranges != 0 && ranges != dim) || index->quant_.step.size() != ranges || (ranges == 0 && slots > 0) ||
+            index->codes_.size() != slots * index->code_bytes_)
+            throw corrupt("HNSWIndex SQ length mismatch");
+    }
+
+    index->data_ = read_vec<float>(in, sq ? 0 : slots * dim);
     index->levels_ = read_vec<uint8_t>(in, slots);
     index->level0_ = read_vec<uint32_t>(in, slots * (index->M0_ + 1));
-    if (index->data_.size() != slots * dim || index->levels_.size() != slots ||
+    if (index->data_.size() != (sq ? 0 : slots * dim) || index->levels_.size() != slots ||
         index->level0_.size() != slots * (index->M0_ + 1))
         throw corrupt("HNSWIndex length mismatch");
 
@@ -318,11 +379,13 @@ vector<uint32_t> HNSWIndex::select_neighbors(vector<Candidate> candidates, size_
 
     vector<uint32_t> res;
     res.reserve(max_neighbors);
+    vector<float> buf;
     for (auto& c : candidates) { 
         if (res.size() == max_neighbors) break;
+        const float* cv = vector_of(c.second, buf);
         bool keep = true;
         for (uint32_t r : res) {
-            if (distance(vec(c.second), r) <= c.first) { keep = false; break; }
+            if (distance(cv, r) <= c.first) { keep = false; break; }
         }
         if (keep) res.emplace_back(c.second);
     }
@@ -363,7 +426,8 @@ void HNSWIndex::insert(uint32_t slot) {
 
     // descend greedily to the new node's top level, then link it on each level
     // from there down, searching with ef_construction
-    const float* q = vec(slot);
+    vector<float> buf;
+    const float* q = vector_of(slot, buf);
     for (int l = top_level; l > level; --l) ep = greedy_closest(q, ep, l, true);
 
     vector<uint32_t> entry_points{ep};
@@ -394,7 +458,8 @@ void HNSWIndex::add_link(uint32_t node, uint32_t new_neighbor, int level) {
     }
 
     // full: keep the best capacity(level) of the old neighbors plus the new one
-    const float* base = vec(node);
+    vector<float> buf;
+    const float* base = vector_of(node, buf);
     vector<Candidate> candidates;
     candidates.reserve(list.size() + 1);
     for (uint32_t nb : list) candidates.emplace_back(distance(base, nb), nb);
@@ -419,9 +484,11 @@ void HNSWIndex::set_own_neighbors(uint32_t slot, int level, const vector<uint32_
         set_neighbors(slot, level, merged);
         return;
     }
+    vector<float> buf;
+    const float* base = vector_of(slot, buf);
     vector<Candidate> candidates;
     candidates.reserve(merged.size());
-    for (uint32_t nb : merged) candidates.emplace_back(distance(vec(slot), nb), nb);
+    for (uint32_t nb : merged) candidates.emplace_back(distance(base, nb), nb);
     set_neighbors(slot, level, select_neighbors(std::move(candidates), capacity(level)));
 }
 
@@ -450,6 +517,16 @@ void HNSWIndex::set_neighbors(uint32_t slot, int level, span<const uint32_t> lis
     upper_[slot][static_cast<size_t>(level - 1)].assign(list.begin(), list.end());
 }
 
-float HNSWIndex::distance(const float* q, uint32_t slot) const { return l2_distance(q, vec(slot), dim_); }
+float HNSWIndex::distance(const float* q, uint32_t slot) const {
+    if (sq_bits_) return quant_.distance(q, codes_.data() + size_t{slot} * code_bytes_);
+    return l2_distance(q, data_.data() + size_t{slot} * dim_, dim_);
+}
+
+const float* HNSWIndex::vector_of(uint32_t slot, vector<float>& buf) const {
+    if (!sq_bits_) return data_.data() + size_t{slot} * dim_;
+    buf.resize(dim_);
+    quant_.decode(codes_.data() + size_t{slot} * code_bytes_, buf.data());
+    return buf.data();
+}
 
 } // namespace vecengine

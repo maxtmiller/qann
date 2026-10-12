@@ -79,6 +79,7 @@ add_library(vecengine_core STATIC
   src/id_map.cpp
   src/fast_scan.cpp
   src/hnsw_index.cpp
+  src/sq.cpp
 )
 
 target_include_directories(vecengine_core PUBLIC

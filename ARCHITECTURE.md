@@ -29,6 +29,7 @@ vecengine/
 │   ├── ivf_index.hpp               # IVF index, optional PQ
 │   ├── hnsw_index.hpp              # HNSW graph index
 │   ├── pq.hpp                      # PQCodebook + PQDistance
+│   ├── sq.hpp                      # SQ: 8- and 4-bit scalar quantizer used by HNSWIndex
 │   ├── refine_index.hpp            # exact re-ranking wrapper
 │   └── index_factory.hpp           # make_index() + IndexOptions, save_index() / load_index()
 ├── src/
@@ -40,6 +41,7 @@ vecengine/
 │   ├── id_map.cpp                  # IdMap: slots <-> user ids, deletions
 │   ├── index.cpp                   # default Index::add_batch / query_batch
 │   ├── pq.cpp
+│   ├── sq.cpp                      # SQ train / encode / decode, NEON / AVX2 distance
 │   ├── flat_index.cpp
 │   ├── ivf_index.cpp
 │   ├── hnsw_index.cpp
@@ -50,10 +52,10 @@ vecengine/
 │   ├── test_serialize.cpp          # save/load round trips and corrupt-file rejection
 │   ├── test_id_map.cpp             # IdMap, custom ids, deletion and compaction per index, format v2/v3
 │   ├── test_fast_scan.cpp          # fast-scan packing, kernels, table rounding, IVF fast-scan
-│   ├── test_hnsw.cpp               # HNSW recall, determinism, deletion, compaction, save/load, parallel build
+│   ├── test_hnsw.cpp               # HNSW recall, determinism, deletion, compaction, save/load, parallel build, SQ
 │   ├── test_metric.cpp             # cosine metric: exact ranking, normalize_rows, zero vectors, save/load, format v4 files
 │   ├── test_python.py              # pytest smoke, save/load, ids and threading tests
-│   └── data/                       # index files saved by 0.1.0a4 (v1), 0.1.0a6 (v2), 0.1.0a7 (v3) and 0.1.0a10 (v4) + their results
+│   └── data/                       # index files saved by 0.1.0a4 (v1), 0.1.0a6 (v2), 0.1.0a7 (v3), 0.1.0a10 (v4), 0.1.0a11 (v5) and macOS-made SQ8 / SQ4 files (v6) + their results
 ├── benchmarks/
 │   ├── bench_distance.cpp          # Google Benchmark distance kernels
 │   ├── bench_indexes.py            # recall vs QPS on SIFT
@@ -165,6 +167,10 @@ With 16 centroids per subspace a code is 4 bits, and a row of the ADC table is 1
 
 Measured on SIFT1M (`benchmarks/fastscan_recall.py`, with 8-bit tables): rounding the tables to bytes costs no recall (0.482 vs 0.482 for PQ32×4, 0.672 vs 0.673 for PQ64×4, flat PQ over 100k vectors). The 4-bit codes do cost recall before re-ranking (PQ64×4 0.638 vs PQ32×8 0.706 at the same 32 bytes), but with re-ranking (`k_factor = 16`) PQ64×4 matches PQ32×8: 0.931 vs 0.932 at `nprobe = 16`, 0.995 vs 0.995 at 64.
 
+### `sq.hpp` / `sq.cpp`: `SQ` (`vecengine::detail`)
+
+Scalar quantization with `bits` = 8 or 4, used by `HNSWIndex::enable_sq()`. `train` sets each dimension's range to the min and max of the sample: `vmin[d]` is code 0 and `step[d] = (max - min) / max_code()` the spacing (`max_code()` is 255 or 15; `step` is 0 for a constant dimension, which then always encodes as 0). 8-bit codes take one byte per dimension; 4-bit codes are packed two per byte, dimension `2i` in the low nibble of byte `i` and `2i + 1` in the high nibble, so a vector takes `code_bytes()` = `ceil(dim / 2)` bytes and an odd `dim` leaves the last high nibble 0. `encode` rounds to the nearest level and clamps values outside the range; `decode` returns `vmin + code * step`, so a decoded value is within `step / 2` of the original inside the range. `distance(q, code)` is the squared L2 from a float query to the decoded vector without writing it out. Both widths share one scoring path: NEON widens 16 one-byte codes to four float lanes and computes `q - (vmin + c * step)` with FMAs into two accumulators, and for 4 bits it first splits 16 packed bytes into low and high nibbles and interleaves them (`vzip1q_u8` / `vzip2q_u8`) into 32 one-byte codes in dimension order. AVX2 does the same 8 dimensions at a time (`_mm_unpacklo_epi8` for the nibbles). A scalar loop handles the tail. Unlike PQ there are no codebooks: each dimension is independent, so nothing needs k-means, and SQ8 loses far less than PQ at 4x compression; SQ4's 16 levels are coarse enough that it needs re-ranking.
+
 ---
 
 ## Layer 3: Indexes
@@ -266,7 +272,7 @@ Every candidate goes through one `push` lambda that checks the `TopK` threshold 
 
 ### `hnsw_index.hpp`: `HNSWIndex`
 
-`HNSWIndex(dim, M = 16, ef_construction = 200, custom_ids = false, seed)` is a Hierarchical Navigable Small World graph (Malkov & Yashunin). Every vector is a node on level 0; a node's top level is drawn as `floor(-ln(U) / ln(M))`, so each level up holds about 1/M of the nodes. Vectors are stored in full, in slot order (`data_`), with ids from an `IdMap` like `FlatIndex`.
+`HNSWIndex(dim, M = 16, ef_construction = 200, custom_ids = false, seed)` is a Hierarchical Navigable Small World graph (Malkov & Yashunin). Every vector is a node on level 0; a node's top level is drawn as `floor(-ln(U) / ln(M))`, so each level up holds about 1/M of the nodes. Vectors are stored in full, in slot order (`data_`), or as SQ codes (`codes_`, see below), with ids from an `IdMap` like `FlatIndex`.
 
 **Storage.** Level 0 is one flat `vector<uint32_t>` with `2M + 1` entries per slot (a count, then up to `2M` neighbor slots), so the hot level is contiguous. Upper levels, which hold few nodes, are `upper_[slot][level - 1]`, a list per level. `levels_` holds each slot's top level; `entry_` is a node on the top level `max_level_` (`-1` while empty).
 
@@ -280,7 +286,9 @@ Every candidate goes through one `push` lambda that checks the `TopK` threshold 
 
 **Memory access.** A search is limited by memory, not arithmetic: on SIFT1M a query at `ef_search = 64` computes about 1,210 distances and expands 76 nodes, and each neighbor's vector is a random 512-byte read from a 512 MB array (~125 ns per distance before prefetching, against ~17 ns for the arithmetic on data in cache). So `search_layer` expands a node in two passes: the first marks its unvisited neighbors and calls `prefetch_vector` on each, so their reads overlap; the second computes the distances. On level 0 it also prefetches the neighbor list of the node it will most likely expand next (the new top of the candidate heap). The upper levels only need the single closest node, so `greedy_closest` walks to whichever neighbor is closer until none is, with the same prefetching and no heaps. Together these took a single-threaded query from 152–157 to 94–95 µs at `ef_search = 64` (recall 0.958) and from 513–596 to 263–287 µs at 256 (0.994), with identical results; builds, which are mostly searches, got faster too.
 
-**Measured** (SIFT1M, `M = 16`, `ef_construction = 200`, all 8 cores, machine busy, IVF in the same run): the build takes 90 s (IVF + PQ64×4 fast-scan + R16: 9.2 s). Recall@10 and QPS by `ef_search`: 16: 0.794 / 37.4k, 32: 0.897 / 30.4k, 64: 0.958 / 21.2k, 128: 0.986 / 8.7k, 256: 0.995 / 5.7k. IVF + fast-scan + R16 at `nprobe` 16 / 32 / 64: 0.931 / 36.1k, 0.977 / 22.6k, 0.995 / 11.8k. So at 0.995 recall HNSW is about 2× slower than IVF + fast-scan + re-ranking (it was 3× before the prefetching). The remaining gap is mostly the size of the vectors it reads: storing 8-bit codes in the graph (compressed HNSW, below) would cut each read from 512 to 128 bytes.
+**Measured** (SIFT1M, `M = 16`, `ef_construction = 200`, all 8 cores, machine busy, IVF in the same run): the build takes 90 s (IVF + PQ64×4 fast-scan + R16: 9.2 s). Recall@10 and QPS by `ef_search`: 16: 0.794 / 37.4k, 32: 0.897 / 30.4k, 64: 0.958 / 21.2k, 128: 0.986 / 8.7k, 256: 0.995 / 5.7k. IVF + fast-scan + R16 at `nprobe` 16 / 32 / 64: 0.931 / 36.1k, 0.977 / 22.6k, 0.995 / 11.8k. So at 0.995 recall HNSW is about 2× slower than IVF + fast-scan + re-ranking (it was 3× before the prefetching). The remaining gap is mostly the size of the vectors it reads, which SQ storage (below) cuts from 512 to 128 bytes (8 bits) or 64 (4 bits).
+
+**SQ storage** (`enable_sq(bits)` with `bits` 8 or 4, before `train()` and any add, like `IVFIndex::enable_pq`). `train()` learns a `detail::SQ` from a sample (unit vectors for Cosine, like IVF's training), and adds encode into `codes_` (`code_bytes_` per slot; `data_` stays empty). Everything goes through two helpers: `distance(q, slot)` uses `SQ::distance` on the slot's code, and `vector_of(slot, buf)` returns a pointer into `data_`, or decodes the code into the caller's `buf`. Inserts and neighbor selection use `vector_of` for the node being linked, so the graph is built and searched entirely with SQ distances, and `compact()` rebuilds from the codes. `prefetch_vector` fetches `stored_bytes()` (on SIFT 2 cache lines for SQ8, 1 for SQ4, instead of 8). Query distances are approximate; a `RefineIndex` over the SQ graph restores exact ranking: `k_factor = 2` is enough for SQ8 on SIFT1M because it ranks nearly like the floats, and SQ4 needs 4. Measured on SIFT1M (all cores, machine busy, same run, first-try numbers before the full refresh): float `ef_search` 64 / 128: 0.960 / 46.9k, 0.987 / 26.4k; SQ8 alone: 0.953 / 59.1k, 0.978 / 35.9k; SQ8 + R2: 0.960 / 57.1k, 0.987 / 33.7k. So SQ8 + re-ranking gives the float graph's recall at about 1.25× the speed, and plain SQ8 uses about 40% of the float graph's memory (128 + 132 bytes of level-0 links per vector vs 512 + 132). SQ4 in a separate run (load ~14): alone 0.840 / 60.8k at 64 and 0.853 / 33.2k at 128 (16 levels lose too much to use alone), with R4 0.957 / 57.4k and 0.986 / 33.7k: the same recall and speed as SQ8 + R2, at 64 code bytes instead of 128. It is not faster than SQ8 because a search waits on the latency of each random read (the vector and its 132-byte link list), not on the bytes moved.
 
 ### `refine_index.hpp`: `RefineIndex`
 
@@ -300,7 +308,7 @@ It only helps when `base` ranks with approximate distances (IVF + PQ). It restor
 
 ### `index_factory.hpp`: `make_index`
 
-`make_index(IndexType, dim, IndexOptions)` returns `unique_ptr<Index>`. `IndexOptions` holds `capacity` (Flat), `nlist`, `nprobe`, `pq_subspaces` (0 = PQ off) and `pq_centroids` (IVF), `hnsw_m`, `ef_construction` and `ef_search` (HNSW), and `custom_ids` (all). IVF-specific calls like `train()` require the concrete `IVFIndex`.
+`make_index(IndexType, dim, IndexOptions)` returns `unique_ptr<Index>`. `IndexOptions` holds `capacity` (Flat), `nlist`, `nprobe`, `pq_subspaces` (0 = PQ off) and `pq_centroids` (IVF), `hnsw_m`, `ef_construction`, `ef_search` and `hnsw_sq_bits` (HNSW, 0 for floats, 8 or 4 calls `enable_sq()`), and `custom_ids` (all). Type-specific calls like `train()` require the concrete `IVFIndex` or `HNSWIndex`.
 
 `load_index(std::istream&)` reads a file header and dispatches to `FlatIndex::load_body`, `IVFIndex::load_body`, `HNSWIndex::load_body` or `RefineIndex::load_body`. The path overloads wrap it for files:
 
@@ -313,28 +321,28 @@ It only helps when `base` ranks with approximate distances (IVF + PQ). It restor
 
 Binary, little-endian (a `static_assert` requires a little-endian host), every size and count stored as `uint64`. Vectors are stored as a `uint64` element count followed by the raw elements (`write_vec` / `read_vec`).
 
-Every index starts with a 9-byte header: magic `QANN` (`uint32`), format version (`uint32`, currently 5) and an `IndexKind` tag (`uint8`). `Index::save` writes header + body; `load_index` reads the header (`read_header` returns `{kind, version}`) and passes the version to the type's static `load_body`, which reads only the body. Versions `kMinFormatVersion` (1) through `kFormatVersion` (5) are readable. Since version 5, Flat, IVF and HNSW bodies end with the metric (u8; `read_metric` rejects unknown values); older files load as L2. A Refine stores no metric of its own: it takes its base's.
+Every index starts with a 9-byte header: magic `QANN` (`uint32`), format version (`uint32`, currently 6) and an `IndexKind` tag (`uint8`). `Index::save` writes header + body; `load_index` reads the header (`read_header` returns `{kind, version}`) and passes the version to the type's static `load_body`, which reads only the body. Versions `kMinFormatVersion` (1) through `kFormatVersion` (6) are readable. Since version 5, Flat, IVF and HNSW bodies end with the metric (u8; `read_metric` rejects unknown values); older files load as L2. A Refine stores no metric of its own: it takes its base's.
 
 | Kind | Body |
 | --- | --- |
 | `Flat` (1) | `dim`, `count` (slots), `data` (`count * dim` floats), id map |
 | `IVF` (2) | `dim`, `nlist`, `nprobe`, `n_total` (slots), `trained` (u8), `pq_distance` (u8), coarse centroids (`nlist * dim`, or empty if untrained), PQ flag (u8) + `PQCodebook` and `fast_scan` (u8, version 4+) if set, then `nlist` lists in cluster order `0..nlist-1`, each slot `ids` + `codes` (PQ: `n * m` bytes, or `ceil(n / 32) * m * 16` in fast-scan blocks) or `vecs` (no PQ), empty lists written as empty vectors; id map; `use_precomputed` (u8, version 3+) |
 | `Refine` (3) | `k_factor`, `count` (slots), the base index (full header + body, same version), `data` (`count * dim` floats), id map |
-| `HNSW` (4) | `dim`, `M`, `ef_construction`, `ef_search`, `count` (slots), `max_level` (i32), `entry` (u32), the level generator's state (version 5: one u64, the splitmix64 state, so adds after a load draw the same levels; version 4 stored `std::mt19937`'s text form, which libc++ and libstdc++ write differently, so a version-4 file continues from an FNV-1a hash of that text), `data` (`count * dim` floats), `levels` (u8 per slot), level 0 (`count * (2M + 1)` u32), then each slot's upper-level lists in slot and level order, id map |
+| `HNSW` (4) | `dim`, `M`, `ef_construction`, `ef_search`, `count` (slots), `max_level` (i32), `entry` (u32), the level generator's state (version 5: one u64, the splitmix64 state, so adds after a load draw the same levels; version 4 stored `std::mt19937`'s text form, which libc++ and libstdc++ write differently, so a version-4 file continues from an FNV-1a hash of that text), the SQ bits per dimension (u8, version 6+: 0 for floats, 8 or 4) and, if nonzero, `vmin` and `step` (`dim` floats each, or empty while untrained) and the codes (`count * dim` bytes for 8 bits, `count * ceil(dim / 2)` for 4), `data` (`count * dim` floats, empty with SQ), `levels` (u8 per slot), level 0 (`count * (2M + 1)` u32), then each slot's upper-level lists in slot and level order, id map |
 
 The id map (`IdMap::save`, version 2+) is `custom_ids` (u8), the slot count, `next_id` (i64, version 3+), `labels` (empty while ids equal slots) and one deleted flag (u8) per slot. It ends each body (in IVF, only the `use_precomputed` flag follows it). For version 1, `load_body` skips it and starts from a map with every slot live and no custom ids; for version 2, `next_id` is the slot count and auto ids carry no labels. Version 3 added `next_id` and auto-id labels for compaction, and IVF's `use_precomputed` flag (version 2 files load with the tables on).
 
 `PQCodebook` (inside IVF, no header): `dim`, `num_subspaces`, `centroids_per_subspace`, `centroids_`. `centroids_t_` and `sdc_table_` are derived and rebuilt on load by `build_tables()`, the same code `train()` runs, so they come out bit-identical.
 
-**Validation on load.** Files are untrusted input, so every loader checks before allocating or indexing: `read_vec` takes a `max_len` and callers then require the exact expected length; sizes are checked against overflow (`count > UINT64_MAX / dim`); IVF ids must be `< n_total` and list sizes must sum to `n_total`; the PQ codebook's `dim` must match the index, and a fast-scan flag needs 16 centroids, an even `m <= 256` and ADC; a Refine's `count` must equal its base's `slots()` (queries index the raw vectors by base slot), its base's ids must equal its slots and it must have the same format version. A Refine base must be Flat, IVF or HNSW, which also stops a crafted file from nesting Refines until the stack overflows. An HNSW file's neighbor lists must be within capacity and point at real slots, and its entry point must sit on the top level. The id map must match its index's slot count, with no duplicate live ids; auto-id labels must be strictly increasing, `>= 0` and below `next_id`, and without labels `next_id` must equal the slot count (or the index must be empty). Any failure throws `runtime_error`.
+**Validation on load.** Files are untrusted input, so every loader checks before allocating or indexing: `read_vec` takes a `max_len` and callers then require the exact expected length; sizes are checked against overflow (`count > UINT64_MAX / dim`); IVF ids must be `< n_total` and list sizes must sum to `n_total`; the PQ codebook's `dim` must match the index, and a fast-scan flag needs 16 centroids, an even `m <= 256` and ADC; a Refine's `count` must equal its base's `slots()` (queries index the raw vectors by base slot), its base's ids must equal its slots and it must have the same format version. A Refine base must be Flat, IVF or HNSW, which also stops a crafted file from nesting Refines until the stack overflows. An HNSW file's neighbor lists must be within capacity and point at real slots, and its entry point must sit on the top level; the SQ bits must be 0, 4 or 8, and with SQ the ranges must have `dim` entries (or none, with no slots) and the codes exactly `count` rows of the width's code bytes. The id map must match its index's slot count, with no duplicate live ids; auto-id labels must be strictly increasing, `>= 0` and below `next_id`, and without labels `next_id` must equal the slot count (or the index must be empty). Any failure throws `runtime_error`.
 
-**Changing the format.** `IndexKind` values are append-only: never renumber or reuse one. Bump `kFormatVersion` whenever an existing type's layout changes, and read older versions explicitly in each `load_body` (as version 5 does for versions 1 to 4). `tests/data/` holds files saved by 0.1.0a4 (version 1), 0.1.0a6 (version 2, with deletions and custom ids) 0.1.0a7 (version 3, compacted, with precomputed tables off on the IVF file) and 0.1.0a10 (version 4: Flat with deletions, IVF fast-scan, and HNSW with deletions) with the results they returned; the C++ and Python tests load them to catch compatibility breaks, and re-save them in the current version.
+**Changing the format.** `IndexKind` values are append-only: never renumber or reuse one. Bump `kFormatVersion` whenever an existing type's layout changes, and read older versions explicitly in each `load_body` (as version 6 does for versions 1 to 5). `tests/data/` holds files saved by 0.1.0a4 (version 1), 0.1.0a6 (version 2, with deletions and custom ids) 0.1.0a7 (version 3, compacted, with precomputed tables off on the IVF file) 0.1.0a10 (version 4: Flat with deletions, IVF fast-scan, and HNSW with deletions) and 0.1.0a11 (version 5: cosine Flat and HNSW, with deletions) with the results they returned, plus version-6 RefineIndexes over SQ8 and SQ4 HNSW graphs (odd `dim`, so 4-bit rows end in half a byte) saved on macOS so Linux CI checks it is portable; the C++ and Python tests load them to catch compatibility breaks, and re-save them in the current version.
 
 ---
 
 ## Benchmarks (`benchmarks/bench_indexes.py`)
 
-Recall@10 (overlap of the returned top 10 with the true top 10), QPS on all cores (`query_batch`) and bytes per vector for Flat, IVF, IVF + PQ (ADC and SDC, m ∈ {8, 16, 32}), IVF + fast-scan PQ (m ∈ {32, 64}, 4-bit), IVF + PQ + re-ranking (`k_factor` ∈ {4, 16}), sweeping `nprobe` from 1 to 128, and HNSW (`M = 16`, `ef_construction = 200`), sweeping `ef_search` from 10 to 256. Training uses each dataset's `learn` set; `nlist ≈ √N`. Each configuration's QPS is the best of 3 full passes, so cold caches after a build don't distort the first measurement. Writes `benchmarks/results/<dataset>.csv` and a recall-vs-QPS plot.
+Recall@10 (overlap of the returned top 10 with the true top 10), QPS on all cores (`query_batch`) and bytes per vector for Flat, IVF, IVF + PQ (ADC and SDC, m ∈ {8, 16, 32}), IVF + fast-scan PQ (m ∈ {32, 64}, 4-bit), IVF + PQ + re-ranking (`k_factor` ∈ {4, 16}), sweeping `nprobe` from 1 to 128, and HNSW (`M = 16`, `ef_construction = 200`; float, SQ8, SQ4, and each SQ width re-ranked: SQ8 with `k_factor = 2`, SQ4 with 4), sweeping `ef_search` from 10 to 256. Training uses each dataset's `learn` set; `nlist ≈ √N`. Each configuration's QPS is the best of 3 full passes, so cold caches after a build don't distort the first measurement. Writes `benchmarks/results/<dataset>.csv` and a recall-vs-QPS plot.
 
 ```bash
 PYTHONPATH=build python3 benchmarks/bench_indexes.py                    # siftsmall (10k)
@@ -461,4 +469,4 @@ pip install .               # builds the Python module into a wheel (no C++ test
 
 ## Not Yet Implemented
 
-- **Compressed HNSW**: storing SQ8 or PQ codes in the graph instead of full vectors, with a `RefineIndex` for exact ranking.
+- **PQ-compressed HNSW**: PQ codes in the graph, for more compression than SQ4.

@@ -103,12 +103,15 @@ refine.add(x)
 
 ### `HNSWIndex(dim, M=16, ef_construction=200, *, custom_ids=False, seed=None)`
 
-A graph index (Hierarchical Navigable Small World): every vector is linked to `M` near neighbors (`2 * M` on the bottom level), and a query walks the graph toward the query vector. No training; `add` builds the graph on all cores. It stores vectors in full, so distances are exact, and it needs no representative training sample, at the cost of more memory per vector (the vector plus its links) and slower adds.
+A graph index (Hierarchical Navigable Small World): every vector is linked to `M` near neighbors (`2 * M` on the bottom level), and a query walks the graph toward the query vector. No training; `add` builds the graph on all cores. It stores vectors in full, so distances are exact, and it needs no representative training sample, at the cost of more memory per vector (the vector plus its links) and slower adds. With `enable_sq()` it stores 8- or 4-bit codes per dimension instead (see below).
 
 | Member | Description |
 | --- | --- |
 | `ef_search` | Property: how many candidates a query keeps while searching (default 64; queries use at least `k`). Can be changed at any time; higher means better recall and slower queries. |
 | `M`, `ef_construction` | Read-only properties: the settings the graph was built with. Higher `M` or `ef_construction` builds a better graph, more slowly. |
+| `enable_sq(bits=8)` | Store vectors as scalar codes of `bits` per dimension: 8 or 4 (anything else raises `ValueError`). Call before `train()` and `add()`. |
+| `train(x)` | With SQ: learn each dimension's range from sample vectors. Required before `add()`; raises `RuntimeError` without SQ. |
+| `sq_bits` | Read-only property: 8 or 4 after `enable_sq()`, else 0. |
 
 ```python
 index = qann.HNSWIndex(128, M=16, ef_construction=200)
@@ -121,6 +124,18 @@ On SIFT1M (1M vectors), `M=16, ef_construction=200` reaches recall@10 0.958 at `
 
 - **Deleting** marks vectors deleted; queries still route through them, so the graph stays connected, but never return them. `compact()` rebuilds the graph from the remaining vectors, which takes about as long as building it again, so call it after many deletes rather than after each one.
 - **Builds are parallel,** so the graph differs slightly from run to run. With `seed` and `qann.set_num_threads(1)`, the build is reproducible.
+
+**Scalar quantization (compressed HNSW).** `enable_sq(8)` maps each dimension's trained range onto 256 evenly spaced values, so a vector takes `dim` bytes instead of `4 * dim` (on SIFT, 128 instead of 512); `enable_sq(4)` uses 16 values packed two per byte (64 bytes on SIFT). Distances become approximate, so wrap the index in a `RefineIndex` to re-rank with exact ones: `k_factor=2` is usually enough for 8 bits, 4 for 4 bits. Values outside the training sample's range are clamped, so train on a representative sample (or on the vectors themselves).
+
+```python
+index = qann.HNSWIndex(128)
+index.enable_sq(8)
+index.train(x)
+refine = qann.RefineIndex(index, k_factor=2)
+refine.add(x)
+```
+
+On SIFT1M with the machine busy, at `ef_search=128`: 8 bits + `RefineIndex(k_factor=2)` matched the float graph's recall (0.987) at about 1.25x its queries per second, and 4 bits + `k_factor=4` did the same (0.986) at the same speed. The `RefineIndex` keeps full vectors too, so the memory saving needs the plain SQ index: 8 bits alone reaches 0.978, 4 bits alone only 0.85, so 4 bits really needs re-ranking. 4 bits is no faster than 8, since searches wait on memory latency rather than bytes moved; choose it to halve code memory.
 
 ### `RefineIndex(base, k_factor=10, *, custom_ids=False)`
 
@@ -139,7 +154,7 @@ ivf = qann.make_index(qann.IndexType.IVF, 128, opts)
 ivf.train(x)
 ```
 
-`IndexType` is `Flat`, `IVF` or `HNSW`. `IndexOptions` fields and defaults: `metric` (`Metric.L2`), plus `capacity` (Flat initial reserve, 1024), `nlist` (100), `nprobe` (10), `pq_subspaces` (0, meaning no PQ) and `pq_centroids` (256) for IVF, and `hnsw_m` (16), `ef_construction` (200) and `ef_search` (64) for HNSW.
+`IndexType` is `Flat`, `IVF` or `HNSW`. `IndexOptions` fields and defaults: `metric` (`Metric.L2`), plus `capacity` (Flat initial reserve, 1024), `nlist` (100), `nprobe` (10), `pq_subspaces` (0, meaning no PQ) and `pq_centroids` (256) for IVF, and `hnsw_m` (16), `ef_construction` (200), `ef_search` (64) and `hnsw_sq_bits` (0 for floats; 8 or 4 calls `enable_sq()`) for HNSW.
 
 ## Metrics
 
@@ -186,11 +201,11 @@ index = qann.load("vectors.qann")   # returns a FlatIndex, IVFIndex, HNSWIndex o
 ids, dists = index.batch_query(queries, 10)
 ```
 
-- **Everything is restored:** vectors, ids (including custom ids), deletions, IVF centroids, PQ codebooks, HNSW graphs, the metric and settings such as `nprobe`, `pq_distance`, `precomputed_tables`, `ef_search` and `k_factor`. A loaded index gives identical results and keeps accepting `add` and `remove`.
+- **Everything is restored:** vectors, ids (including custom ids), deletions, IVF centroids, PQ codebooks, HNSW graphs and SQ ranges, the metric and settings such as `nprobe`, `pq_distance`, `precomputed_tables`, `ef_search` and `k_factor`. A loaded index gives identical results and keeps accepting `add` and `remove`.
 - **A `RefineIndex` file contains its base index**, so loading one restores both. Tune the base through `loaded.base`, e.g. `loaded.base.nprobe = 32`.
 - **Saving is safe to interrupt:** the file is written next to the target as `<path>.tmp` and renamed into place when complete, so a failed save never leaves a partial file or destroys an existing one.
 - **Bad files raise `RuntimeError`:** a missing, truncated or corrupted file, or one that isn't a QaNN index, is rejected instead of loading garbage.
-- **Files are versioned.** Newer releases keep loading files saved by older ones (files from 0.1.0a4, 0.1.0a6, 0.1.0a7 and 0.1.0a10 still load). A file saved by a newer release than the one loading it raises `RuntimeError` rather than being misread.
+- **Files are versioned.** Newer releases keep loading files saved by older ones (files from 0.1.0a4, 0.1.0a6, 0.1.0a7, 0.1.0a10 and 0.1.0a11 still load). A file saved by a newer release than the one loading it raises `RuntimeError` rather than being misread.
 
 `PQCodebook` on its own can't be saved yet; save the `IVFIndex` that uses it instead.
 
