@@ -35,7 +35,7 @@ public:
     // nlist must be in [100, 65535] and nprobe in [1, nlist]; throws
     // std::invalid_argument otherwise. custom_ids makes add_batch() take user
     // ids.
-    explicit IVFIndex(size_t dim, size_t nlist, size_t nprobe = 10, bool custom_ids = false);
+    explicit IVFIndex(size_t dim, size_t nlist, size_t nprobe = 10, bool custom_ids = false, Metric metric = Metric::L2);
 
     // Enables PQ compression of residuals (vec - assigned coarse centroid).
     // Must be called before train()/add(). Once enabled, add() stores codes
@@ -64,19 +64,13 @@ public:
     bool precomputed_tables() const noexcept { return !precomputed_.empty(); }
     void set_precomputed_tables(bool enabled);
 
-    // Index overrides; see Index for the contract of each. add/add_batch
-    // throw std::logic_error before train().
-    void add(span<const float> vec) override;
-    void add_batch(span<const float> vecs, size_t n, const int64_t* ids = nullptr) override;
-    vector<Neighbor> query(span<const float> vec, size_t k) const override;
+    // Index overrides; see Index for the contract of each. Adds throw
+    // std::logic_error before train(). query_batch picks every query's nprobe
+    // lists with one matrix multiply per block of queries (with BLAS), then
+    // scans the lists in parallel; results match query() except that a
+    // near-tie between coarse centroids can pick a different list.
     size_t remove(span<const int64_t> ids) override;
     size_t compact() override;
-
-    // Batched query: picks every query's nprobe lists with one matrix multiply
-    // per block of queries (with BLAS), then scans the lists in parallel.
-    // Results match query() except that a near-tie between coarse centroids
-    // can pick a different list.
-    vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k) const override;
 
     // Learns the nlist coarse centroids (and the PQ codebook, if enabled) from
     // num_vectors sample vectors (at least nlist). Call once, before any add.
@@ -100,6 +94,11 @@ public:
     size_t dim() const noexcept override { return dim_; }
 
 private:
+    // Index implementations: vectors already prepared for the metric.
+    void add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) override;
+    vector<Neighbor> query_impl(span<const float> vec, size_t k) const override;
+    vector<vector<Neighbor>> query_batch_impl(span<const float> queries, size_t num_queries, size_t k) const override;
+
     size_t compact_as_base() override;
 
     // Shared by compact() and compact_as_base(): compacts id_map_, then the

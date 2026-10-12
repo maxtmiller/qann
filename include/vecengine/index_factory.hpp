@@ -29,6 +29,7 @@ struct IndexOptions {
     size_t ef_construction = 200;  // HNSWIndex: beam width while inserting
     size_t ef_search = 64;         // HNSWIndex: beam width per query
     bool custom_ids = false;   // all: add_batch() takes user ids
+    Metric metric = Metric::L2; // all: how vectors are compared
 };
 
 // Constructs the requested index type. Caller owns the result via unique_ptr

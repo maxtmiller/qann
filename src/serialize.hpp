@@ -9,6 +9,8 @@
 #include <type_traits>
 #include <vector>
 
+#include "vecengine/index.hpp"
+
 namespace vecengine::detail {
 
 using std::size_t;
@@ -19,7 +21,7 @@ static_assert(std::endian::native == std::endian::little, "qann index files assu
 
 // "QANN" read as a little-endian uint32.
 inline constexpr uint32_t kMagic = 0x4E4E4151;
-inline constexpr uint32_t kFormatVersion = 4; // Current writer version
+inline constexpr uint32_t kFormatVersion = 5; // Current writer version
 inline constexpr uint32_t kMinFormatVersion = 1; // Oldest readable version
 
 // Type tag stored in each header. Values are part of the file format: never
@@ -77,6 +79,14 @@ vector<T> read_vec(std::istream& in, uint64_t max_len) {
     if (!in) throw std::runtime_error("truncated file");
 
     return v;
+}
+
+// Reads a Metric byte (written as uint8 at the end of each body since version
+// 5); throws std::runtime_error on an unknown value.
+inline Metric read_metric(std::istream& in) {
+    const auto metric = read_pod<uint8_t>(in);
+    if (metric > static_cast<uint8_t>(Metric::Cosine)) throw std::runtime_error("corrupt file: unknown metric");
+    return static_cast<Metric>(metric);
 }
 
 // Header read from a file by read_header. The version is the format version

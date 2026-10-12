@@ -45,8 +45,8 @@ thread_local VisitedTags t_visited;
 } // namespace
 
 
-HNSWIndex::HNSWIndex(size_t dim, size_t M, size_t ef_construction, bool custom_ids, std::optional<uint32_t> seed)
-    : dim_(dim), M_(M), M0_(2 * M), ef_construction_(ef_construction),
+HNSWIndex::HNSWIndex(size_t dim, size_t M, size_t ef_construction, bool custom_ids, std::optional<uint32_t> seed, Metric metric)
+    : Index(metric), dim_(dim), M_(M), M0_(2 * M), ef_construction_(ef_construction),
       rng_(seed ? *seed : std::random_device{}()), id_map_(custom_ids) {
     if (dim == 0) throw std::invalid_argument("dim must be >= 1");
     if (M < 2) throw std::invalid_argument("M must be >= 2");
@@ -59,12 +59,7 @@ void HNSWIndex::set_ef_search(size_t ef) {
     ef_search_ = ef;
 }
 
-void HNSWIndex::add(span<const float> vec) {
-    assert(vec.size() == dim_);
-    add_batch(vec, 1, nullptr);
-}
-
-void HNSWIndex::add_batch(span<const float> vecs, size_t n, const int64_t* ids) {
+void HNSWIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) {
     assert(vecs.size() == n * dim_);
     const uint32_t first = static_cast<uint32_t>(id_map_.slots());
     id_map_.add(n, ids);
@@ -77,7 +72,7 @@ void HNSWIndex::add_batch(span<const float> vecs, size_t n, const int64_t* ids) 
     build(first, n);
 }
 
-vector<Neighbor> HNSWIndex::query(span<const float> vec, size_t k) const {
+vector<Neighbor> HNSWIndex::query_impl(span<const float> vec, size_t k) const {
     assert(vec.size() == dim_);
     if (max_level_ < 0 || k == 0) return {};
 
@@ -87,7 +82,7 @@ vector<Neighbor> HNSWIndex::query(span<const float> vec, size_t k) const {
 
     vector<Neighbor> results;
     results.reserve(k);
-    for (auto [dist, slot] : search_layer(vec.data(), {&ep, 1}, std::max(ef_search_, k), 0, /*skip_deleted=*/true)) {
+    for (auto [dist, slot] : search_layer(vec.data(), {&ep, 1}, std::max(ef_search_, k), 0, true)) {
         results.push_back({static_cast<size_t>(id_map_.label(slot)), dist});
         if (results.size() == k) break;
     }
@@ -155,6 +150,7 @@ void HNSWIndex::save(std::ostream& out) const {
     for (size_t slot = 0; slot < upper_.size(); ++slot)
         for (const auto& list : upper_[slot]) write_vec(out, list);
     id_map_.save(out);
+    write_pod(out, static_cast<uint8_t>(metric_));
 }
 
 std::unique_ptr<HNSWIndex> HNSWIndex::load_body(std::istream& in, uint32_t version) {
@@ -213,11 +209,11 @@ std::unique_ptr<HNSWIndex> HNSWIndex::load_body(std::istream& in, uint32_t versi
     index->entry_ = entry;
 
     index->id_map_ = IdMap::load(in, slots, version);
+    if (version >= 5) index->metric_ = read_metric(in);
     return index;
 }
 
-vector<HNSWIndex::Candidate> HNSWIndex::search_layer(const float* q, span<const uint32_t> entry_points, size_t ef, int level,
-                                                     bool skip_deleted, bool locked) const {
+vector<HNSWIndex::Candidate> HNSWIndex::search_layer(const float* q, span<const uint32_t> entry_points, size_t ef, int level, bool skip_deleted, bool locked) const {
     t_visited.begin(slots());
     vector<uint32_t> copy;   // a locked search's snapshot of the list being expanded
     if (locked) copy.reserve(capacity(level));

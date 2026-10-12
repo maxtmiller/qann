@@ -22,12 +22,9 @@ class FlatIndex : public Index {
 public:
     // dim floats per vector; capacity is an initial reserve (vectors, not a
     // limit). custom_ids makes add_batch() take user ids.
-    explicit FlatIndex(size_t dim, size_t capacity = 1024, bool custom_ids = false);
+    explicit FlatIndex(size_t dim, size_t capacity = 1024, bool custom_ids = false, Metric metric = Metric::L2);
 
     // Index overrides; see Index for the contract of each.
-    void add(span<const float> vec) override;
-    void add_batch(span<const float> vecs, size_t n, const int64_t* ids = nullptr) override;
-    vector<Neighbor> query(span<const float> vec, size_t k) const override;
     size_t remove(span<const int64_t> ids) override;
     size_t compact() override;
 
@@ -45,6 +42,10 @@ public:
     size_t dim() const noexcept override { return dim_; }
 
 private:
+    // Index implementations: vectors already prepared for the metric.
+    void add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) override;
+    vector<Neighbor> query_impl(span<const float> vec, size_t k) const override;
+
     size_t compact_as_base() override;
 
     // Shared by compact() and compact_as_base(): compacts id_map_, then the

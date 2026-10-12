@@ -32,7 +32,7 @@ ids, dists = index.batch_query(x[:5], 10)   # both shaped (5, 10)
 
 - **Vectors** are passed as 2D NumPy arrays of shape `(n, dim)`, except single vectors (`query`, `PQCodebook` methods), which are `(dim,)`. float32 C-contiguous arrays are used without copying; anything else (float64, Fortran order, strided slices) is converted first.
 - **IDs** are assigned in insertion order by default: the first vector added gets id 0, the next id 1, and so on across all `add` calls. Create an index with `custom_ids=True` to use your own ids instead; see [Custom ids and deleting](#custom-ids-and-deleting).
-- **Distances** are squared Euclidean (L2) distances, smallest first. For cosine similarity, L2-normalize vectors before adding and querying.
+- **Distances** are squared Euclidean (L2) distances by default, or cosine distances with `metric=qann.Metric.Cosine` (see [Metrics](#metrics)); smallest first either way.
 - **Results** from `batch_query` are an `int64` id array and a `float32` distance array, both shaped `(num_queries, k)`. Rows with fewer than `k` hits are padded with id `-1` and distance `inf`.
 
 ## Indexes
@@ -139,7 +139,22 @@ ivf = qann.make_index(qann.IndexType.IVF, 128, opts)
 ivf.train(x)
 ```
 
-`IndexType` is `Flat`, `IVF` or `HNSW`. `IndexOptions` fields and defaults: `capacity` (Flat initial reserve, 1024), `nlist` (100), `nprobe` (10), `pq_subspaces` (0, meaning no PQ) and `pq_centroids` (256) for IVF, and `hnsw_m` (16), `ef_construction` (200) and `ef_search` (64) for HNSW.
+`IndexType` is `Flat`, `IVF` or `HNSW`. `IndexOptions` fields and defaults: `metric` (`Metric.L2`), plus `capacity` (Flat initial reserve, 1024), `nlist` (100), `nprobe` (10), `pq_subspaces` (0, meaning no PQ) and `pq_centroids` (256) for IVF, and `hnsw_m` (16), `ef_construction` (200) and `ef_search` (64) for HNSW.
+
+## Metrics
+
+Every index takes `metric=qann.Metric.L2` (the default) or `metric=qann.Metric.Cosine`, fixed at construction and saved with the index. Most text and image embedding models are meant to be compared by cosine similarity, so use `Cosine` for them:
+
+```python
+index = qann.HNSWIndex(384, metric=qann.Metric.Cosine)
+index.add(embeddings)
+ids, dists = index.batch_query(query_embeddings, 10)   # dists = 1 - cosine similarity
+```
+
+- **Distances** are `1 - cosine similarity`, from 0 (same direction) to 2 (opposite), matching `qann.cosine_distance`. Similarity is `1 - dist`.
+- **Vector length doesn't matter:** each vector is scaled to length 1 when it's added and each query when it's run, so you don't need to normalize anything yourself. A zero vector has no direction, so adding or querying one raises `ValueError`.
+- **It works with every index,** including PQ, fast-scan and HNSW. IVF learns its clusters on the scaled vectors, and a `RefineIndex` uses its base's metric. `index.metric` reports it.
+- Inner product (for vectors whose length carries meaning) isn't supported yet.
 
 ## Custom ids and deleting
 
@@ -171,11 +186,11 @@ index = qann.load("vectors.qann")   # returns a FlatIndex, IVFIndex, HNSWIndex o
 ids, dists = index.batch_query(queries, 10)
 ```
 
-- **Everything is restored:** vectors, ids (including custom ids), deletions, IVF centroids, PQ codebooks, HNSW graphs and settings such as `nprobe`, `pq_distance`, `precomputed_tables`, `ef_search` and `k_factor`. A loaded index gives identical results and keeps accepting `add` and `remove`.
+- **Everything is restored:** vectors, ids (including custom ids), deletions, IVF centroids, PQ codebooks, HNSW graphs, the metric and settings such as `nprobe`, `pq_distance`, `precomputed_tables`, `ef_search` and `k_factor`. A loaded index gives identical results and keeps accepting `add` and `remove`.
 - **A `RefineIndex` file contains its base index**, so loading one restores both. Tune the base through `loaded.base`, e.g. `loaded.base.nprobe = 32`.
 - **Saving is safe to interrupt:** the file is written next to the target as `<path>.tmp` and renamed into place when complete, so a failed save never leaves a partial file or destroys an existing one.
 - **Bad files raise `RuntimeError`:** a missing, truncated or corrupted file, or one that isn't a QaNN index, is rejected instead of loading garbage.
-- **Files are versioned.** Newer releases keep loading files saved by older ones (files from 0.1.0a4, 0.1.0a6 and 0.1.0a7 still load). A file saved by a newer release than the one loading it raises `RuntimeError` rather than being misread.
+- **Files are versioned.** Newer releases keep loading files saved by older ones (files from 0.1.0a4, 0.1.0a6, 0.1.0a7 and 0.1.0a10 still load). A file saved by a newer release than the one loading it raises `RuntimeError` rather than being misread.
 
 `PQCodebook` on its own can't be saved yet; save the `IVFIndex` that uses it instead.
 
