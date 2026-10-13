@@ -83,6 +83,36 @@ size_t IdMap::remove(span<const int64_t> ids, vector<uint32_t>* removed_slots) {
     return counter;
 }
 
+SlotFilter IdMap::filter(span<const int64_t> ids) const {
+    SlotFilter f;
+    f.words.assign((slots_ + 63) / 64, 0);
+
+    for (int64_t id : ids) {
+        uint32_t slot;
+        if (custom_ids_) {
+            auto it = slot_of_.find(id);
+            if (it == slot_of_.end()) continue;
+            slot = it->second;
+        } else if (labels_.empty()) {
+            if (id < 0 || static_cast<uint64_t>(id) >= slots_) continue;
+            slot = static_cast<uint32_t>(id);
+        } else {
+            auto it = std::lower_bound(labels_.begin(), labels_.end(), id);
+            if (it == labels_.end() || *it != id) continue;
+            slot = static_cast<uint32_t>(it - labels_.begin());
+        }
+        if (deleted_[slot]) continue;
+
+        uint64_t& word = f.words[slot >> 6];
+        const uint64_t bit = uint64_t{1} << (slot & 63);
+        if (!(word & bit)) {
+            word |= bit;
+            ++f.count;
+        }
+    }
+    return f;
+}
+
 vector<uint32_t> IdMap::compact(bool keep_ids) {
     if (deleted_count_ == 0) return {};
 

@@ -30,10 +30,9 @@ void FlatIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* 
     data_.insert(data_.end(), vecs.begin(), vecs.end());
 }
 
-vector<Neighbor> FlatIndex::query_impl(span<const float> vec, size_t k) const {
+vector<Neighbor> FlatIndex::query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const {
     std::priority_queue<pair<float, size_t>, vector<pair<float, size_t>>, std::less<pair<float, size_t>>> maxHeap;
-    for (size_t i = 0; i < id_map_.slots(); ++i) {
-        if (id_map_.is_deleted(static_cast<uint32_t>(i))) continue;
+    auto score = [&](size_t i) {
         const float* start = data_.data() + i * dim_;
         float dist = l2_distance(start, vec.data(), dim_);
 
@@ -42,6 +41,14 @@ vector<Neighbor> FlatIndex::query_impl(span<const float> vec, size_t k) const {
         } else if (dist < maxHeap.top().first) {
             maxHeap.pop();
             maxHeap.emplace(dist, i);
+        }
+    };
+
+    if (filter) {
+        filter->for_each(score);
+    } else {
+        for (size_t i = 0; i < id_map_.slots(); ++i) {
+            if (!id_map_.is_deleted(static_cast<uint32_t>(i))) score(i);
         }
     }
 

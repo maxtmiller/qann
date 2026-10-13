@@ -34,6 +34,9 @@ public:
     // entries have been kept.
     float threshold() const { return worst_; }
 
+    // How many entries are kept: at most k.
+    size_t size() const { return std::min(buf_.size(), k_); }
+
     // Adds a candidate; requires dist < threshold().
     void push(float dist, size_t id) {
         assert(dist < worst_);

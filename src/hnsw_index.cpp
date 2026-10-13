@@ -2,6 +2,7 @@
 #include "vecengine/distance.hpp"
 #include "serialize.hpp"
 #include "parallel.hpp"
+#include "topk.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -103,9 +104,25 @@ void HNSWIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* 
     build(first, n);
 }
 
-vector<Neighbor> HNSWIndex::query_impl(span<const float> vec, size_t k) const {
+vector<Neighbor> HNSWIndex::query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const {
     assert(vec.size() == dim_);
     if (max_level_ < 0 || k == 0) return {};
+
+    // With a fraction s of the vectors allowed, the beam passes about 1/s nodes
+    // per result it keeps, so a search costs about D / s distances (D: the
+    // unfiltered cost, ~ef * M), while scoring the allowed vectors directly
+    // costs s * slots. The two meet at count^2 = D * slots; below that, score
+    // the allowed vectors directly, which is also exact. On SIFT1M (ef 64,
+    // M 16) the measured crossover was 3-5% allowed; this rule puts it at 3.2%.
+    const size_t ef = std::max(ef_search_, k);
+    if (filter && double(filter->count) * double(filter->count) <= double(ef) * double(M_) * double(slots())) {
+        detail::TopK top(k);
+        filter->for_each([&](uint32_t slot) {
+            const float dist = distance(vec.data(), slot);
+            if (dist < top.threshold()) top.push(dist, id_map_.label(slot));
+        });
+        return top.take_sorted();
+    }
 
     // greedy descent: the nearest node on each upper level enters the next
     uint32_t ep = entry_;
@@ -113,7 +130,7 @@ vector<Neighbor> HNSWIndex::query_impl(span<const float> vec, size_t k) const {
 
     vector<Neighbor> results;
     results.reserve(k);
-    for (auto [dist, slot] : search_layer(vec.data(), {&ep, 1}, std::max(ef_search_, k), 0, true)) {
+    for (auto [dist, slot] : search_layer(vec.data(), {&ep, 1}, ef, 0, true, false, filter)) {
         results.push_back({static_cast<size_t>(id_map_.label(slot)), dist});
         if (results.size() == k) break;
     }
@@ -276,7 +293,8 @@ std::unique_ptr<HNSWIndex> HNSWIndex::load_body(std::istream& in, uint32_t versi
     return index;
 }
 
-vector<HNSWIndex::Candidate> HNSWIndex::search_layer(const float* q, span<const uint32_t> entry_points, size_t ef, int level, bool skip_deleted, bool locked) const {
+vector<HNSWIndex::Candidate> HNSWIndex::search_layer(const float* q, span<const uint32_t> entry_points, size_t ef, int level, bool skip_deleted, bool locked,
+                                                    const detail::SlotFilter* filter) const {
     t_visited.begin(slots());
     vector<uint32_t> copy;   // a locked search's snapshot of the list being expanded
     if (locked) copy.reserve(capacity(level));
@@ -287,10 +305,11 @@ vector<HNSWIndex::Candidate> HNSWIndex::search_layer(const float* q, span<const 
     std::priority_queue<Candidate, vector<Candidate>, std::greater<Candidate>> minHeap;
 
     // a node always joins minHeap to be expanded; it joins the results
-    // (maxHeap) unless it is deleted and the caller skips deleted nodes
+    // (maxHeap) unless it is deleted (or outside the filter) and the caller
+    // skips deleted nodes
     auto admit = [&](float dist, uint32_t slot) {
         minHeap.emplace(dist, slot);
-        if (skip_deleted && id_map_.is_deleted(slot)) return;
+        if (skip_deleted && (filter ? !filter->test(slot) : id_map_.is_deleted(slot))) return;
         maxHeap.emplace(dist, slot);
         if (maxHeap.size() > ef) maxHeap.pop();
     };

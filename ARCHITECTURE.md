@@ -54,6 +54,7 @@ vecengine/
 │   ├── test_fast_scan.cpp          # fast-scan packing, kernels, table rounding, IVF fast-scan
 │   ├── test_hnsw.cpp               # HNSW recall, determinism, deletion, compaction, save/load, parallel build, SQ
 │   ├── test_ivf_sq.cpp             # IVF SQ8/SQ4: recall, API checks, save/load, corrupt files, compaction, cosine
+│   ├── test_filter.cpp             # filtered search on every index: recall vs filtered brute force, tiny / empty / full sets, ids, deletes
 │   ├── test_metric.cpp             # cosine metric: exact ranking, normalize_rows, zero vectors, save/load, format v4 files
 │   ├── test_python.py              # pytest smoke, save/load, ids and threading tests
 │   └── data/                       # index files saved by 0.1.0a4 (v1), 0.1.0a6 (v2), 0.1.0a7 (v3), 0.1.0a10 (v4), 0.1.0a11 (v5) and macOS-made SQ8 / SQ4 files (v6) + their results
@@ -62,6 +63,7 @@ vecengine/
 │   ├── bench_indexes.py            # recall vs QPS on SIFT
 │   ├── compare.py                  # ref vs working tree: recall, QPS, build times
 │   ├── hnsw_m_sweep.py             # HNSW recall and QPS by M on GloVe-100 and SIFT1M (issue #33)
+│   ├── filter_selectivity.py       # filtered search recall and QPS vs selectivity on SIFT1M (issue #37)
 │   ├── profile_query.cpp           # per-section query time breakdown on SIFT1M (VECENGINE_PROFILE=ON)
 │   ├── fastscan_recall.py          # recall of 4-bit codes and uint8 tables on SIFT1M (fast-scan study)
 │   ├── fastscan_bench.cpp          # NEON fast-scan kernel vs the scalar ADC scan (ARM only)
@@ -184,6 +186,9 @@ void add(span<const float> vec);                  // non-virtual: prepare for th
 void add_batch(span<const float> vecs, size_t n, const int64_t* ids = nullptr);
 vector<Neighbor> query(span<const float> vec, size_t k) const;
 vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k) const;
+vector<Neighbor> query(span<const float> vec, size_t k, span<const int64_t> allowed) const;     // filtered
+vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k,
+                                     span<const int64_t> allowed) const;
 Metric metric() const noexcept;
 virtual size_t remove(span<const int64_t> ids) = 0;
 virtual size_t compact() = 0;                   // frees deleted slots, ids unchanged
@@ -201,12 +206,15 @@ virtual size_t dim() const noexcept = 0;
 
 **Slots and ids.** Every added vector gets a *slot*: its position in storage (0, 1, 2, ... in insertion order). Indexes store and scan slots internally (IVF lists hold slots; `RefineIndex` finds its raw vector by slot). Slots only change in `compact()`, which renumbers them in order. The id users see is separate: with `custom_ids` it is the id passed to `add_batch`; otherwise it is the slot until the first compaction, and the original slot number after it. `Neighbor::index` always reports the id. `add_batch` must keep slots in input order: row `i` of a batch gets the next slot.
 
+**Filtered search.** The `allowed` overloads turn the ids into a `detail::SlotFilter` once per call (`id_map().filter(allowed)`: one bit per slot plus the count of set bits; unknown, deleted and repeated ids are dropped), and every query of a batch shares it. A count of 0 returns empty rows without calling the index. Otherwise the filter goes to `query_impl` / `query_batch_impl` as a pointer, `nullptr` meaning unfiltered, and every index tests `filter ? filter->test(slot) : !is_deleted(slot)` where it used to test only `is_deleted`: deleted slots are never in the filter, so one test covers both. Filtering happens during the search, like deletion, so a selective filter still fills the top k. Per index: `FlatIndex` walks the set bits (`for_each`) instead of every slot; `IVFIndex` keeps probing past `nprobe` (see below); `HNSWIndex` treats disallowed nodes like deleted ones, or scores the allowed slots directly when there are few; `RefineIndex` builds the filter from its own id map and passes it to the base unchanged (its slots are the base's), asking for `min(k * k_factor, count)` candidates. Each index exposes its `IdMap` through a private `id_map()` override.
+
 ### `id_map.hpp` / `id_map.cpp`: `IdMap` (`vecengine::detail`)
 
 Each index owns one. It holds `labels_` (slot → id; empty while ids equal slots), `slot_of_` (live custom id → slot, for `remove` and duplicate checks), `next_id_` (the next auto id) and a deleted flag per slot.
 
 - `check(n, ids)` validates an add without changing anything: ids present iff custom ids are on, each `>= 0` (`-1` is the padding id in batch results), no duplicates in the batch or among live ids, and at most `2^32 - 1` slots. `add` runs `check` and then commits.
 - `remove(ids, removed_slots)` marks slots deleted and erases their ids from `slot_of_`, so a deleted id can be added again (it gets a new slot). Unknown and already deleted ids are skipped.
+- `filter(ids)` builds the `SlotFilter` of a filtered query: the slots of the live ids among `ids`, found the same way `remove` finds them.
 - `label(slot)` and `is_deleted(slot)` are inline: queries call them per candidate. `label` returns `labels_[slot]`, or the slot itself while `labels_` is empty.
 - Auto ids: while `labels_` is empty and `next_id_ == slots_`, ids are slots and `add` is a counter bump. After a compaction `labels_` holds each slot's id, and `add` appends `next_id_++`. Auto ids are assigned in increasing order and compaction keeps order, so `labels_` stays sorted and `remove` finds a slot with `lower_bound` instead of a hash map (8 bytes per vector, only once compacted).
 - `compact(keep_ids)` returns `remap` (old slot → new slot, or `kRemoved`), or `{}` when nothing is deleted. It drops deleted slots, moves each live label forward (`remap[old] <= old`, so in place), rewrites `slot_of_` and clears the deleted flags. `keep_ids = false` is for a `RefineIndex` base: `labels_` stays empty and `next_id_` is reset to the new slot count, so its ids keep equalling its slots.
@@ -226,7 +234,7 @@ Defaults in `src/index.cpp`: `add_batch` calls `add` per row; `query_batch` call
 
 ### `flat_index.hpp`: `FlatIndex`
 
-Exact search. Vectors stored row-major in one `vector<float>`, one row per slot. `query` scans every live slot with a size-`k` max-heap, drains it back to front for ascending order and reports each slot's id. This is the ground truth for recall tests.
+Exact search. Vectors stored row-major in one `vector<float>`, one row per slot. `query` scans every live slot (or, filtered, only the allowed ones) with a size-`k` max-heap, drains it back to front for ascending order and reports each slot's id. This is the ground truth for recall tests.
 
 ### `ivf_index.hpp`: `IVFIndex`
 
@@ -271,7 +279,9 @@ Per probed list the table is then `m * K` additions instead of a `sub_dim`-long 
 
 Then `scan()` runs per query in `parallel_for`. Like `assign_nearest`, a near-tie between two centroids' scores can pick a different list than `query()` would, so batch and single results can differ in rare ids; the tests allow 1%.
 
-Every candidate goes through one `push` lambda that checks the `TopK` threshold first and then `is_deleted`, and pushes the slot's id. `nprobe` and `pq_distance` both have setters and can be changed at any time after training; they only affect queries.
+Every candidate goes through one `push` lambda that checks the `TopK` threshold first and then `is_deleted` (or the filter), and pushes the slot's id.
+
+**Filtered queries** may find fewer than `k` allowed vectors in the `nprobe` nearest lists (at 0.1% of SIFT1M, a list of ~1000 vectors holds one on average). So `query_impl` takes `coarse_all()`: every list, with only the `nprobe` nearest sorted (`partial_sort`), and `scan()` continues past the first `nprobe` while `TopK` holds fewer than `min(k, count)` results, sorting the remaining lists the first time it needs them. A filter that the probed lists satisfy costs only the partial sort over `nlist` distances. A filtered `query_batch` takes the `Index` default (per-query `query_impl` in parallel) rather than `coarse_batch`, which ranks only `nprobe` lists per query. `nprobe` and `pq_distance` both have setters and can be changed at any time after training; they only affect queries.
 
 ### `hnsw_index.hpp`: `HNSWIndex`
 
@@ -279,7 +289,9 @@ Every candidate goes through one `push` lambda that checks the `TopK` threshold 
 
 **Storage.** Level 0 is one flat `vector<uint32_t>` with `2M + 1` entries per slot (a count, then up to `2M` neighbor slots), so the hot level is contiguous. Upper levels, which hold few nodes, are `upper_[slot][level - 1]`, a list per level. `levels_` holds each slot's top level; `entry_` is a node on the top level `max_level_` (`-1` while empty).
 
-**Search** (`search_layer(q, entry_points, ef, level)`): a beam search with a min-heap of nodes to expand and a max-heap of the best `ef` so far; it stops when the nearest unexpanded node is farther than the worst result and the results are full. Visited nodes are tracked with a per-thread array of generation tags, so nothing is cleared between searches. `query()` descends greedily through the upper levels (`ef = 1`), then searches level 0 with `max(ef_search, k)`. With `skip_deleted`, deleted nodes are still expanded (they keep the graph connected) but never enter the results heap, so a query's beam fills with live nodes even when most nodes are deleted.
+**Search** (`search_layer(q, entry_points, ef, level)`): a beam search with a min-heap of nodes to expand and a max-heap of the best `ef` so far; it stops when the nearest unexpanded node is farther than the worst result and the results are full. Visited nodes are tracked with a per-thread array of generation tags, so nothing is cleared between searches. `query()` descends greedily through the upper levels (`ef = 1`), then searches level 0 with `max(ef_search, k)`. With `skip_deleted`, deleted nodes are still expanded (they keep the graph connected) but never enter the results heap, so a query's beam fills with live nodes even when most nodes are deleted. A filtered query passes its filter, and nodes outside it are handled the same way.
+
+**Filtered queries.** With a fraction `s` allowed, the beam stops only once it holds `ef` allowed nodes, so it expands about `1/s` times as many nodes as an unfiltered search: about `D / s` distances, where `D` (~1,200 on SIFT1M at `ef_search = 64`) is the unfiltered cost. Scoring the allowed slots directly costs `s * slots` and is exact. The two cross at `count² = D * slots`, so `query_impl` scores directly when `count² <= ef * M * slots` (`ef * M` stands in for `D`: 1,024 at the defaults, i.e. below 32k allowed vectors of 1M). Measured on SIFT1M with 1,000 queries, the crossover between graph and direct scoring was between 3% and 5% allowed, for both the float and the SQ8 graph. The graph search keeps 0.99+ recall all the way down, but at 0.1% it ran at ~100 QPS against ~120k for direct scoring. Results by selectivity are under Benchmarks.
 
 **Insert.** Descend to the new node's level, then on each level from there down: search with `ef_construction`, pick up to `M` neighbors with the paper's heuristic (`select_neighbors`: sorted nearest first, a candidate is kept only if it is closer to the new node than to every neighbor already kept, which favors neighbors in different directions), and add the reverse links (`add_link`), re-selecting a neighbor's list with the same heuristic when it is full. Candidates sort as `(distance, slot)` pairs, so ties break the same way everywhere.
 
@@ -469,6 +481,20 @@ Thread scaling (`set_num_threads`, same commit, every index built once on all co
 - SQ8 costs about 0.01 recall (0.013 on GloVe at 128) for 4× smaller lists and 1.3-1.6× QPS; SQ4 + R8 recovers the floats' recall exactly at a similar speed-up, but keeps the raw vectors.
 - GloVe at `nprobe = 16` was slower with SQ in both runs (0.68× / 0.85× in the first). It is not explained yet: the float rows' own QPS falls 3.6× from 16 to 32 lists for 2× the work, which suggests the float timing at 16 is the outlier, but the machine was too loaded (load ~100) to settle it.
 - Positioning: IVF-SQ8 is the IVF option for high recall without raw vectors in RAM. HNSW-SQ8 reaches the same recall faster for about twice the memory (260 vs 132 B/vec on SIFT), and fast-scan + R16 is faster when the raw vectors fit.
+
+**Filtered search** (`benchmarks/filter_selectivity.py`, issue #37): a random allowed set per selectivity, ground truth from a filtered `FlatIndex` query, 1,000 queries on all cores, timings in alternating rounds (best of 3). Load was 75 to 210 during the run, so the QPS are rough; recall is exact. Recall / QPS:
+
+| SIFT1M allowed | Flat | IVF `nprobe = 16` | IVF-PQ64×4fs + R4 | HNSW `ef = 64` | HNSW-SQ8 + R2 |
+|---|---|---|---|---|---|
+| 100% | 1.000 / 170 | 0.929 / 5.0k | 0.900 / 8.9k | 0.954 / 5.8k | 0.957 / 6.7k |
+| 20% | 1.000 / 280 | 0.891 / 6.0k | 0.880 / 9.9k | 0.992 / 3.4k | 0.993 / 5.3k |
+| 5% | 1.000 / 740 | 0.845 / 5.6k | 0.843 / 10.7k | 0.998 / 2.0k | 0.999 / 2.9k |
+| 2% | 1.000 / 4.9k | 0.795 / 8.7k | 0.795 / 46.4k | 1.000 / 4.8k | 1.000 / 8.5k |
+| 0.5% | 1.000 / 20.6k | 0.704 / 8.2k | 0.704 / 44.0k | 1.000 / 24.2k | 1.000 / 23.1k |
+| 0.1% | 1.000 / 135k | 0.519 / 9.4k | 0.750 / 19.4k | 1.000 / 127k | 1.000 / 122k |
+
+- **HNSW** gains recall as the filter narrows (the beam searches longer for `ef` allowed nodes), and slows down until 3.2%, where it switches to scoring the allowed vectors directly: exact, and as fast as `FlatIndex` over the same set. A separate run with the switch forced either way put the crossover between 3% and 5% for both the float and the SQ8 graph; graph search at 0.1% ran at ~100 QPS against ~120k for direct scoring.
+- **IVF** loses recall as the filter narrows: the filtered top 10 at selectivity `s` lie about as deep as the unfiltered top `10 / s`, and those are spread over more lists than `nprobe`. Probing past `nprobe` only guarantees `k` results, not the right ones. Raising `nprobe` restores recall at the usual cost; below ~1%, `FlatIndex` or `HNSWIndex` over the same vectors are both exact and faster.
 
 **Build times** on all cores (this run, busy machine): IVF trains in 2.3 s and adds 1M vectors in 1.1 s (`add_batch`); IVF + PQ16 trains in 5.2 s and adds in 4.0 s; PQ64×4 fast-scan, the fastest PQ build, 3.4 s and 1.9 s; HNSW builds in 50 to 75 s. On an idle machine earlier, IVF + PQ16 trained in 3.4 s (8.6 s on one thread) and added in 3.0 s. Before `assign_nearest`, IVF training took 37 s and IVF + PQ16 55 s.
 

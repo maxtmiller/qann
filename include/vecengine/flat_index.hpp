@@ -44,7 +44,8 @@ public:
 private:
     // Index implementations: vectors already prepared for the metric.
     void add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) override;
-    vector<Neighbor> query_impl(span<const float> vec, size_t k) const override;
+    vector<Neighbor> query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const override;
+    const detail::IdMap& id_map() const noexcept override { return id_map_; }
 
     size_t compact_as_base() override;
 

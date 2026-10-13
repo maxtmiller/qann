@@ -46,21 +46,26 @@ void RefineIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t
     data_.insert(data_.end(), vecs.begin(), vecs.end());
 }
 
-vector<Neighbor> RefineIndex::query_impl(span<const float> vec, size_t k) const {
+size_t RefineIndex::candidates(size_t k, const detail::SlotFilter* filter) const {
+    return std::min(k * k_factor_, filter ? filter->count : id_map_.live());
+}
+
+vector<Neighbor> RefineIndex::query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const {
     assert(vec.size() == dim());
     if (id_map_.live() == 0) return {};
 
-    return rerank(vec, base_.query_impl(vec, std::min(k * k_factor_, id_map_.live())), k);
+    return rerank(vec, base_.query_impl(vec, candidates(k, filter), filter), k);
 }
 
-vector<vector<Neighbor>> RefineIndex::query_batch_impl(span<const float> queries, size_t num_queries, size_t k) const {
+vector<vector<Neighbor>> RefineIndex::query_batch_impl(span<const float> queries, size_t num_queries, size_t k,
+                                                       const detail::SlotFilter* filter) const {
     assert(queries.size() == num_queries * dim());
     if (id_map_.live() == 0) return vector<vector<Neighbor>>(num_queries);
 
-    auto candidates = base_.query_batch_impl(queries, num_queries, std::min(k * k_factor_, id_map_.live()));
+    auto fetched = base_.query_batch_impl(queries, num_queries, candidates(k, filter), filter);
     vector<vector<Neighbor>> results(num_queries);
     detail::parallel_for(num_queries, [&](size_t i) {
-        results[i] = rerank({queries.data() + i * dim(), dim()}, candidates[i], k);
+        results[i] = rerank({queries.data() + i * dim(), dim()}, fetched[i], k);
     });
     return results;
 }

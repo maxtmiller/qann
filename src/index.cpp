@@ -1,4 +1,5 @@
 #include "vecengine/index.hpp"
+#include "vecengine/id_map.hpp"
 #include "parallel.hpp"
 
 #include <cstddef>
@@ -40,27 +41,47 @@ void Index::add_batch(span<const float> vecs, size_t n, const int64_t* ids) {
 
 vector<Neighbor> Index::query(span<const float> vec, size_t k) const {
     assert(vec.size() == dim());
-    if (metric_ == Metric::L2) return query_impl(vec, k);
-
-    const vector<float> unit = normalize_rows(vec, 1);
-    vector<Neighbor> results = query_impl(unit, k);
-    l2_to_cosine(results);
-    return results;
+    return std::move(query_prepared(vec, 1, k, nullptr, false)[0]);
 }
 
 vector<vector<Neighbor>> Index::query_batch(span<const float> queries, size_t num_queries, size_t k) const {
     assert(queries.size() == num_queries * dim());
-    if (metric_ == Metric::L2) return query_batch_impl(queries, num_queries, k);
+    return query_prepared(queries, num_queries, k, nullptr, true);
+}
+
+vector<Neighbor> Index::query(span<const float> vec, size_t k, span<const int64_t> allowed) const {
+    assert(vec.size() == dim());
+    const detail::SlotFilter filter = id_map().filter(allowed);
+    return std::move(query_prepared(vec, 1, k, &filter, false)[0]);
+}
+
+vector<vector<Neighbor>> Index::query_batch(span<const float> queries, size_t num_queries, size_t k,
+                                            span<const int64_t> allowed) const {
+    assert(queries.size() == num_queries * dim());
+    const detail::SlotFilter filter = id_map().filter(allowed);
+    return query_prepared(queries, num_queries, k, &filter, true);
+}
+
+vector<vector<Neighbor>> Index::query_prepared(span<const float> queries, size_t num_queries, size_t k,
+                                               const detail::SlotFilter* filter, bool batch) const {
+    if (filter && filter->count == 0) return vector<vector<Neighbor>>(num_queries);
+
+    auto run = [&](span<const float> q) {
+        if (!batch) return vector<vector<Neighbor>>{query_impl(q, k, filter)};
+        return query_batch_impl(q, num_queries, k, filter);
+    };
+    if (metric_ == Metric::L2) return run(queries);
 
     const vector<float> unit = normalize_rows(queries, num_queries);
-    vector<vector<Neighbor>> results = query_batch_impl(unit, num_queries, k);
+    vector<vector<Neighbor>> results = run(unit);
     for (auto& row : results) l2_to_cosine(row);
     return results;
 }
 
-vector<vector<Neighbor>> Index::query_batch_impl(span<const float> queries, size_t num_queries, size_t k) const {
+vector<vector<Neighbor>> Index::query_batch_impl(span<const float> queries, size_t num_queries, size_t k,
+                                                 const detail::SlotFilter* filter) const {
     vector<vector<Neighbor>> results(num_queries);
-    detail::parallel_for(num_queries, [&](size_t i) { results[i] = query_impl(queries.subspan(i * dim(), dim()), k); });
+    detail::parallel_for(num_queries, [&](size_t i) { results[i] = query_impl(queries.subspan(i * dim(), dim()), k, filter); });
     return results;
 }
 
