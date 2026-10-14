@@ -140,24 +140,28 @@ void IVFIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* i
     }
 }
 
-vector<Neighbor> IVFIndex::query_impl(span<const float> vec, size_t k) const {
+vector<Neighbor> IVFIndex::query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const {
     assert(vec.size() == dim_);
     if (!trained_) throw std::logic_error("train() has not be run yet");
 
     VECENGINE_PROF_START(t_coarse);
-    vector<Probe> probes = coarse(vec);
+    vector<Probe> probes = filter ? coarse_all(vec) : coarse(vec);
     VECENGINE_PROF_STOP(t_coarse, kProfCoarse);
 
-    return scan(vec, probes, k);
+    return scan(vec, probes, k, filter);
 }
 
-vector<vector<Neighbor>> IVFIndex::query_batch_impl(span<const float> queries, size_t num_queries, size_t k) const {
+vector<vector<Neighbor>> IVFIndex::query_batch_impl(span<const float> queries, size_t num_queries, size_t k,
+                                                    const detail::SlotFilter* filter) const {
     assert(queries.size() == num_queries * dim_);
     if (!trained_) throw std::logic_error("train() has not be run yet");
 
 #ifndef VECENGINE_USE_BLAS
-    return Index::query_batch_impl(queries, num_queries, k);
+    return Index::query_batch_impl(queries, num_queries, k, filter);
 #else
+    // a filtered query may probe every list, which the batched coarse step doesn't rank
+    if (filter) return Index::query_batch_impl(queries, num_queries, k, filter);
+
     // coarse_batch holds block * nlist_ scores; cap them at 32 MB
     const size_t block = std::clamp<size_t>((size_t{32} << 20) / (nlist_ * sizeof(float)), 1, 1024);
 
@@ -172,7 +176,7 @@ vector<vector<Neighbor>> IVFIndex::query_batch_impl(span<const float> queries, s
         VECENGINE_PROF_STOP(t_coarse, kProfCoarse);
 
         detail::parallel_for(b, [&](size_t i) {
-            results[start + i] = scan({q + i * dim_, dim_}, {probes.data() + i * nprobe_, nprobe_}, k);
+            results[start + i] = scan({q + i * dim_, dim_}, {probes.data() + i * nprobe_, nprobe_}, k, nullptr);
         });
     }
     return results;
@@ -203,6 +207,14 @@ vector<IVFIndex::Probe> IVFIndex::coarse(span<const float> vec) const {
         maxCentroidHeap.pop();
         --i;
     }
+    return probes;
+}
+
+vector<IVFIndex::Probe> IVFIndex::coarse_all(span<const float> vec) const {
+    vector<Probe> probes(nlist_);
+    for (size_t i = 0; i < nlist_; ++i)
+        probes[i] = {l2_distance(vec.data(), coarse_centroids_.data() + i * dim_, dim_), static_cast<uint16_t>(i)};
+    std::partial_sort(probes.begin(), probes.begin() + nprobe_, probes.end());
     return probes;
 }
 
@@ -241,14 +253,12 @@ void IVFIndex::coarse_batch(const float* queries, size_t n, Probe* out) const {
         }
 
         // nearest first, ordered by exact distance like coarse()
-        std::sort(probes, probes + nprobe_, [](const Probe& a, const Probe& b) {
-            return a.dist < b.dist || (a.dist == b.dist && a.list < b.list);
-        });
+        std::sort(probes, probes + nprobe_);
     });
 }
 #endif
 
-vector<Neighbor> IVFIndex::scan(span<const float> vec, span<const Probe> probes, size_t k) const {
+vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_t k, const detail::SlotFilter* filter) const {
     VECENGINE_PROF_START(t_setup);
     // intialize vars for pq, reuse allocated memory for adc table
     const size_t m = pq_enabled() ? pq_->num_subspaces() : 0;
@@ -265,8 +275,16 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<const Probe> probes,
     if (use_pre) pq_->compute_inner_table(vec, C);
     VECENGINE_PROF_STOP(t_inner, kProfInner);
 
+    // a filtered query keeps probing past nprobe lists until it has this many results
+    const size_t wanted = filter ? std::min(k, filter->count) : 0;
+
     // find top-k vectors from the inverted lists associated with the nprobe closest coarse centroids
-    for (const Probe& probe : probes) {
+    for (size_t p = 0; p < probes.size(); ++p) {
+        if (p >= nprobe_) {
+            if (top.size() >= wanted) break;
+            if (p == nprobe_) std::sort(probes.begin() + p, probes.end());
+        }
+        const Probe& probe = probes[p];
         VECENGINE_PROF_START(t_list);
         const float A = probe.dist;
         auto it = data_.find(probe.list);
@@ -279,8 +297,9 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<const Probe> probes,
 
         // lamdba function for adding to heap
         auto push = [&](float dist, size_t j) {
-            if (dist < top.threshold() && !id_map_.is_deleted(list.ids[j]))
-                top.push(dist, id_map_.label(list.ids[j]));
+            const uint32_t slot = list.ids[j];
+            if (dist < top.threshold() && (filter ? filter->test(slot) : !id_map_.is_deleted(slot)))
+                top.push(dist, id_map_.label(slot));
         };
 
         if (sq_bits_) {

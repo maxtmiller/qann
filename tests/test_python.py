@@ -264,6 +264,32 @@ def test_custom_ids_and_remove(data, kind):
     assert index.query(new_vec[0], 1)[0][0] == deleted[0]
 
 
+@pytest.mark.parametrize("kind", ["flat", "ivf", "refine", "hnsw"])
+def test_filtered_query(data, kind):
+    ids = np.arange(len(data)) * 10 + 7
+    index = make_custom_index(kind, data, ids)
+    allowed = ids[::4]
+    index.remove(allowed[:10])
+
+    found, _ = index.batch_query(data[:50], 10, allowed=allowed)
+    assert np.isin(found, allowed[10:]).all()
+    if kind in ("flat", "refine"):  # exact distances: allowed vectors find themselves
+        np.testing.assert_array_equal(found[40:50:4, 0], ids[40:50:4])
+
+    one, _ = index.query(data[0], 10, allowed=allowed)
+    np.testing.assert_array_equal(one, index.batch_query(data[:1], 10, allowed=allowed)[0][0])
+
+    # A list works too; unknown ids are ignored; fewer allowed than k pads the rows.
+    found, dists = index.batch_query(data[:3], 5, allowed=[int(ids[1]), int(ids[2]), 123])
+    assert set(found[:, :2].ravel()) == {ids[1], ids[2]}
+    assert (found[:, 2:] == -1).all() and np.isinf(dists[:, 2:]).all()
+
+    found, _ = index.query(data[0], 5, allowed=[])
+    assert len(found) == 0
+    with pytest.raises(TypeError):
+        index.query(data[0], 5, allowed=[1.5])
+
+
 def test_ids_accept_any_integer_sequence(data):
     index = qann.FlatIndex(32, custom_ids=True)
     index.add(data[:4], ids=[10, 11, 12, 13])

@@ -42,7 +42,8 @@ public:
     // too (without ids), and remove() deletes the same slots in the base. The
     // metric is the base's. query_batch fetches every query's candidates with
     // one base query_batch call (so IVFIndex's batched coarse search applies),
-    // then re-ranks in parallel.
+    // then re-ranks in parallel. A filtered query passes its filter (base
+    // slots are this index's slots) to the base.
     size_t remove(span<const int64_t> ids) override;
 
     // Compacts this index's ids and raw vectors and the base's storage with
@@ -76,8 +77,14 @@ private:
     // Index implementations: vectors already prepared for the metric, and
     // passed to the base's *_impl so they are prepared only once.
     void add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) override;
-    vector<Neighbor> query_impl(span<const float> vec, size_t k) const override;
-    vector<vector<Neighbor>> query_batch_impl(span<const float> queries, size_t num_queries, size_t k) const override;
+    vector<Neighbor> query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const override;
+    vector<vector<Neighbor>> query_batch_impl(span<const float> queries, size_t num_queries, size_t k,
+                                              const detail::SlotFilter* filter) const override;
+    const detail::IdMap& id_map() const noexcept override { return id_map_; }
+
+    // Candidates to fetch from the base for k results: k * k_factor, capped
+    // at the vectors that may be returned.
+    size_t candidates(size_t k, const detail::SlotFilter* filter) const;
 
     // A RefineIndex is never a base; throws std::logic_error.
     size_t compact_as_base() override;

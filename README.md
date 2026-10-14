@@ -42,8 +42,8 @@ Every index has the same core methods:
 | Method | Description |
 | --- | --- |
 | `add(data, ids=None)` | Add an `(n, dim)` array of vectors, with `n` ids if the index uses custom ids. |
-| `batch_query(queries, k)` | k nearest neighbors for each row of an `(nq, dim)` array, run in parallel. Returns `(ids, dists)`. |
-| `query(query, k)` | k nearest neighbors for a single `(dim,)` vector such as `x[i]`. Returns 1D `(ids, dists)`. |
+| `batch_query(queries, k, *, allowed=None)` | k nearest neighbors for each row of an `(nq, dim)` array, run in parallel. Returns `(ids, dists)`. `allowed` restricts results to those ids; see [Filtered search](#filtered-search). |
+| `query(query, k, *, allowed=None)` | k nearest neighbors for a single `(dim,)` vector such as `x[i]`. Returns 1D `(ids, dists)`. |
 | `remove(ids)` | Delete vectors by id; returns how many were deleted. |
 | `compact()` | Free the memory of deleted vectors; returns how many were freed. Ids are unchanged, and so are results, except that `HNSWIndex` rebuilds its graph. |
 | `size()` | Number of vectors in the index (deleted ones excluded). |
@@ -206,6 +206,23 @@ index.remove([doc_ids[0], doc_ids[1]])        # returns 2
 - **Deleted vectors keep their memory until `compact()`**: queries skip them, but they still take space and scan time. `compact()` frees them in one pass, keeping every id and every query result the same, so call it after a large batch of deletes. It doesn't retrain anything. (`HNSWIndex` is the exception: it rebuilds its graph, so ids stay the same but results can shift slightly.)
 - **Default ids never repeat.** New vectors continue after the highest id ever assigned, even after deletes and `compact()` (delete ids 0 to 9, compact, add one more, and it gets id 10).
 - For `make_index`, set `IndexOptions.custom_ids`.
+
+## Filtered search
+
+To search only some of the vectors ("nearest products in this category", "documents this user may see"), pass the ids that may be returned as `allowed`:
+
+```python
+in_stock = product_ids[stock > 0]   # computed from your own metadata
+ids, dists = index.batch_query(queries, 10, allowed=in_stock)
+```
+
+- **qann doesn't store metadata:** keep it wherever you already do, and turn the condition into a list of ids. `allowed` takes the same kinds of ids as `remove` (any integer array, list or `range`), with or without custom ids, and one set applies to every row of a `batch_query`.
+- **Unknown and deleted ids in `allowed` are ignored.** An empty set returns no results; fewer than `k` allowed vectors gives fewer results (rows padded with `-1` / `inf`).
+- **Filtering happens during the search,** not after it, so a selective filter still returns `k` results instead of the few that happen to be in an unfiltered top `k`.
+- **Works on every index.** `FlatIndex` scores only the allowed vectors. `IVFIndex` skips the others while scanning, and if its `nprobe` lists hold fewer than `k` allowed vectors it keeps probing the next nearest lists until it has `k`. `HNSWIndex` walks its graph through every node but returns only allowed ones; when few are allowed (below about `sqrt(ef_search * M * size)`, ~3% of SIFT1M), walking the graph would cost more than scoring the allowed vectors directly, so it does that instead, which is also exact. A `RefineIndex` passes the filter to its base and re-ranks as usual.
+- **Recall by index:** `FlatIndex` is exact, and `HNSWIndex` holds or gains recall as the filter narrows. `IVFIndex` loses recall as it narrows (on SIFT1M at `nprobe=16`: 0.93 unfiltered, 0.85 with 5% allowed, 0.52 with 0.1%), because the nearest allowed vectors spread over more lists than `nprobe`; raise `nprobe`, or for very selective filters prefer `HNSWIndex` or `FlatIndex`. Full numbers are in [ARCHITECTURE.md](https://github.com/maxtmiller/qann/blob/main/ARCHITECTURE.md#benchmarks-benchmarksbench_indexespy).
+- **Recall by index:** `FlatIndex` is exact, and `HNSWIndex` holds or gains recall as the filter narrows. `IVFIndex` loses recall as it narrows (on SIFT1M at `nprobe=16`: 0.93 unfiltered, 0.85 with 5% allowed, 0.52 with 0.1%), because the nearest allowed vectors spread over more lists than `nprobe`; raise `nprobe`, or for very selective filters prefer `HNSWIndex` or `FlatIndex`. Full numbers are in [ARCHITECTURE.md](https://github.com/maxtmiller/qann/blob/main/ARCHITECTURE.md#benchmarks-benchmarksbench_indexespy).
+- **Cost** is a pass over `allowed` per call (to look up each id), plus one bit per vector in the index.
 
 ## Saving and loading
 

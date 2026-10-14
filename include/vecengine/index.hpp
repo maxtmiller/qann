@@ -10,6 +10,11 @@
 
 namespace vecengine {
 
+namespace detail {
+class IdMap;
+struct SlotFilter;
+}
+
 using std::size_t;
 using std::vector;
 using std::span;
@@ -61,6 +66,16 @@ public:
 
     // query() for each of num_queries rows of queries, run in parallel.
     vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k) const;
+
+    // Filtered search: query() and query_batch() that return only vectors
+    // whose id is in `allowed` (one set shared by every query of a batch).
+    // Unknown, deleted and repeated ids in `allowed` are ignored; an empty set
+    // returns no results. Fewer than k come back only when fewer than k
+    // allowed vectors are live, or are reachable (HNSW). IVFIndex probes lists
+    // beyond nprobe, nearest first, until it has found k allowed vectors.
+    vector<Neighbor> query(span<const float> vec, size_t k, span<const int64_t> allowed) const;
+    vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k,
+                                         span<const int64_t> allowed) const;
 
     // How this index compares vectors (fixed at construction).
     Metric metric() const noexcept { return metric_; }
@@ -118,16 +133,30 @@ protected:
 
     Metric metric_; // set by the constructor, or by a load_body
 
+    // Default: query_impl() for each row, in parallel. Protected so an
+    // override can fall back to it.
+    virtual vector<vector<Neighbor>> query_batch_impl(span<const float> queries, size_t num_queries, size_t k,
+                                                      const detail::SlotFilter* filter) const;
+
 private:
     friend class RefineIndex;  // sets and clears wrapped_; calls compact_as_base() and the *_impl methods
 
+    // Shared by the public query() and query_batch() overloads: prepares the
+    // queries for the metric, calls query_impl() (one query, batch false) or
+    // query_batch_impl(), and converts distances. filter is nullptr for an
+    // unfiltered query.
+    vector<vector<Neighbor>> query_prepared(span<const float> queries, size_t num_queries, size_t k,
+                                            const detail::SlotFilter* filter, bool batch) const;
+
+    // This index's slot <-> id map, used to turn allowed ids into slots.
+    virtual const detail::IdMap& id_map() const noexcept = 0;
+
     // What each index implements. Vectors arrive already prepared for the
     // metric, and distances go back as squared L2 between prepared vectors.
+    // A non-null filter holds the live slots that may be returned (count > 0);
+    // without one, every live slot may.
     virtual void add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) = 0;
-    virtual vector<Neighbor> query_impl(span<const float> vec, size_t k) const = 0;
-
-    // Default: query_impl() for each row, in parallel.
-    virtual vector<vector<Neighbor>> query_batch_impl(span<const float> queries, size_t num_queries, size_t k) const;
+    virtual vector<Neighbor> query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const = 0;
 
     // compact() for the base of a RefineIndex: same storage compaction, but
     // ids become the new slots so they keep matching the RefineIndex's slots.

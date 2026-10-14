@@ -93,7 +93,8 @@ public:
 private:
     // Index implementations: vectors already prepared for the metric.
     void add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) override;
-    vector<Neighbor> query_impl(span<const float> vec, size_t k) const override;
+    vector<Neighbor> query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const override;
+    const detail::IdMap& id_map() const noexcept override { return id_map_; }
 
     // (distance to the query, slot)
     using Candidate = std::pair<float, uint32_t>;
@@ -109,11 +110,13 @@ private:
     // search that starts from entry_points. Deleted nodes are always expanded,
     // since they keep the graph connected; with skip_deleted they are left out
     // of the results, so a query's beam holds only live nodes. Inserts keep
-    // them, as routes for the new node's links.
+    // them, as routes for the new node's links. A filtered query passes its
+    // filter with skip_deleted: nodes outside it are handled like deleted ones.
     // `locked` reads each neighbor list under its node's lock, for searches
     // that run while other threads insert; queries never do, so they skip it.
     vector<Candidate> search_layer(const float* q, span<const uint32_t> entry_points, size_t ef, int level,
-                                   bool skip_deleted = false, bool locked = false) const;
+                                   bool skip_deleted = false, bool locked = false,
+                                   const detail::SlotFilter* filter = nullptr) const;
 
     // The node of `level` closest to q, found by walking from ep to whichever
     // neighbor is closer until none is. The upper levels only need this one

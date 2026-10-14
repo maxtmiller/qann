@@ -1,5 +1,6 @@
 #pragma once
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <iosfwd>
@@ -12,6 +13,26 @@ namespace vecengine::detail {
 using std::size_t;
 using std::span;
 using std::vector;
+
+// The live slots a filtered query may return: one bit per slot. Built once
+// per query call by IdMap::filter(), so deleted slots are already left out
+// and scans test only this.
+struct SlotFilter {
+    vector<uint64_t> words;  // bit s % 64 of words[s / 64] is set when slot s is allowed
+    size_t count = 0;        // set bits
+
+    // Whether a query may return this slot. Called per candidate, so inline.
+    bool test(uint32_t slot) const noexcept { return (words[slot >> 6] >> (slot & 63)) & 1; }
+
+    // Calls f(slot) for every allowed slot, in increasing order.
+    template <class F>
+    void for_each(F&& f) const {
+        for (size_t w = 0; w < words.size(); ++w) {
+            for (uint64_t bits = words[w]; bits != 0; bits &= bits - 1)
+                f(static_cast<uint32_t>(w * 64 + static_cast<size_t>(std::countr_zero(bits))));
+        }
+    }
+};
 
 // Maps between slots and the ids users see, and tracks deleted slots.
 //
@@ -37,6 +58,10 @@ public:
     // is not nullptr (RefineIndex uses this to delete the same slots in its
     // base). Returns how many ids were deleted.
     size_t remove(span<const int64_t> ids, vector<uint32_t>* removed_slots = nullptr);
+
+    // The slots of the live vectors among ids. Unknown, deleted and repeated
+    // ids are ignored.
+    SlotFilter filter(span<const int64_t> ids) const;
 
     // Runs add()'s validation without changing anything, so a caller that must
     // keep two indexes in step (RefineIndex and its base) can reject bad ids

@@ -173,14 +173,20 @@ static std::size_t index_size(const vecengine::Index& self) {
     return read_locked(self, [&] { return self.size(); });
 }
 
-// Query k-NN for a single vector; returns (indices, distances) as 1D arrays
-// with one entry per result (int64, float32).
+// Query k-NN for a single vector, among the ids in allowed when given;
+// returns (indices, distances) as 1D arrays with one entry per result (int64,
+// float32).
 static std::pair<NumpyArray<int64_t>, NumpyArray<float>>
-index_query(const vecengine::Index &self, FloatVector query, std::size_t k) {
+index_query(const vecengine::Index &self, FloatVector query, std::size_t k, std::optional<IdsArg> allowed) {
     if (query.shape(0) != self.dim())
         throw std::invalid_argument("query dimension does not match index dimension");
 
-    auto results = read_locked(self, [&] { return self.query(as_span(query), k); });
+    std::optional<IdVector> allowed_ids;
+    if (allowed) allowed_ids = as_ids(*allowed);
+    auto results = read_locked(self, [&] {
+        if (!allowed_ids) return self.query(as_span(query), k);
+        return self.query(as_span(query), k, std::span<const int64_t>(allowed_ids->data(), allowed_ids->shape(0)));
+    });
 
     const std::size_t n = results.size();
     std::vector<int64_t> indices(n);
@@ -192,16 +198,22 @@ index_query(const vecengine::Index &self, FloatVector query, std::size_t k) {
     return {to_numpy(std::move(indices), {n}), to_numpy(std::move(distances), {n})};
 }
 
-// Query k-NN for each row; returns (indices, distances) as (num_queries, k)
-// arrays. Rows with fewer than k results are padded with -1 / inf.
+// Query k-NN for each row, among the ids in allowed when given; returns
+// (indices, distances) as (num_queries, k) arrays. Rows with fewer than k
+// results are padded with -1 / inf.
 static std::pair<NumpyArray<int64_t>, NumpyArray<float>>
-index_batch_query(const vecengine::Index &self, FloatMatrix query, std::size_t k) {
+index_batch_query(const vecengine::Index &self, FloatMatrix query, std::size_t k, std::optional<IdsArg> allowed) {
     if (query.shape(1) != self.dim())
         throw std::invalid_argument("query dimension does not match index dimension");
 
     const std::size_t num_queries = query.shape(0);
+    std::optional<IdVector> allowed_ids;
+    if (allowed) allowed_ids = as_ids(*allowed);
     auto results = read_locked(self, [&] {
-        return self.query_batch(std::span<const float>(query.data(), query.size()), num_queries, k);
+        const std::span<const float> queries(query.data(), query.size());
+        if (!allowed_ids) return self.query_batch(queries, num_queries, k);
+        return self.query_batch(queries, num_queries, k,
+                                std::span<const int64_t>(allowed_ids->data(), allowed_ids->shape(0)));
     });
 
     std::vector<int64_t> indices(num_queries * k, -1);
@@ -299,8 +311,13 @@ NB_MODULE(qann, m) {
              "Delete the vectors with these ids; unknown ids are skipped. Returns how many were deleted")
         .def("compact", &index_compact,
              "Free the memory of deleted vectors; ids and results are unchanged. Returns how many were freed")
-        .def("query", &index_query, nb::arg("query"), nb::arg("k"), "Query k-NN for a (dim,) vector; returns 1D (indices, distances)")
-        .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), "Query k-NN for each row; returns (indices, distances) arrays of shape (num_queries, k), padded with -1 / inf")
+        .def("query", &index_query, nb::arg("query"), nb::arg("k"), nb::kw_only(), nb::arg("allowed").none() = nb::none(),
+             "Query k-NN for a (dim,) vector; returns 1D (indices, distances). With allowed (ids), only those "
+             "vectors can be returned; unknown and deleted ids in it are ignored")
+        .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), nb::kw_only(),
+             nb::arg("allowed").none() = nb::none(),
+             "Query k-NN for each row; returns (indices, distances) arrays of shape (num_queries, k), padded with "
+             "-1 / inf. With allowed (ids), only those vectors can be returned, for every row")
         .def_prop_ro("metric", &vecengine::Index::metric, "How vectors are compared (fixed at construction)")
         .def("size", &index_size, "Get number of indexed vectors")
         .def("dim", &vecengine::Index::dim, "Get vector dimension");

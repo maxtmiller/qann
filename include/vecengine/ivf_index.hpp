@@ -110,8 +110,10 @@ public:
 private:
     // Index implementations: vectors already prepared for the metric.
     void add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) override;
-    vector<Neighbor> query_impl(span<const float> vec, size_t k) const override;
-    vector<vector<Neighbor>> query_batch_impl(span<const float> queries, size_t num_queries, size_t k) const override;
+    vector<Neighbor> query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const override;
+    vector<vector<Neighbor>> query_batch_impl(span<const float> queries, size_t num_queries, size_t k,
+                                              const detail::SlotFilter* filter) const override;
+    const detail::IdMap& id_map() const noexcept override { return id_map_; }
 
     size_t compact_as_base() override;
 
@@ -139,17 +141,28 @@ private:
     struct Probe {
         float dist;
         uint16_t list;
+
+        // Nearer first; ties by list id, so the order is deterministic.
+        bool operator<(const Probe& o) const noexcept { return dist < o.dist || (dist == o.dist && list < o.list); }
     };
 
-    // The nprobe lists nearest to vec, furthest first.
+    // The nprobe lists nearest to vec, nearest first.
     vector<Probe> coarse(span<const float> vec) const;
+
+    // Every list, for a filtered query: the nprobe nearest to vec first,
+    // nearest first, then the rest in any order (scan() sorts them if it
+    // needs them).
+    vector<Probe> coarse_all(span<const float> vec) const;
 
     // Coarse step for n queries (query i at queries + i * dim_): writes each
     // query's nprobe probes to out + i * nprobe_, in any order.
     void coarse_batch(const float* queries, size_t n, Probe* out) const;
 
-    // Fine step: the top k over the probed lists.
-    vector<Neighbor> scan(span<const float> vec, span<const Probe> probes, size_t k) const;
+    // Fine step: the top k over the probed lists. Without a filter, probes
+    // holds the nprobe lists to scan. With one, it holds coarse_all()'s lists,
+    // and lists past the first nprobe are scanned, nearest first, only until
+    // min(k, filter->count) allowed vectors have been found.
+    vector<Neighbor> scan(span<const float> vec, span<Probe> probes, size_t k, const detail::SlotFilter* filter) const;
 
     static constexpr size_t kPrecomputedMaxBytes = size_t{256} << 20;
 
