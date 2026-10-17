@@ -18,7 +18,7 @@ std::unique_ptr<Index> make_index(IndexType type, size_t dim, const IndexOptions
             return std::make_unique<FlatIndex>(dim, opts.capacity, opts.custom_ids, opts.metric);
         case IndexType::IVF: {
             auto idx = std::make_unique<IVFIndex>(dim, opts.nlist, opts.nprobe, opts.custom_ids, opts.metric);
-            if (opts.pq_subspaces > 0) idx->enable_pq(opts.pq_subspaces, opts.pq_centroids);
+            if (opts.pq_subspaces > 0) idx->enable_pq(opts.pq_subspaces, opts.pq_centroids, false, opts.pq_rotate);
             if (opts.ivf_sq_bits) idx->enable_sq(opts.ivf_sq_bits);
             return idx;
         }

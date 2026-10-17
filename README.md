@@ -103,6 +103,18 @@ refine.add(x)
 - Without a `RefineIndex`, recall is lower than regular PQ at the same memory, and the returned distances are approximate: the lookup tables are rounded to 6 bits.
 - `num_subspaces` must be even and at most 256, `centroids_per_subspace` must be 16 (the default with `fast_scan`), and `pq_distance` stays `ADC`: setting `SDC` raises `ValueError`.
 
+#### Rotation
+
+`enable_pq(..., rotate=True)` makes `train()` also learn a rotation of the vectors (PCA, with the variance spread evenly over the subspaces), and every vector is rotated before IVF and PQ see it. Rotations don't change distances, so results stay valid; only PQ's error changes. It helps when dimensions are correlated across subspaces, so plain PQ spends bits encoding the same information twice:
+
+```python
+ivf.enable_pq(64, fast_scan=True, rotate=True)
+```
+
+- On SIFT1M with fast-scan, recall@10 at `nprobe=16` goes from 0.635 to 0.718 without re-ranking, and `k_factor=4` reaches what `k_factor=8` did (0.988 vs 0.956 at `nprobe=64`). With re-ranking that is about 5% more queries per second at the same recall, after the cost of rotating each query.
+- It does nothing for embeddings whose dimensions are already uncorrelated (GloVe: within 0.004 either way), and with heavy re-ranking (`k_factor=16`) there is little left to gain. Measure on your data.
+- Training takes a little longer (0.4 s more on SIFT1M), and the index stores one `dim x dim` matrix (64 KB at 128 dimensions).
+
 
 #### SQ
 

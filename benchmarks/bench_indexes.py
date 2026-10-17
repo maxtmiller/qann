@@ -92,12 +92,12 @@ def time_queries(index, queries: np.ndarray, k: int, repeats: int = 3):
     return ids, len(queries) / best
 
 
-def build_ivf(dim, nlist, base, learn, metric, pq_m=None, seed=None, fast_scan=False, sq_bits=0):
+def build_ivf(dim, nlist, base, learn, metric, pq_m=None, seed=None, fast_scan=False, sq_bits=0, rotate=False):
     # With PQ (or SQ4), vectors are added through a RefineIndex so one build serves
     # both the plain rows (query idx) and the re-ranked rows (query refine).
     idx = qann.IVFIndex(dim, nlist, metric=metric)
     if pq_m is not None:
-        idx.enable_pq(pq_m, fast_scan=fast_scan)
+        idx.enable_pq(pq_m, fast_scan=fast_scan, rotate=rotate)
     if sq_bits:
         idx.enable_sq(sq_bits)
     start = time.perf_counter()
@@ -137,10 +137,12 @@ def run(dataset: str, max_queries: int | None, seed: int | None = None):
     ids, qps = time_queries(flat, queries, K)
     record("Flat", "-", ids, qps, dim * 4, add_s=add_s)
 
-    configs = ([("IVF", None, False)] + [(f"IVF-PQ{m}", m, False) for m in cfg["pq"]]
-               + [(f"IVF-PQ{m}x4fs", m, True) for m in cfg["fast_scan"]])
-    for name, m, fast in configs:
-        idx, refine, train_s, add_s = build_ivf(dim, nlist, base, learn, metric, m, seed, fast)
+    # -rot: enable_pq(..., rotate=True), the PCA-balanced rotation (issue #41)
+    configs = ([("IVF", None, False, False)] + [(f"IVF-PQ{m}", m, False, False) for m in cfg["pq"]]
+               + [(f"IVF-PQ{m}x4fs", m, True, False) for m in cfg["fast_scan"]]
+               + [(f"IVF-PQ{m}x4fs-rot", m, True, True) for m in cfg["fast_scan"]])
+    for name, m, fast, rotate in configs:
+        idx, refine, train_s, add_s = build_ivf(dim, nlist, base, learn, metric, m, seed, fast, rotate=rotate)
         print(f"{name}  (train {train_s:.1f}s, add {add_s:.1f}s)")
         code_bytes = 0 if m is None else (m // 2 if fast else m)
         bytes_per_vec = (dim * 4 if m is None else code_bytes) + 4  # + uint32 id

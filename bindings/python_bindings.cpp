@@ -341,18 +341,21 @@ NB_MODULE(qann, m) {
              "Run k-means over sample vectors to compute coarse centroids")
         .def("enable_pq",
              [](vecengine::IVFIndex& self, std::size_t num_subspaces, std::optional<std::size_t> centroids_per_subspace,
-                bool fast_scan) {
+                bool fast_scan, bool rotate) {
                  const std::size_t k = centroids_per_subspace.value_or(fast_scan ? 16 : 256);
-                 write_locked(self, [&] { self.enable_pq(num_subspaces, k, fast_scan); });
+                 write_locked(self, [&] { self.enable_pq(num_subspaces, k, fast_scan, rotate); });
              },
              nb::arg("num_subspaces"), nb::arg("centroids_per_subspace").none() = nb::none(), nb::kw_only(),
-             nb::arg("fast_scan") = false,
+             nb::arg("fast_scan") = false, nb::arg("rotate") = false,
              "Enable PQ compression of residuals. Call before train()/add(). centroids_per_subspace defaults to "
              "256, or 16 with fast_scan=True, which stores 4-bit codes and scores 32 vectors per SIMD instruction "
              "(much faster; distances are approximate, so pair it with a RefineIndex). fast_scan needs an even "
-             "num_subspaces <= 256 and ADC")
-        // TODO(#41): rotate=False keyword on enable_pq above, a read-only pq_rotate
-        // property, and IndexOptions.pq_rotate
+             "num_subspaces <= 256 and ADC. rotate=True makes train() also learn a rotation (PCA, with the "
+             "variance spread evenly over the subspaces) applied to every vector first: lower PQ error when "
+             "dimensions are correlated (e.g. SIFT), no effect on near-isotropic embeddings")
+        .def_prop_ro("pq_rotate",
+                     [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.pq_rotate(); }); },
+                     "Whether enable_pq(..., rotate=True) was used")
         .def("enable_sq", [](vecengine::IVFIndex& self, int bits) { write_locked(self, [&] { self.enable_sq(bits); }); },
              nb::arg("bits") = 8,
              "Store vectors as scalar codes of 8 bits (4x smaller than floats) or 4 bits (8x smaller) per "
@@ -434,6 +437,7 @@ NB_MODULE(qann, m) {
         .def_rw("pq_subspaces", &vecengine::IndexOptions::pq_subspaces)
         .def_rw("pq_centroids", &vecengine::IndexOptions::pq_centroids)
         .def_rw("ivf_sq_bits", &vecengine::IndexOptions::ivf_sq_bits)
+        .def_rw("pq_rotate", &vecengine::IndexOptions::pq_rotate)
         .def_rw("hnsw_m", &vecengine::IndexOptions::hnsw_m)
         .def_rw("ef_construction", &vecengine::IndexOptions::ef_construction)
         .def_rw("ef_search", &vecengine::IndexOptions::ef_search)
