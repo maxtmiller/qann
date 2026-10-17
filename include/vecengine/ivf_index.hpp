@@ -43,8 +43,14 @@ public:
     // Enables PQ compression of residuals (vec - assigned coarse centroid).
     // Must be called before train()/add(). Once enabled, add() stores codes
     // in InvertedList::codes instead of raw floats in InvertedList::vecs.
-    // Throws std::logic_error after enable_sq().
-    void enable_pq(size_t num_subspaces, size_t centroids_per_subspace = 256, bool fast_scan = false);
+    // With rotate, train() also learns a PCA-balanced rotation (see
+    // src/rotation.hpp) and every vector is rotated by it before the coarse
+    // and PQ steps (issue #41). Throws std::logic_error after enable_sq().
+    void enable_pq(size_t num_subspaces, size_t centroids_per_subspace = 256, bool fast_scan = false,
+                   bool rotate = false);
+
+    // Whether enable_pq(..., rotate = true) was used.
+    bool pq_rotate() const noexcept { return rotate_; }
 
     // Stores each vector as scalar codes of `bits` (4 or 8; std::invalid_argument
     // otherwise) per dimension instead of raw floats: 8x or 4x less list
@@ -128,6 +134,10 @@ private:
     // Whether enable_pq() was called.
     bool pq_enabled() const noexcept { return pq_ != nullptr; }
 
+    // A copy of the n rows of vecs rotated by rotation_ (requires a trained
+    // rotation). Used by train, add_batch_impl and the query paths.
+    vector<float> rotated(span<const float> vecs, size_t n) const;
+
     // Bytes of one vector's SQ codes (with SQ enabled).
     size_t sq_code_bytes() const noexcept { return sq_bits_ == 8 ? dim_ : (dim_ + 1) / 2; }
 
@@ -181,6 +191,8 @@ private:
     vector<float> precomputed_; // term B: nlist * m * K floats, list-major; empty when not in use
     detail::IdMap id_map_;
     bool fast_scan_ = false;
+    bool rotate_ = false; // enable_pq(..., rotate) setting
+    vector<float> rotation_; // dim_ x dim_, row-major (see src/rotation.hpp); empty until trained
 };
 
 } // namespace vecengine

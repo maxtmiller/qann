@@ -72,6 +72,7 @@ add_library(vecengine_core STATIC
   src/threads.cpp
   src/flat_index.cpp
   src/ivf_index.cpp
+  src/rotation.cpp
   src/pq.cpp
   src/kmeans.cpp
   src/refine_index.cpp
@@ -133,6 +134,7 @@ add_executable(test_vecengine
   tests/test_metric.cpp
   tests/test_ivf_sq.cpp
   tests/test_filter.cpp
+  tests/test_rotation.cpp
 )
 
 target_link_libraries(test_vecengine PRIVATE

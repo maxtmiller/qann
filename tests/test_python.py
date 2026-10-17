@@ -770,3 +770,46 @@ def test_loads_sq_ivf_saved_on_macos(bits):
     ids, dists = index.batch_query(np.load(DATA / "v7_queries.npy"), 10)
     np.testing.assert_array_equal(ids, np.load(DATA / f"v7_ivf_sq{bits}_ids.npy"))
     np.testing.assert_allclose(dists, np.load(DATA / f"v7_ivf_sq{bits}_dists.npy"), rtol=1e-5, atol=1e-5)
+
+
+def test_ivf_pq_rotate(tmp_path):
+    # Dimension j + 16 is a near-copy of dimension j, so plain PQ quantizes every
+    # value twice in different subspaces; the rotation folds each pair together.
+    rng = np.random.default_rng(3)
+    z = rng.standard_normal((6100, 16)).astype(np.float32)
+    x = np.hstack([z, z + 0.05 * rng.standard_normal(z.shape).astype(np.float32)])
+    data, queries = x[:6000], x[6000:]
+    flat = qann.FlatIndex(32)
+    flat.add(data)
+    truth, _ = flat.batch_query(queries, 10)
+
+    recall = {}
+    for rotate in (False, True):
+        ivf = qann.IVFIndex(32, nlist=100, nprobe=100)
+        ivf.enable_pq(8, rotate=rotate)
+        assert ivf.pq_rotate == rotate
+        ivf.train(data, seed=1)
+        ivf.add(data)
+        ids, _ = ivf.batch_query(queries, 10)
+        recall[rotate] = np.mean([len(set(a) & set(b)) / 10 for a, b in zip(ids, truth)])
+    assert recall[True] >= recall[False] + 0.1
+
+    ivf.save(tmp_path / "rot.qann")
+    loaded = qann.load(tmp_path / "rot.qann")
+    assert loaded.pq_rotate
+    assert_same_results(ivf, loaded, queries[:50])
+
+    opts = qann.IndexOptions()
+    opts.pq_subspaces = 8
+    opts.pq_rotate = True
+    assert qann.make_index(qann.IndexType.IVF, 32, opts).pq_rotate
+
+
+def test_loads_rotated_ivf_saved_on_macos():
+    # Saved on macOS (format version 8): rotated IVF-PQ under a RefineIndex, with
+    # deletions. Linux CI loading it checks the rotation is portable.
+    index = qann.load(DATA / "v8_ivf_rot.qann")
+    assert index.base.pq_rotate
+    ids, dists = index.batch_query(np.load(DATA / "v8_queries.npy"), 10)
+    np.testing.assert_array_equal(ids, np.load(DATA / "v8_ivf_rot_ids.npy"))
+    np.testing.assert_allclose(dists, np.load(DATA / "v8_ivf_rot_dists.npy"), rtol=1e-5, atol=1e-5)
