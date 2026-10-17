@@ -351,6 +351,8 @@ NB_MODULE(qann, m) {
              "256, or 16 with fast_scan=True, which stores 4-bit codes and scores 32 vectors per SIMD instruction "
              "(much faster; distances are approximate, so pair it with a RefineIndex). fast_scan needs an even "
              "num_subspaces <= 256 and ADC")
+        // TODO(#41): rotate=False keyword on enable_pq above, a read-only pq_rotate
+        // property, and IndexOptions.pq_rotate
         .def("enable_sq", [](vecengine::IVFIndex& self, int bits) { write_locked(self, [&] { self.enable_sq(bits); }); },
              nb::arg("bits") = 8,
              "Store vectors as scalar codes of 8 bits (4x smaller than floats) or 4 bits (8x smaller) per "

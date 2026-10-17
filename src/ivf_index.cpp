@@ -7,6 +7,7 @@
 #include "topk.hpp"
 #include "serialize.hpp"
 #include "fast_scan.hpp"
+#include "rotation.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -66,7 +67,7 @@ void IVFIndex::build_precomputed() {
     });
 }
 
-void IVFIndex::enable_pq(size_t num_subspaces, size_t centroids_per_subspace, bool fast_scan) {
+void IVFIndex::enable_pq(size_t num_subspaces, size_t centroids_per_subspace, bool fast_scan, bool rotate) {
     if (id_map_.slots() > 0 || trained_)
         throw std::logic_error("enable_pq must be called before train()/add()");
     if (sq_bits_) throw std::logic_error("enable_pq cannot be combined with enable_sq");
@@ -74,8 +75,17 @@ void IVFIndex::enable_pq(size_t num_subspaces, size_t centroids_per_subspace, bo
         throw std::invalid_argument("fast_scan needs 16 centroids per subspace and an even num_subspaces <= 256");
     if (fast_scan && pq_distance_ == PQDistance::SDC)
         throw std::invalid_argument("cannot use SDC with fast-scan");
+    // TODO(#41): remove once train/add/query/save/load handle rotation_
+    if (rotate) throw std::logic_error("rotate is not implemented yet");
     fast_scan_= fast_scan;
+    rotate_ = rotate;
     pq_ = std::make_unique<PQCodebook>(dim_, num_subspaces, centroids_per_subspace);
+}
+
+vector<float> IVFIndex::rotated(span<const float> vecs, size_t n) const {
+    // TODO(#41): detail::rotate(rotation_, vecs.data(), n, dim_, out.data())
+    (void)vecs; (void)n;
+    throw std::logic_error("rotated is not implemented yet");
 }
 
 void IVFIndex::enable_sq(int bits) {
@@ -89,6 +99,7 @@ void IVFIndex::enable_sq(int bits) {
 void IVFIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) {
     assert(vecs.size() == n * dim());
     if (!trained_) throw std::logic_error("train() has not be run yet");
+    // TODO(#41): with rotate_, replace vecs by rotated(vecs, n) here
 
     const uint32_t first_slot = static_cast<uint32_t>(id_map_.slots());
     id_map_.add(n, ids);
@@ -143,6 +154,7 @@ void IVFIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* i
 vector<Neighbor> IVFIndex::query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const {
     assert(vec.size() == dim_);
     if (!trained_) throw std::logic_error("train() has not be run yet");
+    // TODO(#41): with rotate_, replace vec by rotated(vec, 1) here
 
     VECENGINE_PROF_START(t_coarse);
     vector<Probe> probes = filter ? coarse_all(vec) : coarse(vec);
@@ -161,6 +173,9 @@ vector<vector<Neighbor>> IVFIndex::query_batch_impl(span<const float> queries, s
 #else
     // a filtered query may probe every list, which the batched coarse step doesn't rank
     if (filter) return Index::query_batch_impl(queries, num_queries, k, filter);
+
+    // TODO(#41): with rotate_, rotate the whole batch here, after the early
+    // returns above (they go through query_impl, which rotates itself)
 
     // coarse_batch holds block * nlist_ scores; cap them at 32 MB
     const size_t block = std::clamp<size_t>((size_t{32} << 20) / (nlist_ * sizeof(float)), 1, 1024);
@@ -467,6 +482,9 @@ void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_i
         vectors = unit;
     }
 
+    // TODO(#41): with rotate_, rotation_ = detail::balanced_pca_rotation(vectors,
+    // num_vectors, dim_, pq_->num_subspaces()), then train on rotated(vectors, num_vectors)
+
     // run kmeans
     auto res = vecengine::detail::kmeans(vectors.data(), num_vectors, dim_, dim_, nlist_, max_iters, seed);
     coarse_centroids_ = std::move(res.centroids);
@@ -505,6 +523,7 @@ void IVFIndex::save(std::ostream& out) const {
     if (pq_) {
         pq_->save(out);
         write_pod(out, static_cast<uint8_t>(fast_scan_));
+        // TODO(#41): version 8: write_pod(uint8_t(rotate_)), write_vec(rotation_)
     }
     // version 7: SQ bits per dimension (0 = off), then the ranges (empty until trained)
     write_pod(out, static_cast<uint8_t>(sq_bits_));
@@ -560,6 +579,8 @@ std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version
                 throw std::runtime_error("corrupt file: invalid IVFIndex fast-scan settings");
             index->fast_scan_ = fast_scan;
         }
+        // TODO(#41): version >= 8: read the rotate flag (0 or 1) and rotation_ (empty, or
+        // dim * dim when trained); reject a wrong length or a non-orthogonal matrix
     }
 
     if (version >= 7) {
