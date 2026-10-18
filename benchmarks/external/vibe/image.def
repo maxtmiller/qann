@@ -1,0 +1,9 @@
+Bootstrap: localimage
+From: base.sif
+
+%files
+  qann-dist /opt/qann-dist
+
+%post
+  pip install --no-cache-dir -r /opt/qann-dist/requirement.txt
+  python -c 'import qann; print(qann.__version__)'
