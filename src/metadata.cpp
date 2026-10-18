@@ -174,7 +174,8 @@ void MetadataStore::append(size_t rows, size_t n, const Metadata& md) {
     for (const MetadataColumn& c : md) given.emplace(c.name, &c);
 
     for (const MetadataColumn& c : md) {
-        if (find(c.name)) continue;
+        // an add of no vectors creates no columns: its empty values say nothing about the type
+        if (n == 0 || find(c.name)) continue;
         Column col{c.name, type_of(c), vector<uint8_t>(rows, 0), {}, {}, {}, {}, {}};
         if (col.type == ColumnType::Int64) col.ints.assign(rows, 0);
         else if (col.type == ColumnType::Float64) col.floats.assign(rows, 0.0);
@@ -185,7 +186,7 @@ void MetadataStore::append(size_t rows, size_t n, const Metadata& md) {
     for (Column& col : columns_) {
         assert(col.rows() == rows);
         auto it = given.find(col.name);
-        if (it == given.end()) {  // left out of this add: null
+        if (it == given.end() || n == 0) {  // left out of this add: null
             col.valid.insert(col.valid.end(), n, 0);
             if (col.type == ColumnType::Int64) col.ints.insert(col.ints.end(), n, 0);
             else if (col.type == ColumnType::Float64) col.floats.insert(col.floats.end(), n, 0.0);

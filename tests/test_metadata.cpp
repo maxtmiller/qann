@@ -13,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <random>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -335,4 +336,141 @@ TEST_CASE("Metadata: load rejects corrupt columns", "[metadata][serialize]") {
     write_vec(d, std::vector<char>{'x'});
     write_vec(d, std::vector<char>{'x'});
     rejects(d.str(), 2);
+}
+
+TEST_CASE("Metadata filters on other index settings, and HNSW's graph path", "[metadata]") {
+    const size_t n = 4000, dim = 16, nq = 20, k = 10;
+    const auto data = md_random(n, dim, 6);
+    const auto queries = md_random(nq, dim, 7);
+
+    // narrow: HNSW scores the allowed vectors directly; wide (80%): it searches its graph
+    const Expr narrow = f("price", Op::Lt, int64_t{30}) & ~f("color", Op::Eq, std::string("red"));
+    const Expr wide = f("price", Op::Lt, int64_t{80});
+    const auto narrow_ids = ids_where(n, [](size_t i) { return i % 100 < 30 && i % 4 != 0; });
+    const auto wide_ids = ids_where(n, [](size_t i) { return i % 100 < 80; });
+
+    std::vector<std::pair<std::string, std::function<std::pair<std::unique_ptr<Index>, std::unique_ptr<Index>>()>>> configs = {
+        {"ivf-sq8", [&] {
+             auto ivf = std::make_unique<IVFIndex>(dim, 100, 20);
+             ivf->enable_sq(8);
+             ivf->train(data, n, 25, 1);
+             return std::make_pair(std::unique_ptr<Index>(), std::unique_ptr<Index>(std::move(ivf)));
+         }},
+        {"ivf-fastscan+R", [&] {
+             auto ivf = std::make_unique<IVFIndex>(dim, 100, 20);
+             ivf->enable_pq(8, 16, true);
+             ivf->train(data, n, 25, 1);
+             auto refine = std::make_unique<RefineIndex>(*ivf, 8);
+             return std::make_pair(std::unique_ptr<Index>(std::move(ivf)), std::unique_ptr<Index>(std::move(refine)));
+         }},
+        {"ivf-pq-rotate+R", [&] {
+             auto ivf = std::make_unique<IVFIndex>(dim, 100, 20);
+             ivf->enable_pq(8, 256, false, true);
+             ivf->train(data, n, 25, 1);
+             auto refine = std::make_unique<RefineIndex>(*ivf, 8);
+             return std::make_pair(std::unique_ptr<Index>(std::move(ivf)), std::unique_ptr<Index>(std::move(refine)));
+         }},
+        {"hnsw-sq8+R", [&] {
+             auto hnsw = std::make_unique<HNSWIndex>(dim, 16, 100, false, 1);
+             hnsw->enable_sq(8);
+             hnsw->train(data, n);
+             auto refine = std::make_unique<RefineIndex>(*hnsw, 4);
+             return std::make_pair(std::unique_ptr<Index>(std::move(hnsw)), std::unique_ptr<Index>(std::move(refine)));
+         }},
+        {"hnsw", [&] {
+             return std::make_pair(std::unique_ptr<Index>(),
+                                   std::unique_ptr<Index>(std::make_unique<HNSWIndex>(dim, 16, 100, false, 1)));
+         }},
+        {"flat-cosine", [&] {
+             return std::make_pair(std::unique_ptr<Index>(),
+                                   std::unique_ptr<Index>(std::make_unique<FlatIndex>(dim, n, false, Metric::Cosine)));
+         }},
+        {"hnsw-cosine", [&] {
+             return std::make_pair(std::unique_ptr<Index>(), std::unique_ptr<Index>(std::make_unique<HNSWIndex>(
+                                                                 dim, 16, 100, false, 1, Metric::Cosine)));
+         }},
+    };
+
+    for (auto& [name, make] : configs) {
+        INFO(name);
+        auto [base, index] = make();
+        index->add_batch(data, n, nullptr, md_rows(0, n));
+        for (const auto& [where, ids] : {std::make_pair(narrow, narrow_ids), std::make_pair(wide, wide_ids)}) {
+            const auto got = index->query_batch(queries, nq, k, where);
+            md_require_identical(got, index->query_batch(queries, nq, k, ids));
+            const std::set<int64_t> ok(ids.begin(), ids.end());
+            for (const auto& row : got) {
+                REQUIRE(row.size() == k);
+                for (const auto& nb : row) REQUIRE(ok.count(static_cast<int64_t>(nb.index)) == 1);
+            }
+        }
+    }
+}
+
+TEST_CASE("Metadata: a re-added id gets its new row, and empty adds create no columns", "[metadata]") {
+    const size_t dim = 4;
+    const auto data = md_random(3, dim, 8);
+    FlatIndex flat(dim, 16, true);
+    const std::vector<int64_t> ids = {5, 6};
+    flat.add_batch(std::span<const float>(data.data(), 2 * dim), 2, ids.data(),
+                   {{"color", std::vector<std::string>{"red", "red"}}});
+    flat.remove(std::vector<int64_t>{5});
+    const int64_t again = 5;
+    flat.add_batch(std::span<const float>(data.data() + 2 * dim, dim), 1, &again,
+                   {{"color", std::vector<std::string>{"blue"}}});
+    const std::span<const float> q(data.data(), dim);
+    REQUIRE(flat.query(q, 5, f("color", Op::Eq, std::string("blue")))[0].index == 5);
+    const auto red = flat.query(q, 5, f("color", Op::Eq, std::string("red")));
+    REQUIRE(red.size() == 1);
+    REQUIRE(red[0].index == 6);
+    flat.compact();
+    REQUIRE(flat.query(q, 5, f("color", Op::Eq, std::string("blue")))[0].index == 5);
+
+    // no vectors, so no evidence of a type: the column isn't created
+    FlatIndex empty(dim);
+    empty.add_batch(std::span<const float>(), 0, nullptr, {{"a", std::vector<double>{}}});
+    REQUIRE(empty.metadata_schema().empty());
+    empty.add_batch(std::span<const float>(data.data(), dim), 1, nullptr, {{"a", std::vector<std::string>{"x"}}});
+    REQUIRE(empty.metadata_schema() == std::vector<std::pair<std::string, ColumnType>>{{"a", ColumnType::String}});
+}
+
+TEST_CASE("Metadata filters at 100k rows match a reference evaluation", "[metadata]") {
+    // 100003 rows: not a multiple of 64, so the last word's padding is exercised by ~
+    const size_t n = 100003, dim = 4, nq = 5, k = 20;
+    const auto data = md_random(n, dim, 9);
+    const auto queries = md_random(nq, dim, 10);
+    std::mt19937 rng(11);
+    std::vector<int64_t> price(n);
+    std::vector<double> weight(n);
+    std::vector<std::string> color(n);
+    for (size_t i = 0; i < n; ++i) {
+        price[i] = static_cast<int64_t>(rng() % 1000);
+        weight[i] = static_cast<double>(rng() % 10000) / 100.0;
+        color[i] = kColors[rng() % 4];
+    }
+    FlatIndex flat(dim, n);
+    flat.add_batch(std::span<const float>(data.data(), (n - 3) * dim), n - 3, nullptr,
+                   {{"price", std::vector<int64_t>(price.begin(), price.end() - 3)},
+                    {"weight", std::vector<double>(weight.begin(), weight.end() - 3)},
+                    {"color", std::vector<std::string>(color.begin(), color.end() - 3)}});
+    flat.add_batch(std::span<const float>(data.data() + (n - 3) * dim, 3 * dim), 3);  // last three null
+
+    struct Case {
+        Expr where;
+        std::function<bool(size_t)> match;
+    };
+    auto has = [&](size_t i) { return i < n - 3; };
+    const std::vector<Case> cases = {
+        {f("price", Op::Lt, int64_t{10}), [&](size_t i) { return has(i) && price[i] < 10; }},
+        {~f("price", Op::Lt, int64_t{990}), [&](size_t i) { return !(has(i) && price[i] < 990); }},
+        {(f("weight", Op::Ge, 99.5) | Expr::is_null("color")) & ~f("color", Op::Eq, std::string("red")),
+         [&](size_t i) { return (has(i) ? weight[i] >= 99.5 : true) && !(has(i) && color[i] == "red"); }},
+        {Expr::isin("price", {int64_t{1}, int64_t{500}, 999.0}) & f("color", Op::Ge, std::string("blue")),
+         [&](size_t i) { return has(i) && (price[i] == 1 || price[i] == 500 || price[i] == 999) && color[i] >= "blue"; }},
+    };
+    for (size_t c = 0; c < cases.size(); ++c) {
+        CAPTURE(c);
+        const auto ids = ids_where(n, cases[c].match);
+        md_require_identical(flat.query_batch(queries, nq, k, cases[c].where), flat.query_batch(queries, nq, k, ids));
+    }
 }

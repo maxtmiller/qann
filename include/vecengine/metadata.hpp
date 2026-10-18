@@ -99,7 +99,8 @@ public:
     void check(size_t n, const Metadata& md) const;
 
     // Appends n rows after the current `rows` (the index's slots before the
-    // add). Requires check() to have passed.
+    // add). Requires check() to have passed. With n == 0 nothing changes, so
+    // an empty add creates no columns.
     void append(size_t rows, size_t n, const Metadata& md);
 
     // Moves row old to remap[old] and drops rows marked IdMap::kRemoved, like

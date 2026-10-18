@@ -895,6 +895,61 @@ def test_metadata_input_and_filter_errors(data):
             misuse()
 
 
+def test_metadata_unsigned_overflow_and_empty_adds(data):
+    index = qann.FlatIndex(32)
+    with pytest.raises(ValueError):    # would wrap to a negative int64
+        index.add(data[:2], metadata={"u": np.array([1, 2**63], dtype=np.uint64)})
+    index.add(data[:2], metadata={"u": np.array([1, 2**63 - 1], dtype=np.uint64)})
+    assert index.query(data[0], 2, where=qann.field("u") > 0)[0].size == 2
+
+    # an add of no vectors says nothing about a column's type, so it creates none
+    index.add(data[:0], metadata={"tag": []})
+    assert "tag" not in index.metadata_schema
+    index.add(data[2:3], metadata={"tag": ["x"]})
+    assert index.metadata_schema["tag"] == "str"
+
+
+def test_concurrent_metadata_adds_and_filtered_queries(data):
+    # adds with metadata (exclusive lock) interleaved with where= queries (shared):
+    # every result must satisfy the filter as of some consistent state
+    index = qann.HNSWIndex(32, seed=1)
+    index.add(data[:500], metadata={"group": np.arange(500) % 5, "name": np.array(["a", "b"])[np.arange(500) % 2]})
+    rng = np.random.default_rng(4)
+    batches = [rng.random((100, 32), dtype=np.float32) for _ in range(15)]
+    queries = rng.random((50, 32), dtype=np.float32)
+    f = qann.field
+    where = (f("group") == 3) & (f("name") == "b")
+    errors = []
+
+    def run(fn):
+        try:
+            fn()
+        except Exception as e:
+            errors.append(e)
+
+    def adder():
+        for b, batch in enumerate(batches):
+            start = 500 + 100 * b
+            ids = np.arange(start, start + 100)
+            index.add(batch, metadata={"group": ids % 5, "name": np.array(["a", "b"])[ids % 2]})
+
+    def querier():
+        for _ in range(30):
+            got, _ = index.batch_query(queries, 10, where=where)
+            got = got[got >= 0]
+            assert ((got % 5 == 3) & (got % 2 == 1)).all()
+
+    threads = [threading.Thread(target=run, args=(fn,)) for fn in (adder, querier, querier)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+    assert index.size() == 500 + 100 * len(batches)
+    got, _ = index.batch_query(queries, 10, where=where)
+    assert ((got % 5 == 3) & (got % 2 == 1)).all()
+
+
 def test_loads_metadata_saved_on_macos():
     # Saved on macOS (format version 9): a RefineIndex over IVF-PQ with int,
     # float and string columns, nulls from a second add, and deletions.

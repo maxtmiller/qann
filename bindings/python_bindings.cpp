@@ -161,6 +161,9 @@ static vecengine::Metadata as_metadata(nb::dict metadata, std::size_t n) {
             throw std::invalid_argument("metadata column '" + name + "' must have one value per row of data");
 
         const auto kind = nb::cast<std::string>(arr.attr("dtype").attr("kind"));
+        if (kind == "u" && nb::cast<std::size_t>(arr.attr("size")) > 0 &&
+            nb::cast<uint64_t>(arr.attr("max")()) > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+            throw std::invalid_argument("metadata column '" + name + "' has values above the int64 maximum");
         if (kind == "i" || kind == "u" || kind == "b") {
             auto ints = nb::cast<IdVector>(np.attr("ascontiguousarray")(arr, nb::arg("dtype") = "int64"));
             out.push_back({name, std::vector<int64_t>(ints.data(), ints.data() + ints.shape(0))});
