@@ -428,6 +428,7 @@ size_t IVFIndex::compact_impl(bool keep_ids) {
     auto remap = id_map_.compact(keep_ids);
     if (remap.empty()) return 0;
     compact_storage(remap);
+    metadata_.compact(remap);
     return remap.size() - id_map_.slots();
 }
 
@@ -560,6 +561,7 @@ void IVFIndex::save(std::ostream& out) const {
     id_map_.save(out);
     write_pod(out, static_cast<uint8_t>(use_precomputed_));
     write_pod(out, static_cast<uint8_t>(metric_));
+    metadata_.save(out);
 }
 
 std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version) {
@@ -665,6 +667,7 @@ std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version
         index->use_precomputed_ = use_precomputed;
     }
     if (version >= 5) index->metric_ = read_metric(in);
+    if (version >= 9) index->metadata_ = MetadataStore::load(in, n_total);
     index->build_precomputed();
 
     return index;

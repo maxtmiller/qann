@@ -7,6 +7,10 @@
 #include <shared_mutex>
 #include <atomic>
 #include <cstdint>
+#include <string>
+#include <utility>
+
+#include "vecengine/metadata.hpp"
 
 namespace vecengine {
 
@@ -54,10 +58,13 @@ public:
     void add(span<const float> vec);
 
     // Adds n vectors (n * dim() floats, row-major). ids must hold n ids (>= 0,
-    // unique) when the index uses custom ids and be nullptr otherwise. On a bad
-    // id nothing is added. With Metric::Cosine, a zero vector throws
-    // std::invalid_argument (it has no direction) and nothing is added.
-    void add_batch(span<const float> vecs, size_t n, const int64_t* ids = nullptr);
+    // unique) when the index uses custom ids and be nullptr otherwise.
+    // metadata holds any columns of values for the n vectors (see
+    // detail::MetadataStore: new columns start with earlier rows null, left-out
+    // columns get null). On a bad id or bad metadata nothing is added. With
+    // Metric::Cosine, a zero vector throws std::invalid_argument (it has no
+    // direction) and nothing is added.
+    void add_batch(span<const float> vecs, size_t n, const int64_t* ids = nullptr, const Metadata& metadata = {});
 
     // Up to k nearest live vectors to vec, nearest first. Returns fewer than k
     // only when fewer are reachable (too few live vectors, or for IVF too few
@@ -76,6 +83,20 @@ public:
     vector<Neighbor> query(span<const float> vec, size_t k, span<const int64_t> allowed) const;
     vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k,
                                          span<const int64_t> allowed) const;
+
+    // Metadata filters: only vectors whose metadata matches `where` (and,
+    // with allowed, whose id is also in it) can be returned. Evaluating
+    // `where` scans the columns it names once per call. Throws
+    // std::invalid_argument on an unknown column or a value of the wrong kind.
+    vector<Neighbor> query(span<const float> vec, size_t k, const Expr& where) const;
+    vector<Neighbor> query(span<const float> vec, size_t k, const Expr& where, span<const int64_t> allowed) const;
+    vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k,
+                                         const Expr& where) const;
+    vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k,
+                                         const Expr& where, span<const int64_t> allowed) const;
+
+    // Each metadata column's name and type, in the order they were created.
+    vector<std::pair<std::string, ColumnType>> metadata_schema() const { return metadata_.schema(); }
 
     // How this index compares vectors (fixed at construction).
     Metric metric() const noexcept { return metric_; }
@@ -133,6 +154,11 @@ protected:
 
     Metric metric_; // set by the constructor, or by a load_body
 
+    // Metadata columns, aligned to slots. Filled by add_batch; each index
+    // compacts, saves and loads it with its own storage. Stays empty in the
+    // base of a RefineIndex, whose metadata lives in the RefineIndex.
+    detail::MetadataStore metadata_;
+
     // Default: query_impl() for each row, in parallel. Protected so an
     // override can fall back to it.
     virtual vector<vector<Neighbor>> query_batch_impl(span<const float> queries, size_t num_queries, size_t k,
@@ -147,6 +173,10 @@ private:
     // unfiltered query.
     vector<vector<Neighbor>> query_prepared(span<const float> queries, size_t num_queries, size_t k,
                                             const detail::SlotFilter* filter, bool batch) const;
+
+    // The filter of a metadata query: where's matching slots, also in allowed
+    // when it is given, minus deleted slots.
+    detail::SlotFilter where_filter(const Expr& where, const span<const int64_t>* allowed) const;
 
     // This index's slot <-> id map, used to turn allowed ids into slots.
     virtual const detail::IdMap& id_map() const noexcept = 0;

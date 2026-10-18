@@ -66,7 +66,7 @@ TEST_CASE("serialize: read_header rejects bad input", "[serialize]") {
     expect_throw(bad_magic);
 
     std::string bad_version = bytes;
-    bad_version[4] = 9;
+    bad_version[4] = static_cast<char>(kFormatVersion + 1);
     expect_throw(bad_version);
 
     std::string bad_kind = bytes;
@@ -560,6 +560,7 @@ TEST_CASE("RefineIndex: load rejects truncated and corrupt data", "[refine][seri
         IdMap ids;
         ids.add(count, nullptr);
         ids.save(t);
+        MetadataStore{}.save(t);
         return t;
     };
 

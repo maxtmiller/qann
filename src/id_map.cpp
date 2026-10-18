@@ -113,6 +113,16 @@ SlotFilter IdMap::filter(span<const int64_t> ids) const {
     return f;
 }
 
+SlotFilter IdMap::live(vector<uint64_t> words) const {
+    SlotFilter f;
+    f.words = std::move(words);
+    if (deleted_count_ > 0)
+        for (size_t s = 0; s < slots_; ++s)
+            if (deleted_[s]) f.words[s >> 6] &= ~(uint64_t{1} << (s & 63));
+    for (uint64_t w : f.words) f.count += static_cast<size_t>(std::popcount(w));
+    return f;
+}
+
 vector<uint32_t> IdMap::compact(bool keep_ids) {
     if (deleted_count_ == 0) return {};
 

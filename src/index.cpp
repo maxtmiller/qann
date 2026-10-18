@@ -29,14 +29,19 @@ void Index::add(span<const float> vec) {
     add_batch(vec, 1, nullptr);
 }
 
-void Index::add_batch(span<const float> vecs, size_t n, const int64_t* ids) {
+void Index::add_batch(span<const float> vecs, size_t n, const int64_t* ids, const Metadata& metadata) {
     assert(vecs.size() == n * dim());
+    // validate metadata first and append it only once the vectors are in, so a
+    // throw anywhere leaves both unchanged
+    metadata_.check(n, metadata);
+    const size_t rows = slots();
     if (metric_ == Metric::L2) {
         add_batch_impl(vecs, n, ids);
-        return;
+    } else {
+        const vector<float> unit = normalize_rows(vecs, n);
+        add_batch_impl(unit, n, ids);
     }
-    const vector<float> unit = normalize_rows(vecs, n);
-    add_batch_impl(unit, n, ids);
+    metadata_.append(rows, n, metadata);
 }
 
 vector<Neighbor> Index::query(span<const float> vec, size_t k) const {
@@ -60,6 +65,41 @@ vector<vector<Neighbor>> Index::query_batch(span<const float> queries, size_t nu
     assert(queries.size() == num_queries * dim());
     const detail::SlotFilter filter = id_map().filter(allowed);
     return query_prepared(queries, num_queries, k, &filter, true);
+}
+
+vector<Neighbor> Index::query(span<const float> vec, size_t k, const Expr& where) const {
+    assert(vec.size() == dim());
+    const detail::SlotFilter filter = where_filter(where, nullptr);
+    return std::move(query_prepared(vec, 1, k, &filter, false)[0]);
+}
+
+vector<Neighbor> Index::query(span<const float> vec, size_t k, const Expr& where, span<const int64_t> allowed) const {
+    assert(vec.size() == dim());
+    const detail::SlotFilter filter = where_filter(where, &allowed);
+    return std::move(query_prepared(vec, 1, k, &filter, false)[0]);
+}
+
+vector<vector<Neighbor>> Index::query_batch(span<const float> queries, size_t num_queries, size_t k,
+                                            const Expr& where) const {
+    assert(queries.size() == num_queries * dim());
+    const detail::SlotFilter filter = where_filter(where, nullptr);
+    return query_prepared(queries, num_queries, k, &filter, true);
+}
+
+vector<vector<Neighbor>> Index::query_batch(span<const float> queries, size_t num_queries, size_t k,
+                                            const Expr& where, span<const int64_t> allowed) const {
+    assert(queries.size() == num_queries * dim());
+    const detail::SlotFilter filter = where_filter(where, &allowed);
+    return query_prepared(queries, num_queries, k, &filter, true);
+}
+
+detail::SlotFilter Index::where_filter(const Expr& where, const span<const int64_t>* allowed) const {
+    vector<uint64_t> words = metadata_.evaluate(where, slots());
+    if (allowed) {
+        const vector<uint64_t> also = id_map().filter(*allowed).words;
+        for (size_t w = 0; w < words.size(); ++w) words[w] &= also[w];
+    }
+    return id_map().live(std::move(words));
 }
 
 vector<vector<Neighbor>> Index::query_prepared(span<const float> queries, size_t num_queries, size_t k,

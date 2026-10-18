@@ -63,6 +63,10 @@ public:
     // ids are ignored.
     SlotFilter filter(span<const int64_t> ids) const;
 
+    // A filter from raw bits (one per slot, as MetadataStore::evaluate makes
+    // them) with deleted slots cleared and the set bits counted.
+    SlotFilter live(vector<uint64_t> words) const;
+
     // Runs add()'s validation without changing anything, so a caller that must
     // keep two indexes in step (RefineIndex and its base) can reject bad ids
     // before touching either.
