@@ -146,6 +146,7 @@ size_t HNSWIndex::compact_as_base() { return compact_impl(false); }
 size_t HNSWIndex::compact_impl(bool keep_ids) {
     auto remap = id_map_.compact(keep_ids);
     if (remap.size() == 0) return 0;
+    metadata_.compact(remap);
 
     size_t write_slot = 0;
     for (size_t i = 0; i < remap.size(); ++i) {
@@ -209,6 +210,7 @@ void HNSWIndex::save(std::ostream& out) const {
         for (const auto& list : upper_[slot]) write_vec(out, list);
     id_map_.save(out);
     write_pod(out, static_cast<uint8_t>(metric_));
+    metadata_.save(out);
 }
 
 std::unique_ptr<HNSWIndex> HNSWIndex::load_body(std::istream& in, uint32_t version) {
@@ -290,6 +292,7 @@ std::unique_ptr<HNSWIndex> HNSWIndex::load_body(std::istream& in, uint32_t versi
 
     index->id_map_ = IdMap::load(in, slots, version);
     if (version >= 5) index->metric_ = read_metric(in);
+    if (version >= 9) index->metadata_ = MetadataStore::load(in, slots);
     return index;
 }
 

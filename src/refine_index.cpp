@@ -112,6 +112,7 @@ size_t RefineIndex::compact() {
     if (remap.empty()) return 0;
 
     base_.compact_as_base();
+    metadata_.compact(remap);
     size_t write_slot = 0;
     for (size_t i = 0; i < remap.size(); ++i) {
         uint32_t new_slot = remap[i];
@@ -144,6 +145,7 @@ void RefineIndex::save(std::ostream& out) const {
     base_.save(out);
     write_vec(out, data_);
     id_map_.save(out);
+    metadata_.save(out);
 }
 
 std::unique_ptr<RefineIndex> RefineIndex::load_body(std::istream& in, uint32_t version) {
@@ -179,6 +181,7 @@ std::unique_ptr<RefineIndex> RefineIndex::load_body(std::istream& in, uint32_t v
 
     if (version >= 2) index->id_map_ = detail::IdMap::load(in, count, version);
     else index->id_map_.add(count, nullptr);
+    if (version >= 9) index->metadata_ = detail::MetadataStore::load(in, count);
 
     return index;
 }

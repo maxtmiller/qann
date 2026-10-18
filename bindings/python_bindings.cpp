@@ -6,6 +6,8 @@
 #include <nanobind/stl/unique_ptr.h>
 #include <nanobind/stl/filesystem.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/variant.h>
+#include <nanobind/stl/map.h>
 
 #include <cstdint>
 #include <limits>
@@ -17,6 +19,7 @@
 #include "vecengine/flat_index.hpp"
 #include "vecengine/ivf_index.hpp"
 #include "vecengine/hnsw_index.hpp"
+#include "vecengine/metadata.hpp"
 #include "vecengine/pq.hpp"
 #include "vecengine/refine_index.hpp"
 #include "vecengine/index_factory.hpp"
@@ -132,9 +135,64 @@ static void refuse_if_wrapped(const vecengine::Index& self, const char* what) {
                                     " through the RefineIndex instead");
 }
 
+// qann.field(name): a column to compare; its operators build Expr filters.
+struct PyField {
+    std::string name;
+};
+
+static vecengine::Expr field_compare(const PyField& f, vecengine::Expr::Op op, vecengine::Expr::Value value) {
+    return vecengine::Expr::compare(f.name, op, std::move(value));
+}
+
+// Converts add()'s metadata argument, {name: values}, to columns of n values.
+// Values go through numpy.asarray: integer and bool arrays become Int64
+// columns, float arrays Float64, and str arrays (or object arrays of str)
+// String columns. Must run with the GIL held.
+static vecengine::Metadata as_metadata(nb::dict metadata, std::size_t n) {
+    nb::module_ np = nb::module_::import_("numpy");
+    vecengine::Metadata out;
+    for (auto [key, value] : metadata) {
+        if (!nb::isinstance<nb::str>(key)) throw nb::type_error("metadata column names must be strings");
+        const std::string name = nb::cast<std::string>(key);
+        nb::object arr = np.attr("asarray")(value);
+        if (nb::cast<std::size_t>(arr.attr("ndim")) != 1)
+            throw nb::type_error(("metadata column '" + name + "' must be one-dimensional").c_str());
+        if (nb::cast<std::size_t>(arr.attr("shape")[nb::int_(0)]) != n)
+            throw std::invalid_argument("metadata column '" + name + "' must have one value per row of data");
+
+        const auto kind = nb::cast<std::string>(arr.attr("dtype").attr("kind"));
+        if (kind == "u" && nb::cast<std::size_t>(arr.attr("size")) > 0 &&
+            nb::cast<uint64_t>(arr.attr("max")()) > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+            throw std::invalid_argument("metadata column '" + name + "' has values above the int64 maximum");
+        if (kind == "i" || kind == "u" || kind == "b") {
+            auto ints = nb::cast<IdVector>(np.attr("ascontiguousarray")(arr, nb::arg("dtype") = "int64"));
+            out.push_back({name, std::vector<int64_t>(ints.data(), ints.data() + ints.shape(0))});
+        } else if (kind == "f") {
+            auto floats = nb::cast<nb::ndarray<double, nb::ndim<1>, nb::c_contig, nb::device::cpu>>(
+                np.attr("ascontiguousarray")(arr, nb::arg("dtype") = "float64"));
+            out.push_back({name, std::vector<double>(floats.data(), floats.data() + floats.shape(0))});
+        } else if (kind == "U" || kind == "O") {
+            std::vector<std::string> strings;
+            strings.reserve(n);
+            // numpy.asarray(["a", 1]) silently makes "1" a string, so check a list's own items
+            nb::object items = nb::hasattr(value, "dtype") ? arr.attr("tolist")() : nb::borrow(value);
+            for (nb::handle item : items) {
+                if (!nb::isinstance<nb::str>(item))
+                    throw nb::type_error(("metadata column '" + name + "' mixes strings with other values").c_str());
+                strings.push_back(nb::cast<std::string>(item));
+            }
+            out.push_back({name, std::move(strings)});
+        } else {
+            throw nb::type_error(("metadata column '" + name + "' must hold ints, floats or strings").c_str());
+        }
+    }
+    return out;
+}
+
 // Add all rows of a (N x dim) matrix to the index, with one id per row when
-// the index uses custom ids.
-static void index_add(vecengine::Index &self, FloatMatrix data, std::optional<IdsArg> ids) {
+// the index uses custom ids, and optional metadata columns.
+static void index_add(vecengine::Index &self, FloatMatrix data, std::optional<IdsArg> ids,
+                      std::optional<nb::dict> metadata) {
     if (data.shape(1) != self.dim())
         throw std::invalid_argument("vector dimension does not match index dimension");
 
@@ -145,10 +203,11 @@ static void index_add(vecengine::Index &self, FloatMatrix data, std::optional<Id
             throw std::invalid_argument("ids must have one entry per row of data");
     }
 
+    const vecengine::Metadata md = metadata ? as_metadata(*metadata, data.shape(0)) : vecengine::Metadata{};
     const int64_t* id_ptr = id_array ? id_array->data() : nullptr;
     write_locked(self, [&] {
         refuse_if_wrapped(self, "add");
-        self.add_batch(std::span<const float>(data.data(), data.size()), data.shape(0), id_ptr);
+        self.add_batch(std::span<const float>(data.data(), data.size()), data.shape(0), id_ptr, md);
     });
 }
 
@@ -177,15 +236,19 @@ static std::size_t index_size(const vecengine::Index& self) {
 // returns (indices, distances) as 1D arrays with one entry per result (int64,
 // float32).
 static std::pair<NumpyArray<int64_t>, NumpyArray<float>>
-index_query(const vecengine::Index &self, FloatVector query, std::size_t k, std::optional<IdsArg> allowed) {
+index_query(const vecengine::Index &self, FloatVector query, std::size_t k, std::optional<IdsArg> allowed,
+            std::optional<vecengine::Expr> where) {
     if (query.shape(0) != self.dim())
         throw std::invalid_argument("query dimension does not match index dimension");
 
     std::optional<IdVector> allowed_ids;
     if (allowed) allowed_ids = as_ids(*allowed);
     auto results = read_locked(self, [&] {
-        if (!allowed_ids) return self.query(as_span(query), k);
-        return self.query(as_span(query), k, std::span<const int64_t>(allowed_ids->data(), allowed_ids->shape(0)));
+        if (!allowed_ids && !where) return self.query(as_span(query), k);
+        if (!where) return self.query(as_span(query), k, std::span<const int64_t>(allowed_ids->data(), allowed_ids->shape(0)));
+        if (!allowed_ids) return self.query(as_span(query), k, *where);
+        return self.query(as_span(query), k, *where,
+                          std::span<const int64_t>(allowed_ids->data(), allowed_ids->shape(0)));
     });
 
     const std::size_t n = results.size();
@@ -202,7 +265,8 @@ index_query(const vecengine::Index &self, FloatVector query, std::size_t k, std:
 // (indices, distances) as (num_queries, k) arrays. Rows with fewer than k
 // results are padded with -1 / inf.
 static std::pair<NumpyArray<int64_t>, NumpyArray<float>>
-index_batch_query(const vecengine::Index &self, FloatMatrix query, std::size_t k, std::optional<IdsArg> allowed) {
+index_batch_query(const vecengine::Index &self, FloatMatrix query, std::size_t k, std::optional<IdsArg> allowed,
+                  std::optional<vecengine::Expr> where) {
     if (query.shape(1) != self.dim())
         throw std::invalid_argument("query dimension does not match index dimension");
 
@@ -211,8 +275,12 @@ index_batch_query(const vecengine::Index &self, FloatMatrix query, std::size_t k
     if (allowed) allowed_ids = as_ids(*allowed);
     auto results = read_locked(self, [&] {
         const std::span<const float> queries(query.data(), query.size());
-        if (!allowed_ids) return self.query_batch(queries, num_queries, k);
-        return self.query_batch(queries, num_queries, k,
+        if (!allowed_ids && !where) return self.query_batch(queries, num_queries, k);
+        if (!where)
+            return self.query_batch(queries, num_queries, k,
+                                    std::span<const int64_t>(allowed_ids->data(), allowed_ids->shape(0)));
+        if (!allowed_ids) return self.query_batch(queries, num_queries, k, *where);
+        return self.query_batch(queries, num_queries, k, *where,
                                 std::span<const int64_t>(allowed_ids->data(), allowed_ids->shape(0)));
     });
 
@@ -299,25 +367,73 @@ NB_MODULE(qann, m) {
         .value("Cosine", vecengine::Metric::Cosine,
                "1 - cosine similarity (0 to 2); vectors are scaled to unit length on add and query");
 
+    // Filters for where=: qann.field("price") < 50, combined with & | ~.
+    nb::class_<vecengine::Expr>(m, "Expr", "A metadata filter for where=; build one with qann.field()")
+        .def("__and__", [](const vecengine::Expr& a, const vecengine::Expr& b) { return a & b; }, nb::arg("other"))
+        .def("__or__", [](const vecengine::Expr& a, const vecengine::Expr& b) { return a | b; }, nb::arg("other"))
+        .def("__invert__", [](const vecengine::Expr& a) { return ~a; })
+        // `and`, `or`, `not`, `if` and chained comparisons (0 < f < 5) would call this and
+        // silently drop part of the filter, so refuse instead
+        .def("__bool__", [](const vecengine::Expr&) -> bool {
+            throw nb::type_error("a filter has no truth value: combine filters with & | ~ (not and / or / not), "
+                                 "and write ranges as (f > 0) & (f < 5)");
+        })
+        .def("__repr__", [](const vecengine::Expr& e) { return "qann.Expr(" + e.to_string() + ")"; });
+
+    nb::class_<PyField>(m, "Field", "A metadata column to compare in a where= filter; see qann.field()")
+        .def_ro("name", &PyField::name)
+        .def("__eq__", [](const PyField& f, vecengine::Expr::Value v) { return field_compare(f, vecengine::Expr::Op::Eq, std::move(v)); }, nb::arg("value"))
+        .def("__ne__", [](const PyField& f, vecengine::Expr::Value v) { return field_compare(f, vecengine::Expr::Op::Ne, std::move(v)); }, nb::arg("value"))
+        .def("__lt__", [](const PyField& f, vecengine::Expr::Value v) { return field_compare(f, vecengine::Expr::Op::Lt, std::move(v)); }, nb::arg("value"))
+        .def("__le__", [](const PyField& f, vecengine::Expr::Value v) { return field_compare(f, vecengine::Expr::Op::Le, std::move(v)); }, nb::arg("value"))
+        .def("__gt__", [](const PyField& f, vecengine::Expr::Value v) { return field_compare(f, vecengine::Expr::Op::Gt, std::move(v)); }, nb::arg("value"))
+        .def("__ge__", [](const PyField& f, vecengine::Expr::Value v) { return field_compare(f, vecengine::Expr::Op::Ge, std::move(v)); }, nb::arg("value"))
+        .def("isin", [](const PyField& f, std::vector<vecengine::Expr::Value> values) {
+                 return vecengine::Expr::isin(f.name, std::move(values));
+             },
+             nb::arg("values"), "Matches rows whose value is one of values")
+        .def("is_null", [](const PyField& f) { return vecengine::Expr::is_null(f.name); },
+             "Matches rows with no value in this column")
+        .def("__repr__", [](const PyField& f) { return "qann.field('" + f.name + "')"; });
+
+    m.def("field", [](std::string name) { return PyField{std::move(name)}; }, nb::arg("name"),
+          "A metadata column, for filters such as (qann.field('price') < 50) & (qann.field('color') == 'red')");
+
     nb::class_<vecengine::Index>(m, "Index")
         .def("save", [](const vecengine::Index& self, const std::filesystem::path& path) {
                  read_locked(self, [&] { vecengine::save_index(self, path); });
              },
              nb::arg("path"), "Save the index to a file; load it back with qann.load(path)")
-        .def("add", &index_add, nb::arg("data"), nb::arg("ids").none() = nb::none(),
+        .def("add", &index_add, nb::arg("data"), nb::arg("ids").none() = nb::none(), nb::kw_only(),
+             nb::arg("metadata").none() = nb::none(),
              "Add an (n, dim) array of vectors. Pass ids (n int64 values >= 0) if the index was "
-             "created with custom_ids=True; otherwise ids continue after the highest id ever assigned")
+             "created with custom_ids=True; otherwise ids continue after the highest id ever assigned. "
+             "metadata is {name: n values} (ints, floats or strings) to filter queries on with where=; a new "
+             "column is null for earlier vectors, and a column left out of an add is null for its vectors")
         .def("remove", &index_remove, nb::arg("ids"),
              "Delete the vectors with these ids; unknown ids are skipped. Returns how many were deleted")
         .def("compact", &index_compact,
              "Free the memory of deleted vectors; ids and results are unchanged. Returns how many were freed")
         .def("query", &index_query, nb::arg("query"), nb::arg("k"), nb::kw_only(), nb::arg("allowed").none() = nb::none(),
+             nb::arg("where").none() = nb::none(),
              "Query k-NN for a (dim,) vector; returns 1D (indices, distances). With allowed (ids), only those "
-             "vectors can be returned; unknown and deleted ids in it are ignored")
+             "vectors can be returned; unknown and deleted ids in it are ignored. With where (a filter built from "
+             "qann.field), only vectors whose metadata matches; with both, only those that pass both")
         .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), nb::kw_only(),
-             nb::arg("allowed").none() = nb::none(),
+             nb::arg("allowed").none() = nb::none(), nb::arg("where").none() = nb::none(),
              "Query k-NN for each row; returns (indices, distances) arrays of shape (num_queries, k), padded with "
-             "-1 / inf. With allowed (ids), only those vectors can be returned, for every row")
+             "-1 / inf. allowed (ids) and where (a qann.field filter) restrict the results as in query(), for every row")
+        .def_prop_ro("metadata_schema",
+                     [](const vecengine::Index& self) {
+                         auto schema = read_locked(self, [&] { return self.metadata_schema(); });
+                         nb::dict out;
+                         for (const auto& [name, type] : schema)
+                             out[nb::str(name.c_str())] = type == vecengine::ColumnType::Int64     ? "int"
+                                                          : type == vecengine::ColumnType::Float64 ? "float"
+                                                                                                   : "str";
+                         return out;
+                     },
+                     "Each metadata column's name and type ('int', 'float' or 'str'), in the order they were added")
         .def_prop_ro("metric", &vecengine::Index::metric, "How vectors are compared (fixed at construction)")
         .def("size", &index_size, "Get number of indexed vectors")
         .def("dim", &vecengine::Index::dim, "Get vector dimension");

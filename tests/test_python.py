@@ -813,3 +813,150 @@ def test_loads_rotated_ivf_saved_on_macos():
     ids, dists = index.batch_query(np.load(DATA / "v8_queries.npy"), 10)
     np.testing.assert_array_equal(ids, np.load(DATA / "v8_ivf_rot_ids.npy"))
     np.testing.assert_allclose(dists, np.load(DATA / "v8_ivf_rot_dists.npy"), rtol=1e-5, atol=1e-5)
+
+
+COLORS = np.array(["red", "green", "blue", "black"])
+
+
+@pytest.mark.parametrize("kind", ["flat", "ivf", "refine", "hnsw"])
+def test_metadata_filters(tmp_path, data, kind):
+    ids = np.arange(len(data)) * 10 + 7
+    if kind == "flat":
+        index = qann.FlatIndex(32, custom_ids=True)
+    elif kind == "hnsw":
+        index = qann.HNSWIndex(32, custom_ids=True, seed=1)
+    else:
+        ivf = qann.IVFIndex(32, nlist=100, nprobe=100, custom_ids=(kind == "ivf"))
+        ivf.enable_pq(8)
+        ivf.train(data, seed=1)
+        index = ivf if kind == "ivf" else qann.RefineIndex(ivf, k_factor=5, custom_ids=True)
+
+    i = np.arange(len(data))
+    half = len(data) // 2
+    index.add(data[:half], ids=ids[:half],
+              metadata={"price": i[:half] % 100, "weight": i[:half] * 0.5, "color": COLORS[i[:half] % 4]})
+    index.add(data[half:], ids=ids[half:], metadata={"price": i[half:] % 100})   # weight, color null
+    assert index.metadata_schema == {"price": "int", "weight": "float", "color": "str"}
+
+    f = qann.field
+    where = ((f("price") < 30) & ~(f("color") == "red")) | f("weight").isin([1.0, 2.5])
+    match = ((i % 100 < 30) & (i < half) & (i % 4 != 0)) | ((i % 100 < 30) & (i >= half)) | np.isin(i * 0.5, [1.0, 2.5])
+    queries = data[:40] + 0.01
+    got, dists = index.batch_query(queries, 10, where=where)
+    expected, expected_dists = index.batch_query(queries, 10, allowed=ids[match])
+    np.testing.assert_array_equal(got, expected)
+    np.testing.assert_array_equal(dists, expected_dists)
+    one, _ = index.query(queries[0], 10, where=where)
+    np.testing.assert_array_equal(one, got[0])
+
+    # where and allowed together: only vectors passing both
+    evens = ids[::2]
+    got, _ = index.batch_query(queries, 10, where=where, allowed=evens)
+    np.testing.assert_array_equal(got, index.batch_query(queries, 10, allowed=ids[match & (i % 2 == 0)])[0])
+
+    # nulls: rows added without color
+    got, _ = index.batch_query(queries, 5, where=f("color").is_null())
+    assert np.isin(got[got >= 0], ids[half:]).all()
+
+    index.remove(ids[:10])
+    index.save(tmp_path / "md.qann")
+    loaded = qann.load(tmp_path / "md.qann")
+    assert loaded.metadata_schema == index.metadata_schema
+    np.testing.assert_array_equal(loaded.batch_query(queries, 10, where=where)[0],
+                                  index.batch_query(queries, 10, where=where)[0])
+
+
+def test_metadata_input_and_filter_errors(data):
+    index = qann.FlatIndex(32)
+    index.add(data[:3], metadata={"n": [1, 2, 3], "x": np.array([0.5, 1.5, 2.5], dtype=np.float32),
+                                  "s": np.array(["a", "b", "c"], dtype=object), "flag": np.array([True, False, True])})
+    assert index.metadata_schema == {"n": "int", "x": "float", "s": "str", "flag": "int"}
+    f = qann.field
+    assert index.query(data[0], 3, where=f("flag") == 1)[0].tolist() == [0, 2]
+    assert index.query(data[0], 3, where=f("x") > np.float32(1.0))[0].size == 2
+    assert repr((f("n") >= 2) & ~f("s").isin(["a"])) == "qann.Expr(((n >= 2) & ~s in ['a']))"
+
+    with pytest.raises(ValueError):    # one value per row
+        index.add(data[3:5], metadata={"n": [1]})
+    with pytest.raises(ValueError):    # a column keeps its type
+        index.add(data[3:4], metadata={"n": [1.5]})
+    with pytest.raises(TypeError):     # mixed kinds
+        index.add(data[3:5], metadata={"s": ["a", 1]})
+    with pytest.raises(TypeError):     # not ints, floats or strings
+        index.add(data[3:4], metadata={"d": np.array(["2026-01-01"], dtype="datetime64[D]")})
+    assert index.size() == 3
+
+    with pytest.raises(ValueError):    # unknown column
+        index.query(data[0], 3, where=f("missing") == 1)
+    with pytest.raises(ValueError):    # wrong kind of value
+        index.query(data[0], 3, where=f("s") == 1)
+    for misuse in (lambda: bool(f("n") < 2), lambda: 0 < f("n") < 3, lambda: (f("n") < 2) and (f("n") > 0)):
+        with pytest.raises(TypeError):
+            misuse()
+
+
+def test_metadata_unsigned_overflow_and_empty_adds(data):
+    index = qann.FlatIndex(32)
+    with pytest.raises(ValueError):    # would wrap to a negative int64
+        index.add(data[:2], metadata={"u": np.array([1, 2**63], dtype=np.uint64)})
+    index.add(data[:2], metadata={"u": np.array([1, 2**63 - 1], dtype=np.uint64)})
+    assert index.query(data[0], 2, where=qann.field("u") > 0)[0].size == 2
+
+    # an add of no vectors says nothing about a column's type, so it creates none
+    index.add(data[:0], metadata={"tag": []})
+    assert "tag" not in index.metadata_schema
+    index.add(data[2:3], metadata={"tag": ["x"]})
+    assert index.metadata_schema["tag"] == "str"
+
+
+def test_concurrent_metadata_adds_and_filtered_queries(data):
+    # adds with metadata (exclusive lock) interleaved with where= queries (shared):
+    # every result must satisfy the filter as of some consistent state
+    index = qann.HNSWIndex(32, seed=1)
+    index.add(data[:500], metadata={"group": np.arange(500) % 5, "name": np.array(["a", "b"])[np.arange(500) % 2]})
+    rng = np.random.default_rng(4)
+    batches = [rng.random((100, 32), dtype=np.float32) for _ in range(15)]
+    queries = rng.random((50, 32), dtype=np.float32)
+    f = qann.field
+    where = (f("group") == 3) & (f("name") == "b")
+    errors = []
+
+    def run(fn):
+        try:
+            fn()
+        except Exception as e:
+            errors.append(e)
+
+    def adder():
+        for b, batch in enumerate(batches):
+            start = 500 + 100 * b
+            ids = np.arange(start, start + 100)
+            index.add(batch, metadata={"group": ids % 5, "name": np.array(["a", "b"])[ids % 2]})
+
+    def querier():
+        for _ in range(30):
+            got, _ = index.batch_query(queries, 10, where=where)
+            got = got[got >= 0]
+            assert ((got % 5 == 3) & (got % 2 == 1)).all()
+
+    threads = [threading.Thread(target=run, args=(fn,)) for fn in (adder, querier, querier)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+    assert index.size() == 500 + 100 * len(batches)
+    got, _ = index.batch_query(queries, 10, where=where)
+    assert ((got % 5 == 3) & (got % 2 == 1)).all()
+
+
+def test_loads_metadata_saved_on_macos():
+    # Saved on macOS (format version 9): a RefineIndex over IVF-PQ with int,
+    # float and string columns, nulls from a second add, and deletions.
+    index = qann.load(DATA / "v9_refine_metadata.qann")
+    assert index.metadata_schema == {"price": "int", "weight": "float", "color": "str", "tag": "str"}
+    f = qann.field
+    where = ((f("price") < 40) & (f("color") != "red")) | (f("tag") == "new")
+    ids, dists = index.batch_query(np.load(DATA / "v9_queries.npy"), 10, where=where)
+    np.testing.assert_array_equal(ids, np.load(DATA / "v9_refine_metadata_ids.npy"))
+    np.testing.assert_allclose(dists, np.load(DATA / "v9_refine_metadata_dists.npy"), rtol=1e-5, atol=1e-5)

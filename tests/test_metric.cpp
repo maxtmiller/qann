@@ -247,8 +247,10 @@ TEST_CASE("an unknown metric byte is rejected on load", "[metric][serialize]") {
     std::stringstream s;
     flat.save(s);
     std::string bytes = s.str();
-    REQUIRE(bytes.back() == static_cast<char>(Metric::Cosine));   // the metric ends the body
-    bytes.back() = 7;
+    // the metric comes just before the metadata section, which is a column count of 0 here
+    const size_t metric_at = bytes.size() - 1 - sizeof(uint64_t);
+    REQUIRE(bytes[metric_at] == static_cast<char>(Metric::Cosine));
+    bytes[metric_at] = 7;
     std::stringstream t(bytes);
     REQUIRE_THROWS_AS(load_index(t), std::runtime_error);
 }
