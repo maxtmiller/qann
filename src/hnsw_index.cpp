@@ -51,7 +51,6 @@ HNSWIndex::HNSWIndex(size_t dim, size_t M, size_t ef_construction, bool custom_i
     if (dim == 0) throw std::invalid_argument("dim must be >= 1");
     if (M < 2) throw std::invalid_argument("M must be >= 2");
     if (ef_construction == 0) throw std::invalid_argument("ef_construction must be >= 1");
-    if (metric == Metric::InnerProduct) throw std::invalid_argument("HNSWIndex does not support Metric::InnerProduct yet");
     level_mult_ = 1.0 / std::log(static_cast<double>(M));
 }
 
@@ -101,8 +100,20 @@ void HNSWIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* 
     level0_.resize(id_map_.slots() * (M0_ + 1), 0);
     upper_.resize(id_map_.slots());
     levels_.resize(id_map_.slots(), 0);
+    update_norms(first);
 
     build(first, n);
+}
+
+void HNSWIndex::update_norms(uint32_t first) {
+    if (metric_ != Metric::InnerProduct) return;
+    sqnorm_.resize(id_map_.slots());
+    vector<float> buf;
+    for (uint32_t slot = first; slot < id_map_.slots(); ++slot) {
+        const float* v = vector_of(slot, buf);
+        sqnorm_[slot] = inner_product(v, v, dim_);
+        max_sqnorm_ = std::max(max_sqnorm_, sqnorm_[slot]);
+    }
 }
 
 vector<Neighbor> HNSWIndex::query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const {
@@ -173,6 +184,10 @@ size_t HNSWIndex::compact_impl(bool keep_ids) {
     levels_.assign(write_slot, 0);
     max_level_ = -1;
     entry_ = 0;
+    // M from the remaining vectors, as a load of the compacted index would have it
+    sqnorm_.clear();
+    max_sqnorm_ = 0.0f;
+    update_norms(0);
 
     build(0, write_slot);
 
@@ -294,10 +309,11 @@ std::unique_ptr<HNSWIndex> HNSWIndex::load_body(std::istream& in, uint32_t versi
     index->id_map_ = IdMap::load(in, slots, version);
     if (version >= 5) index->metric_ = read_metric(in);
     if (version >= 9) index->metadata_ = MetadataStore::load(in, slots);
+    index->update_norms(0);
     return index;
 }
 
-vector<HNSWIndex::Candidate> HNSWIndex::search_layer(const float* q, span<const uint32_t> entry_points, size_t ef, int level, bool skip_deleted, bool locked,
+vector<HNSWIndex::Candidate> HNSWIndex::search_layer(Probe q, span<const uint32_t> entry_points, size_t ef, int level, bool skip_deleted, bool locked,
                                                     const detail::SlotFilter* filter) const {
     t_visited.begin(slots());
     vector<uint32_t> copy;   // a locked search's snapshot of the list being expanded
@@ -368,7 +384,7 @@ vector<HNSWIndex::Candidate> HNSWIndex::search_layer(const float* q, span<const 
     return res;
 }
 
-uint32_t HNSWIndex::greedy_closest(const float* q, uint32_t ep, int level, bool locked) const {
+uint32_t HNSWIndex::greedy_closest(Probe q, uint32_t ep, int level, bool locked) const {
     float best = distance(q, ep);
     vector<uint32_t> copy;
     for (bool moved = true; moved;) {
@@ -405,7 +421,7 @@ vector<uint32_t> HNSWIndex::select_neighbors(vector<Candidate> candidates, size_
     vector<float> buf;
     for (auto& c : candidates) { 
         if (res.size() == max_neighbors) break;
-        const float* cv = vector_of(c.second, buf);
+        const Probe cv = probe_of(c.second, buf);
         bool keep = true;
         for (uint32_t r : res) {
             if (distance(cv, r) <= c.first) { keep = false; break; }
@@ -450,7 +466,7 @@ void HNSWIndex::insert(uint32_t slot) {
     // descend greedily to the new node's top level, then link it on each level
     // from there down, searching with ef_construction
     vector<float> buf;
-    const float* q = vector_of(slot, buf);
+    const Probe q = probe_of(slot, buf);
     for (int l = top_level; l > level; --l) ep = greedy_closest(q, ep, l, true);
 
     vector<uint32_t> entry_points{ep};
@@ -482,7 +498,7 @@ void HNSWIndex::add_link(uint32_t node, uint32_t new_neighbor, int level) {
 
     // full: keep the best capacity(level) of the old neighbors plus the new one
     vector<float> buf;
-    const float* base = vector_of(node, buf);
+    const Probe base = probe_of(node, buf);
     vector<Candidate> candidates;
     candidates.reserve(list.size() + 1);
     for (uint32_t nb : list) candidates.emplace_back(distance(base, nb), nb);
@@ -508,7 +524,7 @@ void HNSWIndex::set_own_neighbors(uint32_t slot, int level, const vector<uint32_
         return;
     }
     vector<float> buf;
-    const float* base = vector_of(slot, buf);
+    const Probe base = probe_of(slot, buf);
     vector<Candidate> candidates;
     candidates.reserve(merged.size());
     for (uint32_t nb : merged) candidates.emplace_back(distance(base, nb), nb);
@@ -540,9 +556,14 @@ void HNSWIndex::set_neighbors(uint32_t slot, int level, span<const uint32_t> lis
     upper_[slot][static_cast<size_t>(level - 1)].assign(list.begin(), list.end());
 }
 
-float HNSWIndex::distance(const float* q, uint32_t slot) const {
-    if (sq_bits_) return quant_.distance(q, codes_.data() + size_t{slot} * code_bytes_);
-    return l2_distance(q, data_.data() + size_t{slot} * dim_, dim_);
+float HNSWIndex::distance(Probe q, uint32_t slot) const {
+    if (metric_ == Metric::InnerProduct) {
+        const float dot = sq_bits_ ? quant_.inner_product(q.v, codes_.data() + size_t{slot} * code_bytes_)
+                                   : inner_product(q.v, data_.data() + size_t{slot} * dim_, dim_);
+        return -(dot + (q.extra != 0.0f ? q.extra * extra(slot) : 0.0f));
+    }
+    if (sq_bits_) return quant_.distance(q.v, codes_.data() + size_t{slot} * code_bytes_);
+    return l2_distance(q.v, data_.data() + size_t{slot} * dim_, dim_);
 }
 
 const float* HNSWIndex::vector_of(uint32_t slot, vector<float>& buf) const {

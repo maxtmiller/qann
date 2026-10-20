@@ -44,6 +44,15 @@ struct SQ {
 
     // Squared L2 distance from q (dim() floats) to the vector code stands for.
     float distance(const float* q, const uint8_t* code) const noexcept;
+
+    // Inner product of q (dim() floats) with the vector code stands for.
+    float inner_product(const float* q, const uint8_t* code) const noexcept;
+
+private:
+    // distance() (InnerProduct false) or inner_product() (true): both decode
+    // the codes the same way and differ only in how a dimension is scored.
+    template <bool InnerProduct>
+    float score(const float* q, const uint8_t* code) const noexcept;
 };
 
 } // namespace vecengine::detail

@@ -652,11 +652,32 @@ def test_inner_product_flat_ranks_by_dot_product(data):
     np.testing.assert_allclose(dists, -np.take_along_axis(dots, top, axis=1), rtol=1e-4)
 
 
-def test_inner_product_not_yet_on_ivf_and_hnsw():
+def test_inner_product_not_yet_on_ivf():
     with pytest.raises(ValueError):
         qann.IVFIndex(32, nlist=100, metric=qann.Metric.InnerProduct)
-    with pytest.raises(ValueError):
-        qann.HNSWIndex(32, metric=qann.Metric.InnerProduct)
+
+
+@pytest.mark.parametrize("sq", [0, 8])
+def test_inner_product_hnsw_recall(sq):
+    rng = np.random.default_rng(3)
+    centers = rng.standard_normal((20, 32))
+    scaled = ((centers[rng.integers(0, 20, 5000)] + 0.5 * rng.standard_normal((5000, 32)))
+              * 10 ** rng.uniform(-1, 1, (5000, 1))).astype(np.float32)
+    queries = (centers[rng.integers(0, 20, 50)] + 0.5 * rng.standard_normal((50, 32))).astype(np.float32)
+    flat = qann.FlatIndex(32, metric=qann.Metric.InnerProduct)
+    flat.add(scaled)
+    truth, _ = flat.batch_query(queries, 10)
+
+    hnsw = qann.HNSWIndex(32, metric=qann.Metric.InnerProduct, seed=1)
+    index = hnsw
+    if sq:
+        hnsw.enable_sq(sq)
+        hnsw.train(scaled)
+        index = qann.RefineIndex(hnsw, k_factor=2)
+    index.add(scaled)
+    hnsw.ef_search = 200
+    ids, _ = index.batch_query(queries, 10)
+    assert np.mean([len(set(a) & set(b)) / 10 for a, b in zip(ids, truth)]) >= 0.95
 
 
 def test_cosine_rejects_zero_vectors(data):
