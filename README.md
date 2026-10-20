@@ -32,7 +32,7 @@ ids, dists = index.batch_query(x[:5], 10)   # both shaped (5, 10)
 
 - **Vectors** are passed as 2D NumPy arrays of shape `(n, dim)`, except single vectors (`query`, `PQCodebook` methods), which are `(dim,)`. float32 C-contiguous arrays are used without copying; anything else (float64, Fortran order, strided slices) is converted first.
 - **IDs** are assigned in insertion order by default: the first vector added gets id 0, the next id 1, and so on across all `add` calls. Create an index with `custom_ids=True` to use your own ids instead; see [Custom ids and deleting](#custom-ids-and-deleting).
-- **Distances** are squared Euclidean (L2) distances by default, or cosine distances with `metric=qann.Metric.Cosine` (see [Metrics](#metrics)); smallest first either way.
+- **Distances** are squared Euclidean (L2) distances by default, cosine distances with `metric=qann.Metric.Cosine`, or negative inner products with `metric=qann.Metric.InnerProduct` (see [Metrics](#metrics)); smallest first in every case.
 - **Results** from `batch_query` are an `int64` id array and a `float32` distance array, both shaped `(num_queries, k)`. Rows with fewer than `k` hits are padded with id `-1` and distance `inf`.
 
 ## Indexes
@@ -73,8 +73,8 @@ Partitions vectors into `nlist` clusters with k-means and, at query time, scans 
 | `enable_sq(bits=8)` | Store each vector as scalar codes of 8 or 4 bits per dimension instead of floats (see [SQ](#sq)). Call before `train`; not together with `enable_pq`. |
 | `sq_bits` | Read-only property: 8 or 4 after `enable_sq()`, else 0. |
 | `nprobe` | Property: clusters scanned per query. Can be changed at any time; higher means better recall and slower queries. |
-| `pq_distance` | Property: how PQ codes are scored, `qann.PQDistance.ADC` (default, more accurate) or `qann.PQDistance.SDC`. |
-| `precomputed_tables` | Property: whether ADC queries use lookup tables precomputed at train time, which makes PQ queries faster. On by default; reads `True` once the tables exist (PQ enabled, trained, and `nlist * num_subspaces * centroids_per_subspace * 4` bytes within 256 MB). Set to `False` to free them. |
+| `pq_distance` | Property: how PQ codes are scored, `qann.PQDistance.ADC` (default, more accurate) or `qann.PQDistance.SDC` (not with `Metric.InnerProduct`). |
+| `precomputed_tables` | Property: whether ADC queries use lookup tables precomputed at train time, which makes PQ queries faster. On by default; reads `True` once the tables exist (PQ enabled, trained, and `nlist * num_subspaces * centroids_per_subspace * 4` bytes within 256 MB). Set to `False` to free them. Always `False` with `Metric.InnerProduct`, which doesn't need them. |
 
 `nlist` must be between 100 and 65535, and `nprobe` between 1 and `nlist`. A common starting point is `nlist` around `sqrt(n)` to `4 * sqrt(n)` and `nprobe` at 1% to 5% of `nlist`.
 
@@ -188,7 +188,7 @@ ivf.train(x)
 
 ## Metrics
 
-Every index takes `metric=qann.Metric.L2` (the default) or `metric=qann.Metric.Cosine`, fixed at construction and saved with the index. Most text and image embedding models are meant to be compared by cosine similarity, so use `Cosine` for them:
+Every index takes `metric=qann.Metric.L2` (the default), `metric=qann.Metric.Cosine` or `metric=qann.Metric.InnerProduct`, fixed at construction and saved with the index. Most text and image embedding models are meant to be compared by cosine similarity, so use `Cosine` for them:
 
 ```python
 index = qann.HNSWIndex(384, metric=qann.Metric.Cosine)
@@ -199,7 +199,21 @@ ids, dists = index.batch_query(query_embeddings, 10)   # dists = 1 - cosine simi
 - **Distances** are `1 - cosine similarity`, from 0 (same direction) to 2 (opposite), matching `qann.cosine_distance`. Similarity is `1 - dist`.
 - **Vector length doesn't matter:** each vector is scaled to length 1 when it's added and each query when it's run, so you don't need to normalize anything yourself. A zero vector has no direction, so adding or querying one raises `ValueError`.
 - **It works with every index,** including PQ, fast-scan and HNSW. IVF learns its clusters on the scaled vectors, and a `RefineIndex` uses its base's metric. `index.metric` reports it.
-- Inner product (for vectors whose length carries meaning) isn't supported yet.
+
+### Inner product
+
+Use `InnerProduct` when a vector's length carries meaning, so the largest dot product `q . x` should come first rather than the closest direction: recommendation (user and item factors, where an item's length reflects its popularity), multi-vector retrieval such as ColBERT or MUVERA, attention keys, and embedding models trained with a dot-product loss.
+
+```python
+index = qann.HNSWIndex(64, metric=qann.Metric.InnerProduct)
+index.add(item_factors)
+ids, dists = index.batch_query(user_factors, 10)   # dists = -(q . x)
+```
+
+- **Distances** are `-(q . x)`, so results stay smallest first; the inner product is `-dist`. Vectors are used as given: nothing is normalized, and zero vectors are allowed.
+- **It works with every index:** Flat, IVF (floats, SQ, PQ, fast-scan, rotation), HNSW (floats and SQ) and `RefineIndex`. PQ can only use `ADC`: setting `pq_distance` to `SDC` raises `ValueError`, and `precomputed_tables` reads `False`, since one lookup table per query already serves every list.
+- **HNSW** answers queries by `-(q . x)` but links its graph as if every stored vector had one more coordinate, `sqrt(M^2 - |x|^2)` with `M` the largest stored length. That turns inner product search into L2 search for the links, which matters a lot: at `ef_search=64`, recall@10 was 0.96 instead of 0.05 on ann-benchmarks' Last.fm factors and 0.50 instead of 0.05 on VIBE's llama-128-ip, against linking by raw inner product as hnswlib does. Only the length of each vector is stored for it, and `M` simply grows when longer vectors are added later.
+- **IVF** clusters by L2 as usual and probes the lists whose centroids have the largest `q . c`. With exact lists and `nprobe=64`, recall@10 was 0.98 on Last.fm, 0.88 on VIBE's yi-128-ip and 0.84 on llama-128-ip; with fast-scan PQ (rotated, `dim / 2` subspaces) and `RefineIndex(k_factor=8)`, 0.91, 0.81 and 0.73.
 
 ## Custom ids and deleting
 
