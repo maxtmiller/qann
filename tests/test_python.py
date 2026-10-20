@@ -652,10 +652,19 @@ def test_inner_product_flat_ranks_by_dot_product(data):
     np.testing.assert_allclose(dists, -np.take_along_axis(dots, top, axis=1), rtol=1e-4)
 
 
-def test_inner_product_not_yet_with_ivf_pq():
-    ivf = qann.IVFIndex(32, nlist=100, metric=qann.Metric.InnerProduct)
+@pytest.mark.parametrize("fast_scan", [False, True])
+def test_inner_product_ivf_pq_with_refine(fast_scan):
+    scaled, queries, truth = _ip_clustered()
+    ivf = qann.IVFIndex(32, nlist=100, nprobe=20, metric=qann.Metric.InnerProduct)
+    ivf.enable_pq(16 if fast_scan else 8, fast_scan=fast_scan)
     with pytest.raises(ValueError):
-        ivf.enable_pq(8)
+        ivf.pq_distance = qann.PQDistance.SDC
+    ivf.train(scaled, seed=1)
+    assert not ivf.precomputed_tables
+    index = qann.RefineIndex(ivf, k_factor=10)
+    index.add(scaled)
+    ids, _ = index.batch_query(queries, 10)
+    assert np.mean([len(set(a) & set(b)) / 10 for a, b in zip(ids, truth)]) >= 0.95
 
 
 def _ip_clustered():

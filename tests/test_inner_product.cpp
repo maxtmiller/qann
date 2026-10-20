@@ -215,15 +215,77 @@ TEST_CASE("the inner product metric survives save/load", "[ip][serialize]") {
     }
 }
 
-TEST_CASE("make_index passes the inner product metric; IVF PQ rejects it for now", "[ip]") {
+TEST_CASE("make_index passes the inner product metric", "[ip]") {
     IndexOptions opts;
     opts.metric = Metric::InnerProduct;
     for (IndexType type : {IndexType::Flat, IndexType::IVF, IndexType::HNSW})
         REQUIRE(make_index(type, 8, opts)->metric() == Metric::InnerProduct);
+    opts.pq_subspaces = 4;
+    REQUIRE(make_index(IndexType::IVF, 8, opts)->metric() == Metric::InnerProduct);
+}
 
-    IVFIndex ivf(8, 100, 10, false, Metric::InnerProduct);
-    REQUIRE_THROWS_AS(ivf.enable_pq(4), std::invalid_argument);
-    REQUIRE_THROWS_AS(ivf.enable_pq(4, 16, true), std::invalid_argument);
+TEST_CASE("IVF-PQ inner product: SDC is rejected and no precomputed tables are built", "[ip][ivf][pq]") {
+    const size_t n = 1000, dim = 16;
+    std::vector<float> data, queries;
+    ip_clustered(n, 1, dim, 23, data, queries);
+    IVFIndex ivf(dim, 100, 10, false, Metric::InnerProduct);
+    ivf.enable_pq(4);
+    REQUIRE_THROWS_AS(ivf.set_pq_distance(PQDistance::SDC), std::invalid_argument);
+    ivf.train(data, n, 10, 1);
+    REQUIRE_FALSE(ivf.precomputed_tables());
+}
+
+TEST_CASE("IVF-PQ inner product is exact when every residual is a centroid", "[ip][ivf][pq]") {
+    // 256 vectors and 256 centroids per subspace: k-means gives each residual
+    // slice its own centroid, so the table sums equal -(q . x)
+    const size_t n = 256, dim = 16, nq = 20, k = 10;
+    std::vector<float> data, queries;
+    ip_clustered(n, nq, dim, 24, data, queries);
+    FlatIndex flat(dim, 1024, false, Metric::InnerProduct);
+    flat.add_batch(data, n);
+    const auto truth = flat.query_batch(queries, nq, k);
+
+    IVFIndex ivf(dim, 100, 100, false, Metric::InnerProduct);
+    ivf.enable_pq(4, 256);
+    ivf.train(data, n, 25, 1);
+    ivf.add_batch(data, n);
+    const auto got = ivf.query_batch(queries, nq, k);
+    for (size_t q = 0; q < nq; ++q)
+        for (size_t i = 0; i < k; ++i) {
+            REQUIRE(got[q][i].index == truth[q][i].index);
+            REQUIRE(std::fabs(got[q][i].distance - truth[q][i].distance) < 1e-3f * std::max(1.0f, std::fabs(truth[q][i].distance)));
+        }
+}
+
+TEST_CASE("IVF-PQ and fast-scan find inner product neighbors under a RefineIndex", "[ip][ivf][pq]") {
+    const size_t n = 5000, dim = 32, nq = 100, k = 10;
+    std::vector<float> data, queries;
+    ip_clustered(n, nq, dim, 25, data, queries);
+    FlatIndex flat(dim, 1024, false, Metric::InnerProduct);
+    flat.add_batch(data, n);
+    const auto truth = flat.query_batch(queries, nq, k);
+
+    struct Config { size_t m, K; bool fast, rotate; };
+    for (const Config c : {Config{8, 256, false, false}, Config{16, 16, true, false}, Config{16, 16, true, true}}) {
+        CAPTURE(c.m, c.fast, c.rotate);
+        IVFIndex ivf(dim, 100, 20, false, Metric::InnerProduct);
+        ivf.enable_pq(c.m, c.K, c.fast, c.rotate);
+        ivf.train(data, n, 10, 1);
+        RefineIndex refine(ivf, 10);
+        refine.add_batch(data, n);
+
+        const auto got = refine.query_batch(queries, nq, k);
+        REQUIRE(recall(got, truth) >= 0.95);
+        // without re-ranking, still far better than chance
+        REQUIRE(recall(ivf.query_batch(queries, nq, k), truth) >= 0.5);
+
+        std::vector<std::vector<Neighbor>> single;
+        for (size_t q = 0; q < nq; ++q) single.push_back(refine.query({queries.data() + q * dim, dim}, k));
+        require_same(single, got);
+
+        auto loaded = roundtrip(refine);
+        require_same(loaded->query_batch(queries, nq, k), got);
+    }
 }
 
 TEST_CASE("IVF probing every list returns the exact inner product ranking", "[ip][ivf]") {

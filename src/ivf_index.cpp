@@ -56,7 +56,8 @@ void IVFIndex::set_precomputed_tables(bool enabled) {
 
 void IVFIndex::build_precomputed() {
     precomputed_.clear();
-    if (!use_precomputed_ || !trained_ || !pq_enabled()) return;
+    // InnerProduct needs none: its table doesn't depend on the list (see scan)
+    if (!use_precomputed_ || !trained_ || !pq_enabled() || metric_ == Metric::InnerProduct) return;
 
     size_t list_size = pq_->num_subspaces() * pq_->centroids_per_subspace();
     if (nlist_ * list_size * sizeof(float) > kPrecomputedMaxBytes) return;
@@ -71,7 +72,6 @@ void IVFIndex::enable_pq(size_t num_subspaces, size_t centroids_per_subspace, bo
     if (id_map_.slots() > 0 || trained_)
         throw std::logic_error("enable_pq must be called before train()/add()");
     if (sq_bits_) throw std::logic_error("enable_pq cannot be combined with enable_sq");
-    if (metric_ == Metric::InnerProduct) throw std::invalid_argument("enable_pq does not support Metric::InnerProduct yet");
     if (fast_scan && (centroids_per_subspace != 16 || num_subspaces % 2 != 0 || num_subspaces > 256))
         throw std::invalid_argument("fast_scan needs 16 centroids per subspace and an even num_subspaces <= 256");
     if (fast_scan && pq_distance_ == PQDistance::SDC)
@@ -304,6 +304,47 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
     if (use_pre) pq_->compute_inner_table(vec, C);
     VECENGINE_PROF_STOP(t_inner, kProfInner);
 
+    // InnerProduct: -(q . x) = -(q . c) - sum_s q_s . r_s, for residual r = x - c.
+    // The table of -(q_s . y_sj) is the same for every list, so it is built
+    // (and for fast-scan rounded to bytes) once per query, and each list adds
+    // its -(q . c), the probe's dist.
+    const bool ip_pq = pq_enabled() && metric_ == Metric::InnerProduct;
+    float ip_scale = 1.0f, ip_offset = 0.0f;
+    if (ip_pq) {
+        pq_->compute_inner_table(vec, table);
+        for (float& t : table) t *= 0.5f;
+        if (fast_scan_) detail::quantize_lut(table.data(), m, lut.data(), ip_scale, ip_offset);
+    }
+
+    // scores one fast-scan list with lut (scale and offset as quantize_lut set
+    // them, plus anything added to every distance in the list)
+    auto scan_fast = [&](const InvertedList& list, size_t listSize, float scale, float offset, auto&& push) {
+        const size_t block_bytes = detail::fs_block_bytes(m);
+        uint16_t sums[detail::kFsBlock];
+
+        for (size_t start = 0; start < listSize; start += detail::kFsBlock) {
+            // the current k-th best distance in the table's integer scale, recomputed
+            // per block as it shrinks; sums are whole, so sum < limit <=> sum < ceil(limit)
+            const float limit = (top.threshold() - offset) * scale;
+            const uint16_t limit16 = limit >= 65535.0f ? 65535
+                                   : limit <= 0.0f    ? 0
+                                                      : static_cast<uint16_t>(std::ceil(limit));
+
+            // bit v is set when vector v can beat the k-th best; padding bits are dropped
+            uint32_t mask = detail::fast_scan_block_mask(
+                lut.data(), list.codes.data() + (start / detail::kFsBlock) * block_bytes, m, limit16, sums);
+            const size_t count = std::min(detail::kFsBlock, listSize - start);
+            if (count < detail::kFsBlock) mask &= (1u << count) - 1;
+
+            // visit only the set bits, lowest first
+            while (mask != 0) {
+                const unsigned v = static_cast<unsigned>(std::countr_zero(mask));
+                mask &= mask - 1;
+                push(sums[v] / scale + offset, start + v);
+            }
+        }
+    };
+
     // a filtered query keeps probing past nprobe lists until it has this many results
     const size_t wanted = filter ? std::min(k, filter->count) : 0;
 
@@ -353,6 +394,18 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
             continue;
         }
 
+        if (ip_pq) {
+            VECENGINE_PROF_START(t_scan);
+            if (fast_scan_) {
+                scan_fast(list, listSize, ip_scale, ip_offset + A, push);
+            } else {
+                pq_->distances_adc(table, list.codes.data(), listSize, dists.data());
+                for (size_t j = 0; j < listSize; ++j) push(dists[j] + A, j);
+            }
+            VECENGINE_PROF_STOP(t_scan, kProfCodeScan);
+            continue;
+        }
+
         VECENGINE_PROF_START(t_table);
         vector<float> residual(use_pre ? 0 : dim_);
         if (use_pre) {
@@ -376,30 +429,7 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
                 // round the table to bytes, then score 32 vectors per kernel call
                 float scale, offset;
                 detail::quantize_lut(table.data(), m, lut.data(), scale, offset);
-                const size_t block_bytes = detail::fs_block_bytes(m);
-                uint16_t sums[detail::kFsBlock];
-
-                for (size_t start = 0; start < listSize; start += detail::kFsBlock) {
-                    // the current k-th best distance in the table's integer scale, recomputed
-                    // per block as it shrinks; sums are whole, so sum < limit <=> sum < ceil(limit)
-                    const float limit = (top.threshold() - offset) * scale;
-                    const uint16_t limit16 = limit >= 65535.0f ? 65535
-                                           : limit <= 0.0f    ? 0
-                                                              : static_cast<uint16_t>(std::ceil(limit));
-
-                    // bit v is set when vector v can beat the k-th best; padding bits are dropped
-                    uint32_t mask = detail::fast_scan_block_mask(
-                        lut.data(), list.codes.data() + (start / detail::kFsBlock) * block_bytes, m, limit16, sums);
-                    const size_t count = std::min(detail::kFsBlock, listSize - start);
-                    if (count < detail::kFsBlock) mask &= (1u << count) - 1;
-
-                    // visit only the set bits, lowest first
-                    while (mask != 0) {
-                        const unsigned v = static_cast<unsigned>(std::countr_zero(mask));
-                        mask &= mask - 1;
-                        push(sums[v] / scale + offset, start + v);
-                    }
-                }
+                scan_fast(list, listSize, scale, offset, push);
             } else {
                 pq_->distances_adc(table, list.codes.data(), listSize, dists.data());
                 for (size_t j = 0; j < listSize; ++j) {

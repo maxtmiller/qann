@@ -45,8 +45,7 @@ public:
     // in InvertedList::codes instead of raw floats in InvertedList::vecs.
     // With rotate, train() also learns a PCA-balanced rotation (see
     // src/rotation.hpp) and every vector is rotated by it before the coarse
-    // and PQ steps (issue #41). Throws std::logic_error after enable_sq(), and
-    // std::invalid_argument with Metric::InnerProduct, which PQ doesn't support yet.
+    // and PQ steps (issue #41). Throws std::logic_error after enable_sq().
     void enable_pq(size_t num_subspaces, size_t centroids_per_subspace = 256, bool fast_scan = false,
                    bool rotate = false);
 
@@ -74,6 +73,8 @@ public:
     void set_pq_distance(PQDistance mode) { 
         if (fast_scan_ && mode == PQDistance::SDC) 
             throw std::invalid_argument("cannot use SDC with fast-scan");
+        if (metric_ == Metric::InnerProduct && mode == PQDistance::SDC)
+            throw std::invalid_argument("cannot use SDC with Metric::InnerProduct");
         pq_distance_ = mode; 
     }
 
@@ -81,7 +82,8 @@ public:
     // a full ADC table for every probed list. Enabled by default; the getter
     // is true only once the tables exist (PQ on, trained, and nlist * m * K
     // floats within kPrecomputedMaxBytes). Disabling frees them. Results
-    // match the per-list path up to float rounding.
+    // match the per-list path up to float rounding. Never built for
+    // Metric::InnerProduct, whose one table per query serves every list.
     bool precomputed_tables() const noexcept { return !precomputed_.empty(); }
     void set_precomputed_tables(bool enabled);
 
