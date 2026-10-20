@@ -85,8 +85,9 @@ class QannIVFFastScan(_Qann):
 
     def fit(self, X):
         qann.set_num_threads(1)
-        # Zero padding to a multiple of 4 keeps every distance unchanged and gives PQ even subspaces.
-        self.pad = -X.shape[1] % 4
+        # Zero padding to a multiple of 8 keeps every distance unchanged and lets 2 or 4 dims per
+        # subspace divide evenly (glove-25 padded to 28 could only split into 4 or 14 subspaces).
+        self.pad = -X.shape[1] % 8
         X = self._prep(X)
         dim = X.shape[1]
         self.m = _pq_subspaces(dim, self.dims_per_subspace)

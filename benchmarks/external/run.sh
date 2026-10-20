@@ -141,6 +141,14 @@ run_ann() {
     venv/bin/pip install -q -r requirements.txt
     install_adapter ann_benchmarks/algorithms/qann ann-benchmarks
     stage_qann "$ab" /tmp/qann-dist
+    # Upstream builds hnswlib from a 2018 branch (recall stalls near 0.92 on glove-25) and faiss
+    # under Anaconda's Python 3.8, which lacks the runner's dependencies. Use VIBE's pinned versions.
+    printf 'FROM ann-benchmarks\nRUN pip install --no-cache-dir hnswlib==0.8.0\n' \
+        >ann_benchmarks/algorithms/hnswlib/Dockerfile
+    for lib in faiss faiss_hnsw; do
+        printf 'FROM ann-benchmarks\nRUN pip install --no-cache-dir faiss-cpu==1.14.3\n' \
+            >"ann_benchmarks/algorithms/$lib/Dockerfile"
+    done
 
     log "Building images: qann ${compare}"
     venv/bin/python install.py --algorithm qann
