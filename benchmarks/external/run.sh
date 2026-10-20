@@ -162,6 +162,9 @@ run_ann() {
     for ds in ${ann_datasets//,/ }; do
         log "ann-benchmarks: $ds"
         venv/bin/python run.py --dataset "$ds" --parallelism "$parallelism" $batch
+        # Containers write results as root, and plot.py opens them read-write to cache metrics.
+        docker run --rm --entrypoint chown -v "$ab/results:/results" ann-benchmarks \
+            -R "$(id -u):$(id -g)" /results
         venv/bin/python plot.py --dataset "$ds" --x-scale logit --y-scale log $batch \
             -o "$workdir/out/ann-benchmarks/$ds${batch:+-batch}.png"
     done
