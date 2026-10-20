@@ -10,6 +10,7 @@ METRICS = {
     "cosine": qann.Metric.Cosine,
     # VIBE's "normalized" datasets are unit length, so L2 ranks like cosine without rescaling.
     "normalized": qann.Metric.L2,
+    "ip": qann.Metric.InnerProduct,
 }
 
 

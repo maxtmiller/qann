@@ -7,7 +7,9 @@
 # Options:
 #   --suite ann|vibe|both     which harness to run (default both)
 #   --ann-datasets a,b        ann-benchmarks datasets (default: the six on ann-benchmarks.com)
-#   --vibe-datasets a,b       VIBE datasets (default: in-distribution sets under 2M vectors)
+#   --vibe-datasets a,b       VIBE datasets (default: in-distribution sets under 2M vectors, plus the
+#                             yi-128-ip and llama-128-ip inner product sets; add
+#                             cqadupstack-lemur-2048-ip and cqadupstack-muvera-5120-ip for the rest)
 #   --compare a,b|all|none    other libraries to build and run (default hnswlib,faiss)
 #   --qann SPEC               pip requirement, path to a Linux wheel or sdist, or "local" to build an
 #                             sdist of this checkout (default: qann==<version in pyproject.toml>)
@@ -28,7 +30,7 @@ REPO="$(cd "$HERE/../.." && pwd)"
 
 suite=both
 ann_datasets=glove-25-angular,glove-100-angular,sift-128-euclidean,nytimes-256-angular,fashion-mnist-784-euclidean,gist-960-euclidean
-vibe_datasets=agnews-mxbai-1024-euclidean,arxiv-nomic-768-normalized,glove-200-cosine,gooaq-distilroberta-768-normalized,imagenet-clip-512-normalized,inaturalist-resnet-2048-cosine,landmark-dino-768-cosine,landmark-nomic-768-normalized,yahoo-minilm-384-normalized
+vibe_datasets=agnews-mxbai-1024-euclidean,arxiv-nomic-768-normalized,glove-200-cosine,gooaq-distilroberta-768-normalized,imagenet-clip-512-normalized,inaturalist-resnet-2048-cosine,landmark-dino-768-cosine,landmark-nomic-768-normalized,yahoo-minilm-384-normalized,yi-128-ip,llama-128-ip
 compare=hnswlib,faiss
 qann_spec="qann==$(grep -m1 '^version' "$REPO/pyproject.toml" | cut -d'"' -f2)"
 parallelism=""
@@ -47,7 +49,7 @@ while [[ $# -gt 0 ]]; do
     --batch) batch="--batch"; shift ;;
     --workdir) workdir="$2"; shift 2 ;;
     --setup) setup=1; shift ;;
-    -h | --help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
