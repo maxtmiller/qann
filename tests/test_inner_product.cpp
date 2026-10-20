@@ -5,6 +5,7 @@
 #include "vecengine/hnsw_index.hpp"
 #include "vecengine/index_factory.hpp"
 #include "vecengine/ivf_index.hpp"
+#include "vecengine/metadata.hpp"
 #include "vecengine/refine_index.hpp"
 #include "vecengine/threads.hpp"
 
@@ -215,13 +216,139 @@ TEST_CASE("the inner product metric survives save/load", "[ip][serialize]") {
     }
 }
 
-TEST_CASE("indexes without inner product support reject it", "[ip]") {
-    REQUIRE_THROWS_AS(IVFIndex(8, 100, 10, false, Metric::InnerProduct), std::invalid_argument);
-
+TEST_CASE("make_index passes the inner product metric", "[ip]") {
     IndexOptions opts;
     opts.metric = Metric::InnerProduct;
-    for (IndexType type : {IndexType::Flat, IndexType::HNSW})
+    for (IndexType type : {IndexType::Flat, IndexType::IVF, IndexType::HNSW})
         REQUIRE(make_index(type, 8, opts)->metric() == Metric::InnerProduct);
+    opts.pq_subspaces = 4;
+    REQUIRE(make_index(IndexType::IVF, 8, opts)->metric() == Metric::InnerProduct);
+}
+
+TEST_CASE("IVF-PQ inner product: SDC is rejected and no precomputed tables are built", "[ip][ivf][pq]") {
+    const size_t n = 1000, dim = 16;
+    std::vector<float> data, queries;
+    ip_clustered(n, 1, dim, 23, data, queries);
+    IVFIndex ivf(dim, 100, 10, false, Metric::InnerProduct);
+    ivf.enable_pq(4);
+    REQUIRE_THROWS_AS(ivf.set_pq_distance(PQDistance::SDC), std::invalid_argument);
+    ivf.train(data, n, 10, 1);
+    REQUIRE_FALSE(ivf.precomputed_tables());
+}
+
+TEST_CASE("IVF-PQ inner product is exact when every residual is a centroid", "[ip][ivf][pq]") {
+    // 256 vectors and 256 centroids per subspace: k-means gives each residual
+    // slice its own centroid, so the table sums equal -(q . x)
+    const size_t n = 256, dim = 16, nq = 20, k = 10;
+    std::vector<float> data, queries;
+    ip_clustered(n, nq, dim, 24, data, queries);
+    FlatIndex flat(dim, 1024, false, Metric::InnerProduct);
+    flat.add_batch(data, n);
+    const auto truth = flat.query_batch(queries, nq, k);
+
+    IVFIndex ivf(dim, 100, 100, false, Metric::InnerProduct);
+    ivf.enable_pq(4, 256);
+    ivf.train(data, n, 25, 1);
+    ivf.add_batch(data, n);
+    const auto got = ivf.query_batch(queries, nq, k);
+    for (size_t q = 0; q < nq; ++q)
+        for (size_t i = 0; i < k; ++i) {
+            REQUIRE(got[q][i].index == truth[q][i].index);
+            REQUIRE(std::fabs(got[q][i].distance - truth[q][i].distance) < 1e-3f * std::max(1.0f, std::fabs(truth[q][i].distance)));
+        }
+}
+
+TEST_CASE("IVF-PQ and fast-scan find inner product neighbors under a RefineIndex", "[ip][ivf][pq]") {
+    const size_t n = 5000, dim = 32, nq = 100, k = 10;
+    std::vector<float> data, queries;
+    ip_clustered(n, nq, dim, 25, data, queries);
+    FlatIndex flat(dim, 1024, false, Metric::InnerProduct);
+    flat.add_batch(data, n);
+    const auto truth = flat.query_batch(queries, nq, k);
+
+    struct Config { size_t m, K; bool fast, rotate; };
+    for (const Config c : {Config{8, 256, false, false}, Config{16, 16, true, false}, Config{16, 16, true, true}}) {
+        CAPTURE(c.m, c.fast, c.rotate);
+        IVFIndex ivf(dim, 100, 20, false, Metric::InnerProduct);
+        ivf.enable_pq(c.m, c.K, c.fast, c.rotate);
+        ivf.train(data, n, 10, 1);
+        RefineIndex refine(ivf, 10);
+        refine.add_batch(data, n);
+
+        const auto got = refine.query_batch(queries, nq, k);
+        REQUIRE(recall(got, truth) >= 0.95);
+        // without re-ranking, still far better than chance
+        REQUIRE(recall(ivf.query_batch(queries, nq, k), truth) >= 0.5);
+
+        std::vector<std::vector<Neighbor>> single;
+        for (size_t q = 0; q < nq; ++q) single.push_back(refine.query({queries.data() + q * dim, dim}, k));
+        require_same(single, got);
+
+        auto loaded = roundtrip(refine);
+        require_same(loaded->query_batch(queries, nq, k), got);
+    }
+}
+
+TEST_CASE("IVF probing every list returns the exact inner product ranking", "[ip][ivf]") {
+    const size_t n = 3000, dim = 16, nq = 40, k = 10;
+    std::vector<float> data, queries;
+    ip_clustered(n, nq, dim, 21, data, queries);
+    FlatIndex flat(dim, 1024, false, Metric::InnerProduct);
+    flat.add_batch(data, n);
+
+    IVFIndex ivf(dim, 100, 100, false, Metric::InnerProduct);
+    ivf.train(data, n, 10, 1);
+    ivf.add_batch(data, n);
+    const auto truth = flat.query_batch(queries, nq, k);
+    const auto got = ivf.query_batch(queries, nq, k);
+    for (size_t q = 0; q < nq; ++q) {
+        REQUIRE(got[q].size() == k);
+        for (size_t i = 0; i < k; ++i) {
+            REQUIRE(got[q][i].index == truth[q][i].index);
+            REQUIRE(std::fabs(got[q][i].distance - truth[q][i].distance) < 1e-4f * std::max(1.0f, std::fabs(truth[q][i].distance)));
+        }
+    }
+}
+
+TEST_CASE("IVF finds inner product neighbors with floats and SQ", "[ip][ivf]") {
+    const size_t n = 5000, dim = 32, nq = 100, k = 10;
+    std::vector<float> data, queries;
+    ip_clustered(n, nq, dim, 22, data, queries);
+    FlatIndex flat(dim, 1024, false, Metric::InnerProduct);
+    flat.add_batch(data, n);
+    const auto truth = flat.query_batch(queries, nq, k);
+
+    for (int bits : {0, 8, 4}) {
+        CAPTURE(bits);
+        IVFIndex ivf(dim, 100, 20, false, Metric::InnerProduct);
+        if (bits) ivf.enable_sq(bits);
+        ivf.train(data, n, 10, 1);
+        Index* index = &ivf;
+        std::unique_ptr<RefineIndex> refine;
+        if (bits == 4) {   // 4 bits needs re-ranking
+            refine = std::make_unique<RefineIndex>(ivf, 4);
+            index = refine.get();
+        }
+        index->add_batch(data, n);
+
+        const auto got = index->query_batch(queries, nq, k);
+        REQUIRE(recall(got, truth) >= 0.95);
+        std::vector<std::vector<Neighbor>> single;
+        for (size_t q = 0; q < nq; ++q) single.push_back(index->query({queries.data() + q * dim, dim}, k));
+        require_same(single, got);
+
+        std::vector<int64_t> allowed;
+        for (int64_t id = 0; id < static_cast<int64_t>(n); id += 5) allowed.push_back(id);
+        for (size_t q = 0; q < nq; ++q) {
+            const auto filtered = index->query({queries.data() + q * dim, dim}, k, allowed);
+            REQUIRE(filtered.size() == k);   // probes past nprobe until it has k allowed vectors
+            for (const auto& nb : filtered) REQUIRE(nb.index % 5 == 0);
+        }
+
+        auto loaded = roundtrip(*index);
+        REQUIRE(loaded->metric() == Metric::InnerProduct);
+        require_same(loaded->query_batch(queries, nq, k), got);
+    }
 }
 
 TEST_CASE("HNSW finds inner product neighbors at exact -dot distances", "[ip][hnsw]") {
@@ -328,7 +455,7 @@ TEST_CASE("HNSW inner product: save/load and compact keep building the same way"
     auto data = ip_random(n + 300, dim, 15);
     auto queries = ip_random(nq, dim, 16);
 
-    for (int bits : {0, 8}) {
+    for (int bits : {0, 8, 4}) {
         CAPTURE(bits);
         HNSWIndex hnsw(dim, 12, 100, false, 9, Metric::InnerProduct);
         if (bits) {
@@ -354,4 +481,101 @@ TEST_CASE("HNSW inner product: save/load and compact keep building the same way"
         compacted->add_batch({data.data() + (n + 100) * dim, 200 * dim}, 200);
         require_same(compacted->query_batch(queries, nq, k), hnsw.query_batch(queries, nq, k));
     }
+}
+
+TEST_CASE("inner product with custom ids and where= filters on every index", "[ip][metadata]") {
+    const size_t n = 3000, dim = 16, nq = 30, k = 10;
+    std::vector<float> data, queries;
+    ip_clustered(n, nq, dim, 31, data, queries);
+    std::vector<int64_t> ids(n), group(n);
+    for (size_t i = 0; i < n; ++i) ids[i] = 1000 + 7 * static_cast<int64_t>(i), group[i] = static_cast<int64_t>(i % 4);
+    const Metadata md{{"group", group}};
+    const Expr where = Expr::compare("group", Expr::Op::Eq, int64_t{1});
+
+    // exact answer: the k largest dot products among rows with group 1, by custom id
+    std::vector<std::vector<int64_t>> truth(nq);
+    for (size_t q = 0; q < nq; ++q) {
+        std::vector<std::pair<double, int64_t>> all;
+        for (size_t i = 1; i < n; i += 4) all.push_back({-dot_ref(queries.data() + q * dim, data.data() + i * dim, dim), ids[i]});
+        std::partial_sort(all.begin(), all.begin() + k, all.end());
+        for (size_t i = 0; i < k; ++i) truth[q].push_back(all[i].second);
+    }
+    auto check = [&](const Index& index, double min_recall) {
+        double hit = 0;
+        for (size_t q = 0; q < nq; ++q) {
+            const auto got = index.query({queries.data() + q * dim, dim}, k, where);
+            REQUIRE(got.size() == k);
+            for (const auto& nb : got) {
+                REQUIRE((static_cast<int64_t>(nb.index) - 1000) % 7 == 0);
+                REQUIRE(((static_cast<int64_t>(nb.index) - 1000) / 7) % 4 == 1);
+                hit += std::count(truth[q].begin(), truth[q].end(), static_cast<int64_t>(nb.index));
+            }
+        }
+        REQUIRE(hit / (nq * k) >= min_recall);
+    };
+
+    FlatIndex flat(dim, 1024, true, Metric::InnerProduct);
+    flat.add_batch(data, n, ids.data(), md);
+    check(flat, 1.0);
+
+    HNSWIndex hnsw(dim, 16, 100, true, 1, Metric::InnerProduct);
+    hnsw.set_ef_search(100);
+    hnsw.add_batch(data, n, ids.data(), md);
+    check(hnsw, 0.95);
+
+    IVFIndex ivf(dim, 100, 100, true, Metric::InnerProduct);   // every list: exact
+    ivf.train(data, n, 10, 1);
+    ivf.add_batch(data, n, ids.data(), md);
+    check(ivf, 1.0);
+
+    IVFIndex fs(dim, 100, 20, false, Metric::InnerProduct);
+    fs.enable_pq(8, 16, true);
+    fs.train(data, n, 10, 1);
+    RefineIndex refine(fs, 10, true);
+    refine.add_batch(data, n, ids.data(), md);
+    check(refine, 0.95);
+}
+
+TEST_CASE("IVF inner product: remove and compact keep results and ids", "[ip][ivf][compact]") {
+    const size_t n = 3000, dim = 16, nq = 30, k = 10;
+    std::vector<float> data, queries;
+    ip_clustered(n, nq, dim, 32, data, queries);
+    std::vector<int64_t> dead;
+    for (int64_t id = 0; id < static_cast<int64_t>(n); id += 3) dead.push_back(id);
+
+    for (int mode : {0, 1, 2}) {   // floats, SQ8, fast-scan PQ
+        CAPTURE(mode);
+        IVFIndex ivf(dim, 100, 20, false, Metric::InnerProduct);
+        if (mode == 1) ivf.enable_sq(8);
+        if (mode == 2) ivf.enable_pq(8, 16, true);
+        ivf.train(data, n, 10, 1);
+        ivf.add_batch(data, n);
+        REQUIRE(ivf.remove(dead) == dead.size());
+
+        const auto before = ivf.query_batch(queries, nq, k);
+        for (const auto& row : before)
+            for (const auto& nb : row) REQUIRE(nb.index % 3 != 0);
+        REQUIRE(ivf.compact() == dead.size());
+        require_same(ivf.query_batch(queries, nq, k), before);
+        require_same(roundtrip(ivf)->query_batch(queries, nq, k), before);
+    }
+}
+
+TEST_CASE("HNSW inner product with 4-bit SQ, re-ranked", "[ip][hnsw][sq]") {
+    const size_t n = 5000, dim = 32, nq = 100, k = 10;
+    std::vector<float> data, queries;
+    ip_clustered(n, nq, dim, 33, data, queries);
+    FlatIndex flat(dim, 1024, false, Metric::InnerProduct);
+    flat.add_batch(data, n);
+
+    HNSWIndex sq(dim, 16, 100, false, 1, Metric::InnerProduct);
+    sq.set_ef_search(200);
+    sq.enable_sq(4);
+    sq.train(data, n);
+    RefineIndex refine(sq, 8);
+    refine.add_batch(data, n);
+    // 16 levels per dimension spread over 100x norms: 0.89 to 1.00 over seeds
+    // 33-38 (8 bits and floats: 0.98 to 1.00)
+    REQUIRE(recall(refine.query_batch(queries, nq, k), flat.query_batch(queries, nq, k)) >= 0.85);
+    require_same(roundtrip(refine)->query_batch(queries, nq, k), refine.query_batch(queries, nq, k));
 }
