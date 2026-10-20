@@ -39,7 +39,6 @@ using std::pair;
 IVFIndex::IVFIndex(size_t dim, size_t nlist, size_t nprobe, bool custom_ids, Metric metric): Index(metric), dim_(dim), nlist_(nlist), nprobe_(nprobe), id_map_(custom_ids)  {
     if (nlist < 100 || nlist > 65535) throw std::invalid_argument("nlist must be in [100, 65535]");
     if (dim == 0) throw std::invalid_argument("dim must be >= 1");
-    if (metric == Metric::InnerProduct) throw std::invalid_argument("IVFIndex does not support Metric::InnerProduct yet");
     set_nprobe(nprobe);
     coarse_centroids_.reserve(dim_ * nlist_);
 }
@@ -72,6 +71,7 @@ void IVFIndex::enable_pq(size_t num_subspaces, size_t centroids_per_subspace, bo
     if (id_map_.slots() > 0 || trained_)
         throw std::logic_error("enable_pq must be called before train()/add()");
     if (sq_bits_) throw std::logic_error("enable_pq cannot be combined with enable_sq");
+    if (metric_ == Metric::InnerProduct) throw std::invalid_argument("enable_pq does not support Metric::InnerProduct yet");
     if (fast_scan && (centroids_per_subspace != 16 || num_subspaces % 2 != 0 || num_subspaces > 256))
         throw std::invalid_argument("fast_scan needs 16 centroids per subspace and an even num_subspaces <= 256");
     if (fast_scan && pq_distance_ == PQDistance::SDC)
@@ -215,7 +215,7 @@ vector<IVFIndex::Probe> IVFIndex::coarse(span<const float> vec) const {
     std::priority_queue<pair<float, uint16_t>, vector<pair<float, uint16_t>>, std::less<pair<float, uint16_t>>> maxCentroidHeap;
     for (size_t i = 0; i < nlist_; ++i) {
         const float* centroid_ptr = coarse_centroids_.data() + i * dim_;
-        float dist = l2_distance(vec.data(), centroid_ptr, dim_);
+        float dist = exact_score(vec.data(), centroid_ptr, dim_);
 
         if (maxCentroidHeap.size() < nprobe_) {
             maxCentroidHeap.emplace(dist, static_cast<uint16_t>(i));
@@ -240,7 +240,7 @@ vector<IVFIndex::Probe> IVFIndex::coarse(span<const float> vec) const {
 vector<IVFIndex::Probe> IVFIndex::coarse_all(span<const float> vec) const {
     vector<Probe> probes(nlist_);
     for (size_t i = 0; i < nlist_; ++i)
-        probes[i] = {l2_distance(vec.data(), coarse_centroids_.data() + i * dim_, dim_), static_cast<uint16_t>(i)};
+        probes[i] = {exact_score(vec.data(), coarse_centroids_.data() + i * dim_, dim_), static_cast<uint16_t>(i)};
     std::partial_sort(probes.begin(), probes.begin() + nprobe_, probes.end());
     return probes;
 }
@@ -263,12 +263,14 @@ void IVFIndex::coarse_batch(const float* queries, size_t n, Probe* out) const {
                 coarse_centroids_.data(), static_cast<int>(dim_),
                 0.0f, dots.data(), static_cast<int>(nlist_));
 
+    const bool ip = metric_ == Metric::InnerProduct;
     detail::parallel_for(n, [&](size_t i) {
         // ||q - c||^2 = ||q||^2 + ||c||^2 - 2 q.c, and ||q||^2 is the same for
-        // every list, so ||c||^2 - 2 q.c ranks the lists
+        // every list, so ||c||^2 - 2 q.c ranks the lists (-q.c for InnerProduct)
         const float* row = dots.data() + i * nlist_;
         vector<pair<float, uint16_t>> scored(nlist_);
-        for (size_t c = 0; c < nlist_; ++c) scored[c] = {norms[c] - 2.0f * row[c], static_cast<uint16_t>(c)};
+        for (size_t c = 0; c < nlist_; ++c)
+            scored[c] = {ip ? -row[c] : norms[c] - 2.0f * row[c], static_cast<uint16_t>(c)};
         std::nth_element(scored.begin(), scored.begin() + (nprobe_ - 1), scored.end());
 
         // the scores lose precision to cancellation, so A is recomputed exactly
@@ -276,7 +278,7 @@ void IVFIndex::coarse_batch(const float* queries, size_t n, Probe* out) const {
         Probe* probes = out + i * nprobe_;
         for (size_t j = 0; j < nprobe_; ++j) {
             const uint16_t list = scored[j].second;
-            probes[j] = {l2_distance(q, coarse_centroids_.data() + list * dim_, dim_), list};
+            probes[j] = {exact_score(q, coarse_centroids_.data() + list * dim_, dim_), list};
         }
 
         // nearest first, ordered by exact distance like coarse()
@@ -332,7 +334,11 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
         if (sq_bits_) {
             VECENGINE_PROF_START(t_raw);
             const size_t w = sq_code_bytes();
-            for (size_t j = 0; j < listSize; ++j) push(sq_.distance(vec.data(), list.codes.data() + j * w), j);
+            if (metric_ == Metric::InnerProduct) {
+                for (size_t j = 0; j < listSize; ++j) push(-sq_.inner_product(vec.data(), list.codes.data() + j * w), j);
+            } else {
+                for (size_t j = 0; j < listSize; ++j) push(sq_.distance(vec.data(), list.codes.data() + j * w), j);
+            }
             VECENGINE_PROF_STOP(t_raw, kProfRawScan);
             continue;
         }
@@ -341,7 +347,7 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
             VECENGINE_PROF_START(t_raw);
             for (size_t j = 0; j < listSize; ++j) {
                 const float* start = list.vecs.data() + j * dim_;
-                push(l2_distance(vec.data(), start, dim_), j);
+                push(exact_score(vec.data(), start, dim_), j);
             }
             VECENGINE_PROF_STOP(t_raw, kProfRawScan);
             continue;

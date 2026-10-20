@@ -652,13 +652,14 @@ def test_inner_product_flat_ranks_by_dot_product(data):
     np.testing.assert_allclose(dists, -np.take_along_axis(dots, top, axis=1), rtol=1e-4)
 
 
-def test_inner_product_not_yet_on_ivf():
+def test_inner_product_not_yet_with_ivf_pq():
+    ivf = qann.IVFIndex(32, nlist=100, metric=qann.Metric.InnerProduct)
     with pytest.raises(ValueError):
-        qann.IVFIndex(32, nlist=100, metric=qann.Metric.InnerProduct)
+        ivf.enable_pq(8)
 
 
-@pytest.mark.parametrize("sq", [0, 8])
-def test_inner_product_hnsw_recall(sq):
+def _ip_clustered():
+    # directions follow 20 cluster centers, lengths spread over 0.1x to 10x
     rng = np.random.default_rng(3)
     centers = rng.standard_normal((20, 32))
     scaled = ((centers[rng.integers(0, 20, 5000)] + 0.5 * rng.standard_normal((5000, 32)))
@@ -667,6 +668,24 @@ def test_inner_product_hnsw_recall(sq):
     flat = qann.FlatIndex(32, metric=qann.Metric.InnerProduct)
     flat.add(scaled)
     truth, _ = flat.batch_query(queries, 10)
+    return scaled, queries, truth
+
+
+@pytest.mark.parametrize("sq", [0, 8])
+def test_inner_product_ivf_recall(sq):
+    scaled, queries, truth = _ip_clustered()
+    ivf = qann.IVFIndex(32, nlist=100, nprobe=20, metric=qann.Metric.InnerProduct)
+    if sq:
+        ivf.enable_sq(sq)
+    ivf.train(scaled, seed=1)
+    ivf.add(scaled)
+    ids, _ = ivf.batch_query(queries, 10)
+    assert np.mean([len(set(a) & set(b)) / 10 for a, b in zip(ids, truth)]) >= 0.95
+
+
+@pytest.mark.parametrize("sq", [0, 8])
+def test_inner_product_hnsw_recall(sq):
+    scaled, queries, truth = _ip_clustered()
 
     hnsw = qann.HNSWIndex(32, metric=qann.Metric.InnerProduct, seed=1)
     index = hnsw

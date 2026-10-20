@@ -45,7 +45,8 @@ public:
     // in InvertedList::codes instead of raw floats in InvertedList::vecs.
     // With rotate, train() also learns a PCA-balanced rotation (see
     // src/rotation.hpp) and every vector is rotated by it before the coarse
-    // and PQ steps (issue #41). Throws std::logic_error after enable_sq().
+    // and PQ steps (issue #41). Throws std::logic_error after enable_sq(), and
+    // std::invalid_argument with Metric::InnerProduct, which PQ doesn't support yet.
     void enable_pq(size_t num_subspaces, size_t centroids_per_subspace = 256, bool fast_scan = false,
                    bool rotate = false);
 
@@ -147,7 +148,11 @@ private:
     void build_precomputed();
 
     // One probed list: its exact coarse distance ||q - c||^2 (term A of the
-    // precomputed tables) and its cluster id.
+    // precomputed tables), or -(q . c) for InnerProduct, and its cluster id.
+    // InnerProduct still clusters and assigns vectors by L2 k-means and only
+    // probes by -(q . c): measured on lastfm factors and VIBE's yi and
+    // llama-128-ip, that beat clustering the L2-transformed vectors (as HNSW
+    // links them) or probing by L2 in that space.
     struct Probe {
         float dist;
         uint16_t list;
