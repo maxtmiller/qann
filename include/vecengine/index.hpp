@@ -10,6 +10,7 @@
 #include <string>
 #include <utility>
 
+#include "vecengine/distance.hpp"
 #include "vecengine/metadata.hpp"
 
 namespace vecengine {
@@ -24,7 +25,7 @@ using std::vector;
 using std::span;
 
 // One query result: the vector's id and its distance to the query under the
-// index's metric (squared L2, or 1 - cosine similarity).
+// index's metric (squared L2, 1 - cosine similarity, or -inner product).
 struct Neighbor {
     size_t index;
     float distance;
@@ -35,6 +36,7 @@ enum class Metric : uint8_t {
     L2 = 0,      // squared Euclidean distance
     Cosine = 1,  // 1 - cosine similarity, in [0, 2]: vectors are scaled to unit
                  // length on add and query, so squared L2 / 2 is the cosine distance
+    InnerProduct = 2,  // -(a . b), so the largest inner product comes first
 };
 
 // Common interface every index type implements.
@@ -51,7 +53,7 @@ public:
 
     // add, add_batch, query and query_batch prepare vectors for the metric
     // (scaling them to unit length for Cosine) exactly once, call the index's
-    // *_impl, and turn squared L2 into the metric's distance on the way out.
+    // *_impl, and turn its scores into the metric's distance on the way out.
 
     // Adds one vector of dim() floats. Throws std::invalid_argument on an
     // index with custom ids, since there is no id to give it.
@@ -152,6 +154,12 @@ protected:
     // Metric::Cosine, by the public methods and by IVFIndex::train.
     vector<float> normalize_rows(span<const float> vecs, size_t n) const;
 
+    // The exact score *_impl methods rank by, smallest first: squared L2, or
+    // -(a . b) for InnerProduct, over n floats.
+    float exact_score(const float* a, const float* b, size_t n) const noexcept {
+        return metric_ == Metric::InnerProduct ? -inner_product(a, b, n) : l2_distance(a, b, n);
+    }
+
     Metric metric_; // set by the constructor, or by a load_body
 
     // Metadata columns, aligned to slots. Filled by add_batch; each index
@@ -182,7 +190,8 @@ private:
     virtual const detail::IdMap& id_map() const noexcept = 0;
 
     // What each index implements. Vectors arrive already prepared for the
-    // metric, and distances go back as squared L2 between prepared vectors.
+    // metric, and distances go back as squared L2 between prepared vectors,
+    // or as -(a . b) for InnerProduct.
     // A non-null filter holds the live slots that may be returned (count > 0);
     // without one, every live slot may.
     virtual void add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) = 0;

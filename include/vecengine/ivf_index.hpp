@@ -73,6 +73,8 @@ public:
     void set_pq_distance(PQDistance mode) { 
         if (fast_scan_ && mode == PQDistance::SDC) 
             throw std::invalid_argument("cannot use SDC with fast-scan");
+        if (metric_ == Metric::InnerProduct && mode == PQDistance::SDC)
+            throw std::invalid_argument("cannot use SDC with Metric::InnerProduct");
         pq_distance_ = mode; 
     }
 
@@ -80,7 +82,8 @@ public:
     // a full ADC table for every probed list. Enabled by default; the getter
     // is true only once the tables exist (PQ on, trained, and nlist * m * K
     // floats within kPrecomputedMaxBytes). Disabling frees them. Results
-    // match the per-list path up to float rounding.
+    // match the per-list path up to float rounding. Never built for
+    // Metric::InnerProduct, whose one table per query serves every list.
     bool precomputed_tables() const noexcept { return !precomputed_.empty(); }
     void set_precomputed_tables(bool enabled);
 
@@ -147,7 +150,11 @@ private:
     void build_precomputed();
 
     // One probed list: its exact coarse distance ||q - c||^2 (term A of the
-    // precomputed tables) and its cluster id.
+    // precomputed tables), or -(q . c) for InnerProduct, and its cluster id.
+    // InnerProduct still clusters and assigns vectors by L2 k-means and only
+    // probes by -(q . c): measured on lastfm factors and VIBE's yi and
+    // llama-128-ip, that beat clustering the L2-transformed vectors (as HNSW
+    // links them) or probing by L2 in that space.
     struct Probe {
         float dist;
         uint16_t list;

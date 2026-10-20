@@ -365,7 +365,9 @@ NB_MODULE(qann, m) {
     nb::enum_<vecengine::Metric>(m, "Metric")
         .value("L2", vecengine::Metric::L2, "Squared Euclidean distance")
         .value("Cosine", vecengine::Metric::Cosine,
-               "1 - cosine similarity (0 to 2); vectors are scaled to unit length on add and query");
+               "1 - cosine similarity (0 to 2); vectors are scaled to unit length on add and query")
+        .value("InnerProduct", vecengine::Metric::InnerProduct,
+               "Negative inner product -(a . b), so the largest inner product comes first");
 
     // Filters for where=: qann.field("price") < 50, combined with & | ~.
     nb::class_<vecengine::Expr>(m, "Expr", "A metadata filter for where=; build one with qann.field()")

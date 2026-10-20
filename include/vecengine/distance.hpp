@@ -21,18 +21,25 @@ float l2_distance_avx2(const float* a, const float* b, size_t n);
 float cosine_distance_scalar(const float* a, const float* b, size_t n);
 float cosine_distance_avx2(const float* a, const float* b, size_t n);
 
+// Inner product: sum(a[i] * b[i])
+float inner_product_scalar(const float* a, const float* b, size_t n);
+float inner_product_avx2(const float* a, const float* b, size_t n);
+
 // Dispatch wrappers: use AVX2 or NEON when compiled for them, else scalar.
 inline float l2_distance(const float* a, const float* b, size_t n);
 inline float cosine_distance(const float* a, const float* b, size_t n);
+inline float inner_product(const float* a, const float* b, size_t n);
 
 // std::span convenience overloads
 inline float l2_distance(span<const float> a, span<const float> b);
 inline float cosine_distance(span<const float> a, span<const float> b);
+inline float inner_product(span<const float> a, span<const float> b);
 
-// ARM NEON versions of the same two distances (used on Apple Silicon and
+// ARM NEON versions of the same three functions (used on Apple Silicon and
 // aarch64 Linux).
 float l2_distance_neon(const float* a, const float* b, std::size_t n);
 float cosine_distance_neon(const float* a, const float* b, std::size_t n);
+float inner_product_neon(const float* a, const float* b, std::size_t n);
 
 } // namespace vecengine
 

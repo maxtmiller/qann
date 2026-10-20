@@ -638,6 +638,76 @@ def test_cosine_flat_matches_cosine_distance(data):
         np.testing.assert_allclose(row_dists, expected[top], atol=1e-5)
 
 
+def test_inner_product_flat_ranks_by_dot_product(data):
+    index = qann.FlatIndex(32, metric=qann.Metric.InnerProduct)
+    assert index.metric == qann.Metric.InnerProduct
+    scaled = data * np.linspace(0.1, 10, len(data), dtype=np.float32)[:, None]   # lengths matter here
+    index.add(scaled)
+    queries = data[:20] - 0.5
+    ids, dists = index.batch_query(queries, 5)
+
+    dots = queries @ scaled.T
+    top = np.argsort(-dots, axis=1, kind="stable")[:, :5]
+    np.testing.assert_array_equal(ids, top)
+    np.testing.assert_allclose(dists, -np.take_along_axis(dots, top, axis=1), rtol=1e-4)
+
+
+@pytest.mark.parametrize("fast_scan", [False, True])
+def test_inner_product_ivf_pq_with_refine(fast_scan):
+    scaled, queries, truth = _ip_clustered()
+    ivf = qann.IVFIndex(32, nlist=100, nprobe=20, metric=qann.Metric.InnerProduct)
+    ivf.enable_pq(16 if fast_scan else 8, fast_scan=fast_scan)
+    with pytest.raises(ValueError):
+        ivf.pq_distance = qann.PQDistance.SDC
+    ivf.train(scaled, seed=1)
+    assert not ivf.precomputed_tables
+    index = qann.RefineIndex(ivf, k_factor=10)
+    index.add(scaled)
+    ids, _ = index.batch_query(queries, 10)
+    assert np.mean([len(set(a) & set(b)) / 10 for a, b in zip(ids, truth)]) >= 0.95
+
+
+def _ip_clustered():
+    # directions follow 20 cluster centers, lengths spread over 0.1x to 10x
+    rng = np.random.default_rng(3)
+    centers = rng.standard_normal((20, 32))
+    scaled = ((centers[rng.integers(0, 20, 5000)] + 0.5 * rng.standard_normal((5000, 32)))
+              * 10 ** rng.uniform(-1, 1, (5000, 1))).astype(np.float32)
+    queries = (centers[rng.integers(0, 20, 50)] + 0.5 * rng.standard_normal((50, 32))).astype(np.float32)
+    flat = qann.FlatIndex(32, metric=qann.Metric.InnerProduct)
+    flat.add(scaled)
+    truth, _ = flat.batch_query(queries, 10)
+    return scaled, queries, truth
+
+
+@pytest.mark.parametrize("sq", [0, 8])
+def test_inner_product_ivf_recall(sq):
+    scaled, queries, truth = _ip_clustered()
+    ivf = qann.IVFIndex(32, nlist=100, nprobe=20, metric=qann.Metric.InnerProduct)
+    if sq:
+        ivf.enable_sq(sq)
+    ivf.train(scaled, seed=1)
+    ivf.add(scaled)
+    ids, _ = ivf.batch_query(queries, 10)
+    assert np.mean([len(set(a) & set(b)) / 10 for a, b in zip(ids, truth)]) >= 0.95
+
+
+@pytest.mark.parametrize("sq", [0, 8])
+def test_inner_product_hnsw_recall(sq):
+    scaled, queries, truth = _ip_clustered()
+
+    hnsw = qann.HNSWIndex(32, metric=qann.Metric.InnerProduct, seed=1)
+    index = hnsw
+    if sq:
+        hnsw.enable_sq(sq)
+        hnsw.train(scaled)
+        index = qann.RefineIndex(hnsw, k_factor=2)
+    index.add(scaled)
+    hnsw.ef_search = 200
+    ids, _ = index.batch_query(queries, 10)
+    assert np.mean([len(set(a) & set(b)) / 10 for a, b in zip(ids, truth)]) >= 0.95
+
+
 def test_cosine_rejects_zero_vectors(data):
     index = qann.FlatIndex(32, metric=qann.Metric.Cosine)
     bad = data[:3].copy()
@@ -960,3 +1030,48 @@ def test_loads_metadata_saved_on_macos():
     ids, dists = index.batch_query(np.load(DATA / "v9_queries.npy"), 10, where=where)
     np.testing.assert_array_equal(ids, np.load(DATA / "v9_refine_metadata_ids.npy"))
     np.testing.assert_allclose(dists, np.load(DATA / "v9_refine_metadata_dists.npy"), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("name", ["flat", "hnsw_sq8", "refine_ivf_fs"])
+def test_loads_inner_product_saved_on_macos(name):
+    # Saved on macOS (format version 9, Metric.InnerProduct): 2000 clustered
+    # 16-dim vectors with lengths over 0.1x to 10x; a Flat with deletions, an
+    # HNSW with SQ8, and a RefineIndex over rotated fast-scan IVF-PQ.
+    index = qann.load(DATA / f"v9_ip_{name}.qann")
+    assert index.metric == qann.Metric.InnerProduct
+    ids, dists = index.batch_query(np.load(DATA / "v9_ip_queries.npy"), 10)
+    np.testing.assert_array_equal(ids, np.load(DATA / f"v9_ip_{name}_ids.npy"))
+    np.testing.assert_allclose(dists, np.load(DATA / f"v9_ip_{name}_dists.npy"), rtol=1e-5, atol=1e-5)
+
+
+def test_inner_product_hnsw_queries_while_adding():
+    scaled, queries, truth = _ip_clustered()
+    index = qann.HNSWIndex(32, metric=qann.Metric.InnerProduct, seed=1)
+    index.add(scaled[:1000])
+    errors = []
+
+    def run(fn):
+        try:
+            fn()
+        except Exception as e:
+            errors.append(e)
+
+    def adder():
+        for start in range(1000, 5000, 500):
+            index.add(scaled[start:start + 500])
+
+    def querier():
+        for _ in range(20):
+            ids, dists = index.batch_query(queries, 10)
+            assert (np.diff(dists, axis=1) >= 0).all()
+            assert ((ids >= 0) & (ids < 5000)).all()
+
+    threads = [threading.Thread(target=run, args=(fn,)) for fn in (adder, querier, querier)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+    index.ef_search = 200
+    ids, _ = index.batch_query(queries, 10)
+    assert np.mean([len(set(a) & set(b)) / 10 for a, b in zip(ids, truth)]) >= 0.95

@@ -13,7 +13,9 @@
 #include <utility>
 #include <iosfwd>
 #include <memory>
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <mutex>
 
 namespace vecengine {
@@ -99,6 +101,26 @@ private:
     // (distance to the query, slot)
     using Candidate = std::pair<float, uint32_t>;
 
+    // What a distance is measured from: a query, or a stored vector while
+    // building. With InnerProduct the graph is built as if every stored vector
+    // had one more coordinate, extra = sqrt(M^2 - |x|^2) with M the largest
+    // stored norm (the transform that turns inner product search into L2
+    // search, Bachrach et al. 2014): all stored vectors then have length M, so
+    // L2 between them ranks like -(a . b + extra_a * extra_b). A query's extra
+    // coordinate is 0, so searches rank by -(q . x) exactly. Linking by raw
+    // inner product instead (as hnswlib does) is far worse on real data:
+    // recall@10 at ef 64 (M 16) 0.05 vs 0.96 on ann-benchmarks' lastfm factors,
+    // 0.05 vs 0.50 on VIBE's llama-128-ip, 0.15 vs 0.54 on yi-128-ip. It only
+    // wins on Gaussian data whose directions ignore their norms. Nothing extra
+    // is stored but |x|^2: M only shapes the links, so it may grow with later
+    // adds, and links made earlier with a smaller M stay valid (lastfm added
+    // in ascending norm order, the worst case: 0.93 instead of 0.96).
+    struct Probe {
+        Probe(const float* v, float extra = 0.0f) : v(v), extra(extra) {}
+        const float* v;
+        float extra;
+    };
+
     size_t compact_as_base() override;
 
     // Shared by compact() and compact_as_base(): compacts id_map_ (keep_ids as
@@ -114,14 +136,14 @@ private:
     // filter with skip_deleted: nodes outside it are handled like deleted ones.
     // `locked` reads each neighbor list under its node's lock, for searches
     // that run while other threads insert; queries never do, so they skip it.
-    vector<Candidate> search_layer(const float* q, span<const uint32_t> entry_points, size_t ef, int level,
+    vector<Candidate> search_layer(Probe q, span<const uint32_t> entry_points, size_t ef, int level,
                                    bool skip_deleted = false, bool locked = false,
                                    const detail::SlotFilter* filter = nullptr) const;
 
     // The node of `level` closest to q, found by walking from ep to whichever
     // neighbor is closer until none is. The upper levels only need this one
     // node, so it skips search_layer's heaps. `locked` as in search_layer.
-    uint32_t greedy_closest(const float* q, uint32_t ep, int level, bool locked) const;
+    uint32_t greedy_closest(Probe q, uint32_t ep, int level, bool locked) const;
 
     // Picks up to max_neighbors of candidates (distances to one base node) as
     // that node's neighbors with the paper's heuristic: a candidate is kept
@@ -159,8 +181,20 @@ private:
     size_t capacity(int level) const noexcept { return level == 0 ? M0_ : M_; }
 
     // Squared L2 distance from q to the vector at slot (to its decoded code
-    // with SQ).
-    float distance(const float* q, uint32_t slot) const;
+    // with SQ), or for InnerProduct -(q . x + q.extra * extra(slot)).
+    float distance(Probe q, uint32_t slot) const;
+
+    // slot's vector as a Probe, its code decoded into buf with SQ.
+    Probe probe_of(uint32_t slot, vector<float>& buf) const { return {vector_of(slot, buf), extra(slot)}; }
+
+    // slot's extra coordinate (see Probe); 0 unless InnerProduct.
+    float extra(uint32_t slot) const noexcept {
+        return sqnorm_.empty() ? 0.0f : std::sqrt(std::max(max_sqnorm_ - sqnorm_[slot], 0.0f));
+    }
+
+    // InnerProduct: records |x|^2 of slots [first, slots()) as stored (decoded
+    // with SQ) and raises max_sqnorm_ to cover them.
+    void update_norms(uint32_t first);
 
     // The vector at slot as dim() floats: a pointer into data_, or with SQ
     // its code decoded into buf (valid until buf is reused).
@@ -212,6 +246,8 @@ private:
     vector<uint32_t> level0_;  // per slot, M0_ + 1 entries: count, then neighbors
     vector<vector<vector<uint32_t>>> upper_; // upper_[slot][level - 1]: neighbors on levels >= 1
     vector<uint8_t> levels_;   // top level of each slot
+    vector<float> sqnorm_;     // InnerProduct: |x|^2 per slot; empty otherwise
+    float max_sqnorm_ = 0.0f;  // InnerProduct: the largest of sqnorm_
     uint32_t entry_ = 0;       // a node on max_level_, where every search starts
     int max_level_ = -1;       // -1 while the graph is empty
 

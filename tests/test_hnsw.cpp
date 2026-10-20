@@ -432,6 +432,8 @@ TEST_CASE("SQ: codes round to the nearest level and the kernel matches the decod
                 for (size_t d = 0; d < dim; ++d) REQUIRE(std::abs(decoded[d] - v[d]) <= q.step[d] * 0.5f + 1e-5f);
                 const float exact = l2_distance_scalar(query.data(), decoded.data(), dim);
                 REQUIRE(std::abs(q.distance(query.data(), code.data()) - exact) <= 1e-4f * (1.0f + exact));
+                const float dot = inner_product_scalar(query.data(), decoded.data(), dim);
+                REQUIRE(std::abs(q.inner_product(query.data(), code.data()) - dot) <= 1e-4f * (1.0f + std::abs(dot)));
             }
         }
     }

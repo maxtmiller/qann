@@ -61,8 +61,9 @@ vecengine/
 │   ├── test_rotation.cpp           # eigensolver, PCA-balanced rotation, rotated IVF-PQ recall, save/load, corrupt files
 │   ├── test_filter.cpp             # filtered search on every index: recall vs filtered brute force, tiny / empty / full sets, ids, deletes
 │   ├── test_metric.cpp             # cosine metric: exact ranking, normalize_rows, zero vectors, save/load, format v4 files
+│   ├── test_inner_product.cpp      # inner product: kernels, exact ranking on every index type, HNSW vs explicit L2 transform, PQ, save/load
 │   ├── test_python.py              # pytest smoke, save/load, ids and threading tests
-│   └── data/                       # index files saved by 0.1.0a4 (v1), 0.1.0a6 (v2), 0.1.0a7 (v3), 0.1.0a10 (v4), 0.1.0a11 (v5) and macOS-made SQ8 / SQ4 files (v6) + their results
+│   └── data/                       # index files saved by 0.1.0a4 (v1), 0.1.0a6 (v2), 0.1.0a7 (v3), 0.1.0a10 (v4), 0.1.0a11 (v5), macOS-made SQ8 / SQ4 files (v6) and inner product files (v9) + their results
 ├── benchmarks/
 │   ├── bench_distance.cpp          # Google Benchmark distance kernels
 │   ├── bench_indexes.py            # recall vs QPS on SIFT
@@ -89,7 +90,7 @@ float l2_distance(const float* a, const float* b, size_t n);      // squared L2
 float cosine_distance(const float* a, const float* b, size_t n);  // 1 - cos(a, b)
 ```
 
-`l2_distance` returns **squared** L2. It ranks neighbors identically to true L2 and skips the `sqrt`. Every index and PQ distance in this repo is squared L2 internally; `Metric::Cosine` reuses it on unit vectors (see `Index`).
+`l2_distance` returns **squared** L2. It ranks neighbors identically to true L2 and skips the `sqrt`. Every index and PQ distance in this repo is squared L2 internally; `Metric::Cosine` reuses it on unit vectors (see `Index`). `inner_product` (same three paths) serves `Metric::InnerProduct`.
 
 The unsuffixed functions dispatch at compile time in `distance_inl.hpp`:
 
@@ -210,7 +211,9 @@ virtual size_t dim() const noexcept = 0;
 
 `Neighbor { size_t index; float distance; }`. Results are sorted nearest first.
 
-**Metrics.** `Metric { L2, Cosine }` is fixed at construction (`metric_`, set by each constructor, a `RefineIndex` copying its base's). For unit vectors `‖a − b‖² = 2 (1 − cos(a, b))`, so cosine needs no new search code: the public `add`, `add_batch`, `query` and `query_batch` are non-virtual and, for `Cosine`, copy the input through `normalize_rows` (each row scaled to unit length; a zero row throws `invalid_argument`), call the index's private virtual `add_batch_impl` / `query_impl` / `query_batch_impl`, and halve the returned squared L2 into `1 − cos`. `IVFIndex::train` normalizes its training set the same way, so clusters are learned on unit vectors. Normalizing happens exactly once per vector: a `RefineIndex` (a friend of `Index`) passes its already prepared vectors to the base's `*_impl` methods rather than its public ones, and the default `query_batch_impl` calls `query_impl` per row. (Normalizing a unit vector again can change its last bits, which would make `query` and `query_batch` disagree.)
+**Metrics.** `Metric { L2, Cosine, InnerProduct }` is fixed at construction (`metric_`, set by each constructor, a `RefineIndex` copying its base's). For unit vectors `‖a − b‖² = 2 (1 − cos(a, b))`, so cosine needs no new search code: the public `add`, `add_batch`, `query` and `query_batch` are non-virtual and, for `Cosine`, copy the input through `normalize_rows` (each row scaled to unit length; a zero row throws `invalid_argument`), call the index's private virtual `add_batch_impl` / `query_impl` / `query_batch_impl`, and halve the returned squared L2 into `1 − cos`. `IVFIndex::train` normalizes its training set the same way, so clusters are learned on unit vectors. Normalizing happens exactly once per vector: a `RefineIndex` (a friend of `Index`) passes its already prepared vectors to the base's `*_impl` methods rather than its public ones, and the default `query_batch_impl` calls `query_impl` per row. (Normalizing a unit vector again can change its last bits, which would make `query` and `query_batch` disagree.)
+
+`Metric::InnerProduct` can't be reduced to L2 at the edge, so the `*_impl` methods score by `-(a . b)` themselves, smallest first like the other metrics: `Index::exact_score` (squared L2, or `-inner_product`) for Flat, RefineIndex's re-ranking and IVF's float lists and coarse probing; `SQ::inner_product` (the same decode loop as `SQ::distance`) for SQ codes. HNSW searches by `-(q . x)` but links stored vectors as if each had an extra coordinate `sqrt(M^2 - |x|^2)` (`HNSWIndex::Probe`; only `|x|^2` per slot is kept and `M` is recomputed on add, compact and load). IVF keeps L2 k-means and assignment and probes by `-(q . c)`; for PQ the table of `-(q_s . y_sj)` doesn't depend on the list, so `scan` builds (and for fast-scan quantizes) it once per query and adds each list's `-(q . c)`, with no precomputed tables and no SDC. The measurements behind these choices are in the comments on `HNSWIndex::Probe` and `IVFIndex::Probe`, and on #27.
 
 **Slots and ids.** Every added vector gets a *slot*: its position in storage (0, 1, 2, ... in insertion order). Indexes store and scan slots internally (IVF lists hold slots; `RefineIndex` finds its raw vector by slot). Slots only change in `compact()`, which renumbers them in order. The id users see is separate: with `custom_ids` it is the id passed to `add_batch`; otherwise it is the slot until the first compaction, and the original slot number after it. `Neighbor::index` always reports the id. `add_batch` must keep slots in input order: row `i` of a batch gets the next slot.
 

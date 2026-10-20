@@ -35,7 +35,7 @@ void Index::add_batch(span<const float> vecs, size_t n, const int64_t* ids, cons
     // throw anywhere leaves both unchanged
     metadata_.check(n, metadata);
     const size_t rows = slots();
-    if (metric_ == Metric::L2) {
+    if (metric_ != Metric::Cosine) {
         add_batch_impl(vecs, n, ids);
     } else {
         const vector<float> unit = normalize_rows(vecs, n);
@@ -110,7 +110,7 @@ vector<vector<Neighbor>> Index::query_prepared(span<const float> queries, size_t
         if (!batch) return vector<vector<Neighbor>>{query_impl(q, k, filter)};
         return query_batch_impl(q, num_queries, k, filter);
     };
-    if (metric_ == Metric::L2) return run(queries);
+    if (metric_ != Metric::Cosine) return run(queries);
 
     const vector<float> unit = normalize_rows(queries, num_queries);
     vector<vector<Neighbor>> results = run(unit);
