@@ -5,6 +5,7 @@
 #include "vecengine/hnsw_index.hpp"
 #include "vecengine/index_factory.hpp"
 #include "vecengine/ivf_index.hpp"
+#include "vecengine/metadata.hpp"
 #include "vecengine/refine_index.hpp"
 #include "vecengine/threads.hpp"
 
@@ -454,7 +455,7 @@ TEST_CASE("HNSW inner product: save/load and compact keep building the same way"
     auto data = ip_random(n + 300, dim, 15);
     auto queries = ip_random(nq, dim, 16);
 
-    for (int bits : {0, 8}) {
+    for (int bits : {0, 8, 4}) {
         CAPTURE(bits);
         HNSWIndex hnsw(dim, 12, 100, false, 9, Metric::InnerProduct);
         if (bits) {
@@ -480,4 +481,101 @@ TEST_CASE("HNSW inner product: save/load and compact keep building the same way"
         compacted->add_batch({data.data() + (n + 100) * dim, 200 * dim}, 200);
         require_same(compacted->query_batch(queries, nq, k), hnsw.query_batch(queries, nq, k));
     }
+}
+
+TEST_CASE("inner product with custom ids and where= filters on every index", "[ip][metadata]") {
+    const size_t n = 3000, dim = 16, nq = 30, k = 10;
+    std::vector<float> data, queries;
+    ip_clustered(n, nq, dim, 31, data, queries);
+    std::vector<int64_t> ids(n), group(n);
+    for (size_t i = 0; i < n; ++i) ids[i] = 1000 + 7 * static_cast<int64_t>(i), group[i] = static_cast<int64_t>(i % 4);
+    const Metadata md{{"group", group}};
+    const Expr where = Expr::compare("group", Expr::Op::Eq, int64_t{1});
+
+    // exact answer: the k largest dot products among rows with group 1, by custom id
+    std::vector<std::vector<int64_t>> truth(nq);
+    for (size_t q = 0; q < nq; ++q) {
+        std::vector<std::pair<double, int64_t>> all;
+        for (size_t i = 1; i < n; i += 4) all.push_back({-dot_ref(queries.data() + q * dim, data.data() + i * dim, dim), ids[i]});
+        std::partial_sort(all.begin(), all.begin() + k, all.end());
+        for (size_t i = 0; i < k; ++i) truth[q].push_back(all[i].second);
+    }
+    auto check = [&](const Index& index, double min_recall) {
+        double hit = 0;
+        for (size_t q = 0; q < nq; ++q) {
+            const auto got = index.query({queries.data() + q * dim, dim}, k, where);
+            REQUIRE(got.size() == k);
+            for (const auto& nb : got) {
+                REQUIRE((static_cast<int64_t>(nb.index) - 1000) % 7 == 0);
+                REQUIRE(((static_cast<int64_t>(nb.index) - 1000) / 7) % 4 == 1);
+                hit += std::count(truth[q].begin(), truth[q].end(), static_cast<int64_t>(nb.index));
+            }
+        }
+        REQUIRE(hit / (nq * k) >= min_recall);
+    };
+
+    FlatIndex flat(dim, 1024, true, Metric::InnerProduct);
+    flat.add_batch(data, n, ids.data(), md);
+    check(flat, 1.0);
+
+    HNSWIndex hnsw(dim, 16, 100, true, 1, Metric::InnerProduct);
+    hnsw.set_ef_search(100);
+    hnsw.add_batch(data, n, ids.data(), md);
+    check(hnsw, 0.95);
+
+    IVFIndex ivf(dim, 100, 100, true, Metric::InnerProduct);   // every list: exact
+    ivf.train(data, n, 10, 1);
+    ivf.add_batch(data, n, ids.data(), md);
+    check(ivf, 1.0);
+
+    IVFIndex fs(dim, 100, 20, false, Metric::InnerProduct);
+    fs.enable_pq(8, 16, true);
+    fs.train(data, n, 10, 1);
+    RefineIndex refine(fs, 10, true);
+    refine.add_batch(data, n, ids.data(), md);
+    check(refine, 0.95);
+}
+
+TEST_CASE("IVF inner product: remove and compact keep results and ids", "[ip][ivf][compact]") {
+    const size_t n = 3000, dim = 16, nq = 30, k = 10;
+    std::vector<float> data, queries;
+    ip_clustered(n, nq, dim, 32, data, queries);
+    std::vector<int64_t> dead;
+    for (int64_t id = 0; id < static_cast<int64_t>(n); id += 3) dead.push_back(id);
+
+    for (int mode : {0, 1, 2}) {   // floats, SQ8, fast-scan PQ
+        CAPTURE(mode);
+        IVFIndex ivf(dim, 100, 20, false, Metric::InnerProduct);
+        if (mode == 1) ivf.enable_sq(8);
+        if (mode == 2) ivf.enable_pq(8, 16, true);
+        ivf.train(data, n, 10, 1);
+        ivf.add_batch(data, n);
+        REQUIRE(ivf.remove(dead) == dead.size());
+
+        const auto before = ivf.query_batch(queries, nq, k);
+        for (const auto& row : before)
+            for (const auto& nb : row) REQUIRE(nb.index % 3 != 0);
+        REQUIRE(ivf.compact() == dead.size());
+        require_same(ivf.query_batch(queries, nq, k), before);
+        require_same(roundtrip(ivf)->query_batch(queries, nq, k), before);
+    }
+}
+
+TEST_CASE("HNSW inner product with 4-bit SQ, re-ranked", "[ip][hnsw][sq]") {
+    const size_t n = 5000, dim = 32, nq = 100, k = 10;
+    std::vector<float> data, queries;
+    ip_clustered(n, nq, dim, 33, data, queries);
+    FlatIndex flat(dim, 1024, false, Metric::InnerProduct);
+    flat.add_batch(data, n);
+
+    HNSWIndex sq(dim, 16, 100, false, 1, Metric::InnerProduct);
+    sq.set_ef_search(200);
+    sq.enable_sq(4);
+    sq.train(data, n);
+    RefineIndex refine(sq, 8);
+    refine.add_batch(data, n);
+    // 16 levels per dimension spread over 100x norms: 0.89 to 1.00 over seeds
+    // 33-38 (8 bits and floats: 0.98 to 1.00)
+    REQUIRE(recall(refine.query_batch(queries, nq, k), flat.query_batch(queries, nq, k)) >= 0.85);
+    require_same(roundtrip(refine)->query_batch(queries, nq, k), refine.query_batch(queries, nq, k));
 }

@@ -63,7 +63,7 @@ vecengine/
 │   ├── test_metric.cpp             # cosine metric: exact ranking, normalize_rows, zero vectors, save/load, format v4 files
 │   ├── test_inner_product.cpp      # inner product: kernels, exact ranking on every index type, HNSW vs explicit L2 transform, PQ, save/load
 │   ├── test_python.py              # pytest smoke, save/load, ids and threading tests
-│   └── data/                       # index files saved by 0.1.0a4 (v1), 0.1.0a6 (v2), 0.1.0a7 (v3), 0.1.0a10 (v4), 0.1.0a11 (v5) and macOS-made SQ8 / SQ4 files (v6) + their results
+│   └── data/                       # index files saved by 0.1.0a4 (v1), 0.1.0a6 (v2), 0.1.0a7 (v3), 0.1.0a10 (v4), 0.1.0a11 (v5), macOS-made SQ8 / SQ4 files (v6) and inner product files (v9) + their results
 ├── benchmarks/
 │   ├── bench_distance.cpp          # Google Benchmark distance kernels
 │   ├── bench_indexes.py            # recall vs QPS on SIFT

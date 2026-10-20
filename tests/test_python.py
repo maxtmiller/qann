@@ -1030,3 +1030,48 @@ def test_loads_metadata_saved_on_macos():
     ids, dists = index.batch_query(np.load(DATA / "v9_queries.npy"), 10, where=where)
     np.testing.assert_array_equal(ids, np.load(DATA / "v9_refine_metadata_ids.npy"))
     np.testing.assert_allclose(dists, np.load(DATA / "v9_refine_metadata_dists.npy"), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("name", ["flat", "hnsw_sq8", "refine_ivf_fs"])
+def test_loads_inner_product_saved_on_macos(name):
+    # Saved on macOS (format version 9, Metric.InnerProduct): 2000 clustered
+    # 16-dim vectors with lengths over 0.1x to 10x; a Flat with deletions, an
+    # HNSW with SQ8, and a RefineIndex over rotated fast-scan IVF-PQ.
+    index = qann.load(DATA / f"v9_ip_{name}.qann")
+    assert index.metric == qann.Metric.InnerProduct
+    ids, dists = index.batch_query(np.load(DATA / "v9_ip_queries.npy"), 10)
+    np.testing.assert_array_equal(ids, np.load(DATA / f"v9_ip_{name}_ids.npy"))
+    np.testing.assert_allclose(dists, np.load(DATA / f"v9_ip_{name}_dists.npy"), rtol=1e-5, atol=1e-5)
+
+
+def test_inner_product_hnsw_queries_while_adding():
+    scaled, queries, truth = _ip_clustered()
+    index = qann.HNSWIndex(32, metric=qann.Metric.InnerProduct, seed=1)
+    index.add(scaled[:1000])
+    errors = []
+
+    def run(fn):
+        try:
+            fn()
+        except Exception as e:
+            errors.append(e)
+
+    def adder():
+        for start in range(1000, 5000, 500):
+            index.add(scaled[start:start + 500])
+
+    def querier():
+        for _ in range(20):
+            ids, dists = index.batch_query(queries, 10)
+            assert (np.diff(dists, axis=1) >= 0).all()
+            assert ((ids >= 0) & (ids < 5000)).all()
+
+    threads = [threading.Thread(target=run, args=(fn,)) for fn in (adder, querier, querier)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+    index.ef_search = 200
+    ids, _ = index.batch_query(queries, 10)
+    assert np.mean([len(set(a) & set(b)) / 10 for a, b in zip(ids, truth)]) >= 0.95
