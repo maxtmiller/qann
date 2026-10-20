@@ -74,6 +74,7 @@ vector<Neighbor> RefineIndex::rerank(span<const float> vec, const vector<Neighbo
     VECENGINE_PROF_START(t_rerank);
     vector<pair<float, size_t>> candidates;
     candidates.reserve(candidatesRaw.size());
+    const size_t d = dim();
 
     for (size_t i = 0; i < candidatesRaw.size(); ++i) {
         constexpr size_t kAhead = 8;   // how many candidates ahead to prefetch
@@ -81,7 +82,7 @@ vector<Neighbor> RefineIndex::rerank(span<const float> vec, const vector<Neighbo
             const char* p = reinterpret_cast<const char*>(data_.data() + candidatesRaw[i + kAhead].index * dim());
             for (size_t b = 0; b < dim() * sizeof(float); b += 64) __builtin_prefetch(p + b);
         }
-        float dst = l2_distance(vec.data(), data_.data() + (candidatesRaw[i].index * dim()), dim());
+        float dst = exact_score(vec.data(), data_.data() + (candidatesRaw[i].index * d), d);
         candidates.emplace_back(dst, candidatesRaw[i].index);
     }
 

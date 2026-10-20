@@ -638,6 +638,48 @@ def test_cosine_flat_matches_cosine_distance(data):
         np.testing.assert_allclose(row_dists, expected[top], atol=1e-5)
 
 
+def test_inner_product_flat_ranks_by_dot_product(data):
+    index = qann.FlatIndex(32, metric=qann.Metric.InnerProduct)
+    assert index.metric == qann.Metric.InnerProduct
+    scaled = data * np.linspace(0.1, 10, len(data), dtype=np.float32)[:, None]   # lengths matter here
+    index.add(scaled)
+    queries = data[:20] - 0.5
+    ids, dists = index.batch_query(queries, 5)
+
+    dots = queries @ scaled.T
+    top = np.argsort(-dots, axis=1, kind="stable")[:, :5]
+    np.testing.assert_array_equal(ids, top)
+    np.testing.assert_allclose(dists, -np.take_along_axis(dots, top, axis=1), rtol=1e-4)
+
+
+def test_inner_product_not_yet_on_ivf():
+    with pytest.raises(ValueError):
+        qann.IVFIndex(32, nlist=100, metric=qann.Metric.InnerProduct)
+
+
+@pytest.mark.parametrize("sq", [0, 8])
+def test_inner_product_hnsw_recall(sq):
+    rng = np.random.default_rng(3)
+    centers = rng.standard_normal((20, 32))
+    scaled = ((centers[rng.integers(0, 20, 5000)] + 0.5 * rng.standard_normal((5000, 32)))
+              * 10 ** rng.uniform(-1, 1, (5000, 1))).astype(np.float32)
+    queries = (centers[rng.integers(0, 20, 50)] + 0.5 * rng.standard_normal((50, 32))).astype(np.float32)
+    flat = qann.FlatIndex(32, metric=qann.Metric.InnerProduct)
+    flat.add(scaled)
+    truth, _ = flat.batch_query(queries, 10)
+
+    hnsw = qann.HNSWIndex(32, metric=qann.Metric.InnerProduct, seed=1)
+    index = hnsw
+    if sq:
+        hnsw.enable_sq(sq)
+        hnsw.train(scaled)
+        index = qann.RefineIndex(hnsw, k_factor=2)
+    index.add(scaled)
+    hnsw.ef_search = 200
+    ids, _ = index.batch_query(queries, 10)
+    assert np.mean([len(set(a) & set(b)) / 10 for a, b in zip(ids, truth)]) >= 0.95
+
+
 def test_cosine_rejects_zero_vectors(data):
     index = qann.FlatIndex(32, metric=qann.Metric.Cosine)
     bad = data[:3].copy()

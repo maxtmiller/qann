@@ -137,6 +137,7 @@ add_executable(test_vecengine
   tests/test_filter.cpp
   tests/test_rotation.cpp
   tests/test_metadata.cpp
+  tests/test_inner_product.cpp
 )
 
 target_link_libraries(test_vecengine PRIVATE

@@ -53,7 +53,12 @@ void SQ::decode(const uint8_t* code, float* out) const noexcept {
     for (size_t d = 0; d < dim(); ++d) out[d] = vmin[d] + static_cast<float>(code_at(code, d, bits)) * step[d];
 }
 
-float SQ::distance(const float* q, const uint8_t* code) const noexcept {
+float SQ::distance(const float* q, const uint8_t* code) const noexcept { return score<false>(q, code); }
+
+float SQ::inner_product(const float* q, const uint8_t* code) const noexcept { return score<true>(q, code); }
+
+template <bool InnerProduct>
+float SQ::score(const float* q, const uint8_t* code) const noexcept {
     const size_t n = dim();
     const float* lo = vmin.data();
     const float* st = step.data();
@@ -68,8 +73,12 @@ float SQ::distance(const float* q, const uint8_t* code) const noexcept {
     auto step8 = [&](__m128i c8, size_t at) {
         const __m256 c = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(c8));
         const __m256 x = _mm256_fmadd_ps(c, _mm256_loadu_ps(st + at), _mm256_loadu_ps(lo + at));
-        const __m256 diff = _mm256_sub_ps(_mm256_loadu_ps(q + at), x);
-        acc = _mm256_fmadd_ps(diff, diff, acc);
+        if constexpr (InnerProduct) {
+            acc = _mm256_fmadd_ps(_mm256_loadu_ps(q + at), x, acc);
+        } else {
+            const __m256 diff = _mm256_sub_ps(_mm256_loadu_ps(q + at), x);
+            acc = _mm256_fmadd_ps(diff, diff, acc);
+        }
     };
     if (bits == 8) {
         for (; d + 8 <= n; d += 8) step8(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(code + d)), d);
@@ -90,8 +99,12 @@ float SQ::distance(const float* q, const uint8_t* code) const noexcept {
     // two accumulators halve the FMA dependency chain
     auto step4 = [&](float32x4_t& acc, uint32x4_t c, size_t at) {
         const float32x4_t x = vfmaq_f32(vld1q_f32(lo + at), vcvtq_f32_u32(c), vld1q_f32(st + at));
-        const float32x4_t diff = vsubq_f32(vld1q_f32(q + at), x);
-        acc = vfmaq_f32(acc, diff, diff);
+        if constexpr (InnerProduct) {
+            acc = vfmaq_f32(acc, vld1q_f32(q + at), x);
+        } else {
+            const float32x4_t diff = vsubq_f32(vld1q_f32(q + at), x);
+            acc = vfmaq_f32(acc, diff, diff);
+        }
     };
     // scores the 16 dimensions at `at` from one byte code each
     auto step16 = [&](uint8x16_t c8, size_t at) {
@@ -117,8 +130,13 @@ float SQ::distance(const float* q, const uint8_t* code) const noexcept {
 #endif
 
     for (; d < n; ++d) {
-        const float diff = q[d] - (lo[d] + static_cast<float>(code_at(code, d, bits)) * st[d]);
-        sum += diff * diff;
+        const float x = lo[d] + static_cast<float>(code_at(code, d, bits)) * st[d];
+        if constexpr (InnerProduct) {
+            sum += q[d] * x;
+        } else {
+            const float diff = q[d] - x;
+            sum += diff * diff;
+        }
     }
     return sum;
 }

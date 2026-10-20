@@ -85,7 +85,7 @@ vector<T> read_vec(std::istream& in, uint64_t max_len) {
 // 5); throws std::runtime_error on an unknown value.
 inline Metric read_metric(std::istream& in) {
     const auto metric = read_pod<uint8_t>(in);
-    if (metric > static_cast<uint8_t>(Metric::Cosine)) throw std::runtime_error("corrupt file: unknown metric");
+    if (metric > static_cast<uint8_t>(Metric::InnerProduct)) throw std::runtime_error("corrupt file: unknown metric");
     return static_cast<Metric>(metric);
 }
 

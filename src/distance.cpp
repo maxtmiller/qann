@@ -38,6 +38,12 @@ float cosine_distance_scalar(const float* a, const float* b, std::size_t n) {
     return 1.0f - (dot / denom);
 }
 
+float inner_product_scalar(const float* a, const float* b, std::size_t n) {
+    float acc = 0.0f;
+    for (std::size_t i = 0; i < n; ++i) acc += a[i] * b[i];
+    return acc;
+}
+
 // ---------------------------------------------------------------------------
 // AVX2 + FMA implementations
 // ---------------------------------------------------------------------------
@@ -106,11 +112,22 @@ float cosine_distance_avx2(const float* a, const float* b, std::size_t n) {
     return 1.0f - (dot / denom);
 }
 
+float inner_product_avx2(const float* a, const float* b, std::size_t n) {
+    __m256 acc = _mm256_setzero_ps();
+    std::size_t i = 0;
+    for (; i + 8 <= n; i += 8) acc = _mm256_fmadd_ps(_mm256_loadu_ps(a + i), _mm256_loadu_ps(b + i), acc);
+
+    float result = hsum256(acc);
+    for (; i < n; ++i) result += a[i] * b[i];
+    return result;
+}
+
 #else
 
 // Non-AVX2 build: forward to scalar so the TU still compiles cleanly.
 float l2_distance_avx2(const float* a, const float* b, std::size_t n) { return l2_distance_scalar(a, b, n); }
 float cosine_distance_avx2(const float* a, const float* b, std::size_t n) { return cosine_distance_scalar(a, b, n); }
+float inner_product_avx2(const float* a, const float* b, std::size_t n) { return inner_product_scalar(a, b, n); }
 
 #endif // __AVX2__
 
@@ -174,11 +191,22 @@ float cosine_distance_neon(const float* a, const float* b, std::size_t n) {
     return 1.0f - (dot / denom);
 }
 
+float inner_product_neon(const float* a, const float* b, std::size_t n) {
+    float32x4_t acc = vdupq_n_f32(0.0f);
+    std::size_t i = 0;
+    for (; i + 4 <= n; i += 4) acc = vfmaq_f32(acc, vld1q_f32(a + i), vld1q_f32(b + i));
+
+    float result = hsum128(acc);
+    for (; i < n; ++i) result += a[i] * b[i];
+    return result;
+}
+
 #else
 
 // Non-ARM_NEON build: forward to scalar so the TU still compiles cleanly.
 float l2_distance_neon(const float* a, const float* b, std::size_t n) { return l2_distance_scalar(a, b, n); }
 float cosine_distance_neon(const float* a, const float* b, std::size_t n) { return cosine_distance_scalar(a, b, n); }
+float inner_product_neon(const float* a, const float* b, std::size_t n) { return inner_product_scalar(a, b, n); }
 
 #endif // __ARM_NEON
 

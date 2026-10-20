@@ -34,7 +34,7 @@ vector<Neighbor> FlatIndex::query_impl(span<const float> vec, size_t k, const de
     std::priority_queue<pair<float, size_t>, vector<pair<float, size_t>>, std::less<pair<float, size_t>>> maxHeap;
     auto score = [&](size_t i) {
         const float* start = data_.data() + i * dim_;
-        float dist = l2_distance(start, vec.data(), dim_);
+        float dist = exact_score(start, vec.data(), dim_);
 
         if (maxHeap.size() < k) {
             maxHeap.emplace(dist, i);
