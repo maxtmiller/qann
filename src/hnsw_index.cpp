@@ -51,6 +51,7 @@ HNSWIndex::HNSWIndex(size_t dim, size_t M, size_t ef_construction, bool custom_i
     if (dim == 0) throw std::invalid_argument("dim must be >= 1");
     if (M < 2) throw std::invalid_argument("M must be >= 2");
     if (ef_construction == 0) throw std::invalid_argument("ef_construction must be >= 1");
+    if (metric == Metric::InnerProduct) throw std::invalid_argument("HNSWIndex does not support Metric::InnerProduct yet");
     level_mult_ = 1.0 / std::log(static_cast<double>(M));
 }
 

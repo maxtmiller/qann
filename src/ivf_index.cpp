@@ -39,6 +39,7 @@ using std::pair;
 IVFIndex::IVFIndex(size_t dim, size_t nlist, size_t nprobe, bool custom_ids, Metric metric): Index(metric), dim_(dim), nlist_(nlist), nprobe_(nprobe), id_map_(custom_ids)  {
     if (nlist < 100 || nlist > 65535) throw std::invalid_argument("nlist must be in [100, 65535]");
     if (dim == 0) throw std::invalid_argument("dim must be >= 1");
+    if (metric == Metric::InnerProduct) throw std::invalid_argument("IVFIndex does not support Metric::InnerProduct yet");
     set_nprobe(nprobe);
     coarse_centroids_.reserve(dim_ * nlist_);
 }

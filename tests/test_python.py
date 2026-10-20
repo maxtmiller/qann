@@ -638,6 +638,27 @@ def test_cosine_flat_matches_cosine_distance(data):
         np.testing.assert_allclose(row_dists, expected[top], atol=1e-5)
 
 
+def test_inner_product_flat_ranks_by_dot_product(data):
+    index = qann.FlatIndex(32, metric=qann.Metric.InnerProduct)
+    assert index.metric == qann.Metric.InnerProduct
+    scaled = data * np.linspace(0.1, 10, len(data), dtype=np.float32)[:, None]   # lengths matter here
+    index.add(scaled)
+    queries = data[:20] - 0.5
+    ids, dists = index.batch_query(queries, 5)
+
+    dots = queries @ scaled.T
+    top = np.argsort(-dots, axis=1, kind="stable")[:, :5]
+    np.testing.assert_array_equal(ids, top)
+    np.testing.assert_allclose(dists, -np.take_along_axis(dots, top, axis=1), rtol=1e-4)
+
+
+def test_inner_product_not_yet_on_ivf_and_hnsw():
+    with pytest.raises(ValueError):
+        qann.IVFIndex(32, nlist=100, metric=qann.Metric.InnerProduct)
+    with pytest.raises(ValueError):
+        qann.HNSWIndex(32, metric=qann.Metric.InnerProduct)
+
+
 def test_cosine_rejects_zero_vectors(data):
     index = qann.FlatIndex(32, metric=qann.Metric.Cosine)
     bad = data[:3].copy()

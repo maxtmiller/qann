@@ -29,6 +29,17 @@ inline float cosine_distance(const float* a, const float* b, size_t n) {
 #endif
 }
 
+// Inner product, using the fastest kernel this build supports.
+inline float inner_product(const float* a, const float* b, size_t n) {
+#if defined(__AVX2__)
+    return inner_product_avx2(a, b, n);
+#elif defined(__ARM_NEON)
+    return inner_product_neon(a, b, n);
+#else
+    return inner_product_scalar(a, b, n);
+#endif
+}
+
 // l2_distance over two equal-length spans.
 inline float l2_distance(span<const float> a, span<const float> b) {
     assert(a.size() == b.size());
@@ -39,6 +50,12 @@ inline float l2_distance(span<const float> a, span<const float> b) {
 inline float cosine_distance(span<const float> a, span<const float> b) {
     assert(a.size() == b.size());
     return cosine_distance(a.data(), b.data(), a.size());
+}
+
+// inner_product over two equal-length spans.
+inline float inner_product(span<const float> a, span<const float> b) {
+    assert(a.size() == b.size());
+    return inner_product(a.data(), b.data(), a.size());
 }
 
 } // namespace vecengine
