@@ -16,6 +16,10 @@ option(VECENGINE_BUILD_TESTS "Build C++ tests and microbenchmarks" ON)
 # Per-section query timers (src/profile.hpp) and the profile_query tool.
 # Adds timer calls to the query path, so keep it off for normal builds.
 option(VECENGINE_PROFILE "Build with query section timers and profile_query" OFF)
+# Compile for the build machine's CPU (-march=native), which turns on the
+# AVX-512 kernels where the CPU has them. The result may not run on other CPUs,
+# so wheels keep it off.
+option(VECENGINE_NATIVE "Compile for the build machine's CPU (-march=native)" OFF)
 
 FetchContent_Declare(
   Catch2
@@ -61,6 +65,10 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i686")
     $<$<CONFIG:Release>:-mavx2>
     $<$<CONFIG:Release>:-mfma>
   )
+endif()
+
+if(VECENGINE_NATIVE)
+  add_compile_options($<$<CONFIG:Release>:-march=native>)
 endif()
 
 # ---------------------------------------------------------------------------

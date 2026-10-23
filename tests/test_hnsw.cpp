@@ -415,7 +415,7 @@ static std::unique_ptr<HNSWIndex> sq_hnsw(int bits, const std::vector<float>& da
 TEST_CASE("SQ: codes round to the nearest level and the kernel matches the decoded vector", "[sq]") {
     for (int bits : {8, 4}) {
         // with and without SIMD tails, and odd sizes that leave a 4-bit code's high nibble unused
-        for (size_t dim : {size_t{3}, size_t{16}, size_t{33}, size_t{100}, size_t{128}}) {
+        for (size_t dim : {size_t{3}, size_t{16}, size_t{33}, size_t{48}, size_t{80}, size_t{100}, size_t{128}}) {
             CAPTURE(bits, dim);
             auto data = hnsw_random(200, dim, 50);
             SQ q;

@@ -4,7 +4,7 @@
 #include <cassert>
 #include <cmath>
 
-#if defined(__AVX2__)
+#if defined(__AVX2__) || defined(__AVX512F__)
 #  include <immintrin.h>
 #elif defined(__ARM_NEON)
 #  include <arm_neon.h>
@@ -67,7 +67,38 @@ float SQ::score(const float* q, const uint8_t* code) const noexcept {
 
     // The SIMD loops first spread 4-bit codes out to one byte per dimension,
     // then score bytes the same way for both widths.
-#if defined(__AVX2__)
+#if defined(__AVX512F__)
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+    // two accumulators halve the FMA dependency chain
+    // scores the 16 dimensions at `at` from one byte code each in c16
+    auto step16 = [&](__m512& acc, __m128i c16, size_t at) {
+        const __m512 c = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(c16));
+        const __m512 x = _mm512_fmadd_ps(c, _mm512_loadu_ps(st + at), _mm512_loadu_ps(lo + at));
+        if constexpr (InnerProduct) {
+            acc = _mm512_fmadd_ps(_mm512_loadu_ps(q + at), x, acc);
+        } else {
+            const __m512 diff = _mm512_sub_ps(_mm512_loadu_ps(q + at), x);
+            acc = _mm512_fmadd_ps(diff, diff, acc);
+        }
+    };
+    if (bits == 8) {
+        for (; d + 32 <= n; d += 32) {
+            step16(acc0, _mm_loadu_si128(reinterpret_cast<const __m128i*>(code + d)), d);
+            step16(acc1, _mm_loadu_si128(reinterpret_cast<const __m128i*>(code + d + 16)), d + 16);
+        }
+        for (; d + 16 <= n; d += 16) step16(acc0, _mm_loadu_si128(reinterpret_cast<const __m128i*>(code + d)), d);
+    } else {
+        const __m128i nibble = _mm_set1_epi8(0x0F);
+        for (; d + 32 <= n; d += 32) {
+            const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i*>(code + d / 2));
+            const __m128i low = _mm_and_si128(c, nibble);
+            const __m128i high = _mm_and_si128(_mm_srli_epi16(c, 4), nibble);
+            step16(acc0, _mm_unpacklo_epi8(low, high), d);
+            step16(acc1, _mm_unpackhi_epi8(low, high), d + 16);
+        }
+    }
+    sum = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+#elif defined(__AVX2__)
     __m256 acc = _mm256_setzero_ps();
     // scores the 8 dimensions at `at` from one byte code each, in the low 8 bytes of c8
     auto step8 = [&](__m128i c8, size_t at) {
