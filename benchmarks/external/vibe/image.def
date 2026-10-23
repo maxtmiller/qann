@@ -5,5 +5,6 @@ From: base.sif
   qann-dist /opt/qann-dist
 
 %post
-  pip install --no-cache-dir -r /opt/qann-dist/requirement.txt
+  # Built from source for this CPU (AVX-512 where it has it), the way hnswlib builds itself here.
+  CMAKE_ARGS="-DVECENGINE_NATIVE=ON" pip install --no-cache-dir --no-binary qann -r /opt/qann-dist/requirement.txt
   python -c 'import qann; print(qann.__version__)'

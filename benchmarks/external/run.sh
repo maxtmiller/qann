@@ -11,8 +11,9 @@
 #                             yi-128-ip and llama-128-ip inner product sets; add
 #                             cqadupstack-lemur-2048-ip and cqadupstack-muvera-5120-ip for the rest)
 #   --compare a,b|all|none    other libraries to build and run (default hnswlib,faiss)
-#   --qann SPEC               pip requirement, path to a Linux wheel or sdist, or "local" to build an
-#                             sdist of this checkout (default: qann==<version in pyproject.toml>)
+#   --qann SPEC               pip requirement, path to an sdist, or "local" to build an sdist of this
+#                             checkout (default: qann==<version in pyproject.toml>). qann is always
+#                             compiled from source for the machine's CPU, as hnswlib is.
 #   --parallelism N           indexes benchmarked at once (default: min(cores - 1, RAM GB / 16))
 #   --batch                   ann-benchmarks batch mode (all queries at once, all cores)
 #   --workdir DIR             where repos, images, datasets and results go (default ~/qann-bench)
