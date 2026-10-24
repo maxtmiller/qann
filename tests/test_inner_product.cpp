@@ -428,6 +428,11 @@ TEST_CASE("HNSW inner product builds like L2 HNSW on the transformed vectors", "
 
 TEST_CASE("HNSW inner product keeps recall when later adds have larger norms", "[ip][hnsw]") {
     // the first batch fixes M; every vector of the second is 10x longer
+    // One build's recall swings by about 0.1 with the seed (and with float
+    // rounding), so this averages 5 seeds, each built on one thread so the
+    // graphs are the same every run.
+    struct Reset { ~Reset() { set_num_threads(0); } } reset;
+    set_num_threads(1);
     const size_t n = 2500, dim = 32, nq = 100, k = 10;
     std::vector<float> data, queries;
     ip_clustered(2 * n, nq, dim, 13, data, queries);
@@ -436,15 +441,19 @@ TEST_CASE("HNSW inner product keeps recall when later adds have larger norms", "
     flat.add_batch(data, 2 * n);
     const auto truth = flat.query_batch(queries, nq, k);
 
-    HNSWIndex once(dim, 16, 100, false, 1, Metric::InnerProduct);
-    once.set_ef_search(100);
-    once.add_batch(data, 2 * n);
-    HNSWIndex twice(dim, 16, 100, false, 1, Metric::InnerProduct);
-    twice.set_ef_search(100);
-    twice.add_batch({data.data(), n * dim}, n);
-    twice.add_batch({data.data() + n * dim, n * dim}, n);
-    const double r_once = recall(once.query_batch(queries, nq, k), truth);
-    const double r_twice = recall(twice.query_batch(queries, nq, k), truth);
+    constexpr uint32_t seeds = 5;
+    double r_once = 0, r_twice = 0;
+    for (uint32_t seed = 1; seed <= seeds; ++seed) {
+        HNSWIndex once(dim, 16, 100, false, seed, Metric::InnerProduct);
+        once.set_ef_search(100);
+        once.add_batch(data, 2 * n);
+        HNSWIndex twice(dim, 16, 100, false, seed, Metric::InnerProduct);
+        twice.set_ef_search(100);
+        twice.add_batch({data.data(), n * dim}, n);
+        twice.add_batch({data.data() + n * dim, n * dim}, n);
+        r_once += recall(once.query_batch(queries, nq, k), truth) / seeds;
+        r_twice += recall(twice.query_batch(queries, nq, k), truth) / seeds;
+    }
     REQUIRE(r_twice >= r_once - 0.05);
     REQUIRE(r_twice >= 0.7);
 }

@@ -61,6 +61,22 @@ TEST_CASE("l2_distance_scalar: known values", "[l2][scalar]") {
                  WithinAbs(27.0f, kEps));
 }
 
+TEST_CASE("SIMD distance kernels match the scalar ones at every dimension", "[l2][ip][cosine][simd]") {
+    // every unrolled loop and tail length of whichever kernels this build uses
+    // (AVX-512 with VECENGINE_NATIVE on a CPU that has it, else AVX2 or NEON)
+    for (size_t dim = 1; dim <= 140; ++dim) {
+        CAPTURE(dim);
+        const auto v = random_vectors(2, dim, static_cast<unsigned>(dim));
+        const float* a = v.data();
+        const float* b = v.data() + dim;
+        const float l2 = vecengine::l2_distance_scalar(a, b, dim);
+        REQUIRE_THAT(vecengine::l2_distance(a, b, dim), WithinAbs(l2, 1e-5f * (1.0f + l2)));
+        const float ip = vecengine::inner_product_scalar(a, b, dim);
+        REQUIRE_THAT(vecengine::inner_product(a, b, dim), WithinAbs(ip, 1e-5f * (1.0f + std::abs(ip))));
+        REQUIRE_THAT(vecengine::cosine_distance(a, b, dim), WithinAbs(vecengine::cosine_distance_scalar(a, b, dim), 1e-5f));
+    }
+}
+
 TEST_CASE("FlatIndex: query returns self at rank 0", "[index]") {
     vecengine::FlatIndex idx(3);
     std::vector<float> a = {1.0f, 2.0f, 3.0f};
