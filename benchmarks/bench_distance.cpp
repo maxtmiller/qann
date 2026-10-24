@@ -39,6 +39,33 @@ static void BM_L2_AVX2(benchmark::State& state) {
         benchmark::DoNotOptimize(vecengine::l2_distance_avx2(vp.a.data(), vp.b.data(), N));
 }
 
+// The _AVX512 kernels exist only in VECENGINE_NATIVE builds on a CPU with
+// AVX-512; elsewhere they forward to scalar.
+template <std::size_t N>
+static void BM_L2_AVX512(benchmark::State& state) {
+    VecPair<N> vp;
+    for (auto _ : state)
+        benchmark::DoNotOptimize(vecengine::l2_distance_avx512(vp.a.data(), vp.b.data(), N));
+}
+
+// ---------------------------------------------------------------------------
+// Inner product benchmarks
+// ---------------------------------------------------------------------------
+
+template <std::size_t N>
+static void BM_IP_AVX2(benchmark::State& state) {
+    VecPair<N> vp;
+    for (auto _ : state)
+        benchmark::DoNotOptimize(vecengine::inner_product_avx2(vp.a.data(), vp.b.data(), N));
+}
+
+template <std::size_t N>
+static void BM_IP_AVX512(benchmark::State& state) {
+    VecPair<N> vp;
+    for (auto _ : state)
+        benchmark::DoNotOptimize(vecengine::inner_product_avx512(vp.a.data(), vp.b.data(), N));
+}
+
 // ---------------------------------------------------------------------------
 // Cosine benchmarks
 // ---------------------------------------------------------------------------
@@ -67,6 +94,19 @@ BENCHMARK_TEMPLATE(BM_L2_Scalar,   512);
 BENCHMARK_TEMPLATE(BM_L2_AVX2,     512);
 BENCHMARK_TEMPLATE(BM_L2_Scalar,  1536); // common embedding dim
 BENCHMARK_TEMPLATE(BM_L2_AVX2,   1536);
+
+// AVX2 vs AVX-512 at the benchmark datasets' sizes (glove-25, sift, fashion-mnist, gist)
+BENCHMARK_TEMPLATE(BM_L2_AVX2,     25);
+BENCHMARK_TEMPLATE(BM_L2_AVX512,   25);
+BENCHMARK_TEMPLATE(BM_L2_AVX512,  128);
+BENCHMARK_TEMPLATE(BM_L2_AVX2,    784);
+BENCHMARK_TEMPLATE(BM_L2_AVX512,  784);
+BENCHMARK_TEMPLATE(BM_L2_AVX2,    960);
+BENCHMARK_TEMPLATE(BM_L2_AVX512,  960);
+BENCHMARK_TEMPLATE(BM_IP_AVX2,    128);
+BENCHMARK_TEMPLATE(BM_IP_AVX512,  128);
+BENCHMARK_TEMPLATE(BM_IP_AVX2,    784);
+BENCHMARK_TEMPLATE(BM_IP_AVX512,  784);
 
 BENCHMARK_TEMPLATE(BM_Cosine_Scalar,  128);
 BENCHMARK_TEMPLATE(BM_Cosine_AVX2,    128);

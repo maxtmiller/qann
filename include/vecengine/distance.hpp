@@ -25,7 +25,7 @@ float cosine_distance_avx2(const float* a, const float* b, size_t n);
 float inner_product_scalar(const float* a, const float* b, size_t n);
 float inner_product_avx2(const float* a, const float* b, size_t n);
 
-// Dispatch wrappers: use AVX2 or NEON when compiled for them, else scalar.
+// Dispatch wrappers: use AVX-512, AVX2 or NEON when compiled for them, else scalar.
 inline float l2_distance(const float* a, const float* b, size_t n);
 inline float cosine_distance(const float* a, const float* b, size_t n);
 inline float inner_product(const float* a, const float* b, size_t n);
@@ -40,6 +40,12 @@ inline float inner_product(span<const float> a, span<const float> b);
 float l2_distance_neon(const float* a, const float* b, std::size_t n);
 float cosine_distance_neon(const float* a, const float* b, std::size_t n);
 float inner_product_neon(const float* a, const float* b, std::size_t n);
+
+// AVX-512 versions, used only by builds that target it (VECENGINE_NATIVE on a
+// CPU with AVX-512); portable x86 builds stay on AVX2.
+float l2_distance_avx512(const float* a, const float* b, std::size_t n);
+float cosine_distance_avx512(const float* a, const float* b, std::size_t n);
+float inner_product_avx512(const float* a, const float* b, std::size_t n);
 
 } // namespace vecengine
 

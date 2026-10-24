@@ -1,5 +1,6 @@
 #pragma once
-// Inline dispatch: selected at compile time via __AVX2__ macro.
+// Inline dispatch: selected at compile time via the __AVX512F__, __AVX2__ and
+// __ARM_NEON macros.
 // This header is included only by distance.hpp.
 
 #include <cassert>
@@ -9,7 +10,9 @@ namespace vecengine {
 
 // Squared L2 distance, using the fastest kernel this build supports.
 inline float l2_distance(const float* a, const float* b, size_t n) {
-#if defined(__AVX2__)
+#if defined(__AVX512F__)
+    return l2_distance_avx512(a, b, n);
+#elif defined(__AVX2__)
     return l2_distance_avx2(a, b, n);
 #elif defined(__ARM_NEON)
     return l2_distance_neon(a, b, n);
@@ -20,7 +23,9 @@ inline float l2_distance(const float* a, const float* b, size_t n) {
 
 // Cosine distance, using the fastest kernel this build supports.
 inline float cosine_distance(const float* a, const float* b, size_t n) {
-#if defined(__AVX2__)
+#if defined(__AVX512F__)
+    return cosine_distance_avx512(a, b, n);
+#elif defined(__AVX2__)
     return cosine_distance_avx2(a, b, n);
 #elif defined(__ARM_NEON)
     return cosine_distance_neon(a, b, n);
@@ -31,7 +36,9 @@ inline float cosine_distance(const float* a, const float* b, size_t n) {
 
 // Inner product, using the fastest kernel this build supports.
 inline float inner_product(const float* a, const float* b, size_t n) {
-#if defined(__AVX2__)
+#if defined(__AVX512F__)
+    return inner_product_avx512(a, b, n);
+#elif defined(__AVX2__)
     return inner_product_avx2(a, b, n);
 #elif defined(__ARM_NEON)
     return inner_product_neon(a, b, n);

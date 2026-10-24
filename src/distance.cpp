@@ -3,7 +3,7 @@
 #include <cmath>
 #include <numeric>
 
-#if defined(__AVX2__)
+#if defined(__AVX2__) || defined(__AVX512F__)
 #  include <immintrin.h>
 #endif
 
@@ -158,6 +158,101 @@ float cosine_distance_avx2(const float* a, const float* b, std::size_t n) { retu
 float inner_product_avx2(const float* a, const float* b, std::size_t n) { return inner_product_scalar(a, b, n); }
 
 #endif // __AVX2__
+
+// ---------------------------------------------------------------------------
+// AVX-512 implementations (builds with -march=native on a CPU that has it)
+// ---------------------------------------------------------------------------
+
+#if defined(__AVX512F__)
+
+// The last n % 16 dimensions go through one masked step: lanes past n load as
+// zero, so they add nothing to any sum.
+static inline __mmask16 tail_mask(std::size_t left) { return static_cast<__mmask16>((1u << left) - 1); }
+
+float l2_distance_avx512(const float* a, const float* b, std::size_t n) {
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+    __m512 acc2 = _mm512_setzero_ps(), acc3 = _mm512_setzero_ps();
+    std::size_t i = 0;
+
+    for (; i + 64 <= n; i += 64) {
+        const __m512 d0 = _mm512_sub_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i));
+        const __m512 d1 = _mm512_sub_ps(_mm512_loadu_ps(a + i + 16), _mm512_loadu_ps(b + i + 16));
+        const __m512 d2 = _mm512_sub_ps(_mm512_loadu_ps(a + i + 32), _mm512_loadu_ps(b + i + 32));
+        const __m512 d3 = _mm512_sub_ps(_mm512_loadu_ps(a + i + 48), _mm512_loadu_ps(b + i + 48));
+        acc0 = _mm512_fmadd_ps(d0, d0, acc0);
+        acc1 = _mm512_fmadd_ps(d1, d1, acc1);
+        acc2 = _mm512_fmadd_ps(d2, d2, acc2);
+        acc3 = _mm512_fmadd_ps(d3, d3, acc3);
+    }
+    for (; i + 16 <= n; i += 16) {
+        const __m512 d = _mm512_sub_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i));
+        acc0 = _mm512_fmadd_ps(d, d, acc0);
+    }
+    if (i < n) {
+        const __mmask16 m = tail_mask(n - i);
+        const __m512 d = _mm512_sub_ps(_mm512_maskz_loadu_ps(m, a + i), _mm512_maskz_loadu_ps(m, b + i));
+        acc1 = _mm512_fmadd_ps(d, d, acc1);
+    }
+    return _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3)));
+}
+
+float cosine_distance_avx512(const float* a, const float* b, std::size_t n) {
+    __m512 vdot0 = _mm512_setzero_ps(), vnorma0 = _mm512_setzero_ps(), vnormb0 = _mm512_setzero_ps();
+    __m512 vdot1 = _mm512_setzero_ps(), vnorma1 = _mm512_setzero_ps(), vnormb1 = _mm512_setzero_ps();
+    std::size_t i = 0;
+
+    for (; i + 32 <= n; i += 32) {
+        const __m512 va0 = _mm512_loadu_ps(a + i), vb0 = _mm512_loadu_ps(b + i);
+        const __m512 va1 = _mm512_loadu_ps(a + i + 16), vb1 = _mm512_loadu_ps(b + i + 16);
+        vdot0   = _mm512_fmadd_ps(va0, vb0, vdot0);
+        vnorma0 = _mm512_fmadd_ps(va0, va0, vnorma0);
+        vnormb0 = _mm512_fmadd_ps(vb0, vb0, vnormb0);
+        vdot1   = _mm512_fmadd_ps(va1, vb1, vdot1);
+        vnorma1 = _mm512_fmadd_ps(va1, va1, vnorma1);
+        vnormb1 = _mm512_fmadd_ps(vb1, vb1, vnormb1);
+    }
+    for (; i < n; i += 16) {
+        const __mmask16 m = n - i >= 16 ? __mmask16{0xFFFF} : tail_mask(n - i);
+        const __m512 va = _mm512_maskz_loadu_ps(m, a + i), vb = _mm512_maskz_loadu_ps(m, b + i);
+        vdot0   = _mm512_fmadd_ps(va, vb, vdot0);
+        vnorma0 = _mm512_fmadd_ps(va, va, vnorma0);
+        vnormb0 = _mm512_fmadd_ps(vb, vb, vnormb0);
+    }
+
+    const float dot    = _mm512_reduce_add_ps(_mm512_add_ps(vdot0, vdot1));
+    const float norm_a = _mm512_reduce_add_ps(_mm512_add_ps(vnorma0, vnorma1));
+    const float norm_b = _mm512_reduce_add_ps(_mm512_add_ps(vnormb0, vnormb1));
+    const float denom = std::sqrt(norm_a) * std::sqrt(norm_b);
+    if (denom < 1e-10f) return 1.0f;
+    return 1.0f - (dot / denom);
+}
+
+float inner_product_avx512(const float* a, const float* b, std::size_t n) {
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+    __m512 acc2 = _mm512_setzero_ps(), acc3 = _mm512_setzero_ps();
+    std::size_t i = 0;
+    for (; i + 64 <= n; i += 64) {
+        acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc0);
+        acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 16), _mm512_loadu_ps(b + i + 16), acc1);
+        acc2 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 32), _mm512_loadu_ps(b + i + 32), acc2);
+        acc3 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i + 48), _mm512_loadu_ps(b + i + 48), acc3);
+    }
+    for (; i + 16 <= n; i += 16) acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(a + i), _mm512_loadu_ps(b + i), acc0);
+    if (i < n) {
+        const __mmask16 m = tail_mask(n - i);
+        acc1 = _mm512_fmadd_ps(_mm512_maskz_loadu_ps(m, a + i), _mm512_maskz_loadu_ps(m, b + i), acc1);
+    }
+    return _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3)));
+}
+
+#else
+
+// Non-AVX-512 build: forward to scalar so the TU still compiles cleanly.
+float l2_distance_avx512(const float* a, const float* b, std::size_t n) { return l2_distance_scalar(a, b, n); }
+float cosine_distance_avx512(const float* a, const float* b, std::size_t n) { return cosine_distance_scalar(a, b, n); }
+float inner_product_avx512(const float* a, const float* b, std::size_t n) { return inner_product_scalar(a, b, n); }
+
+#endif // __AVX512F__
 
 
 #if defined(__ARM_NEON)
