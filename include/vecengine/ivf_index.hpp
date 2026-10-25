@@ -207,6 +207,7 @@ private:
     bool fast_scan_ = false;
     bool rotate_ = false; // enable_pq(..., rotate) setting
     vector<float> rotation_; // dim_ x dim_, row-major (see src/rotation.hpp); empty until trained
+    vector<float> rotation_panels_; // rotation_ in the layout detail::rotate reads
 };
 
 } // namespace vecengine

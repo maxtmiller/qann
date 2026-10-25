@@ -5,6 +5,7 @@
 #include <cmath>
 #include <numeric>
 #include <stdexcept>
+#include <type_traits>
 
 #ifdef VECENGINE_USE_BLAS
 #ifdef __APPLE__
@@ -139,22 +140,46 @@ bool is_orthogonal(span<const float> r, size_t d) {
     return true;
 }
 
-void rotate(span<const float> r, const float* in, size_t n, size_t d, float* out) {
-    // plain loops rather than BLAS, so a vector rotates to the same floats on
-    // every platform (saved indexes hold rotated codes); k-outer order keeps
-    // the inner loop contiguous, and the compiler vectorizes it
+// Column panel widths: kPanel, then 8 for the remainder, then 1. A panel of
+// width w holds R[k][j..j+w) for k = 0..d-1, contiguous, so rotating streams
+// it in order with w running sums in registers.
+constexpr size_t kPanel = 32;
+
+template <typename F>
+static void for_each_panel(size_t d, F&& f) {
+    size_t j = 0;
+    for (; j + kPanel <= d; j += kPanel) f(std::integral_constant<size_t, kPanel>{}, j);
+    for (; j + 8 <= d; j += 8) f(std::integral_constant<size_t, 8>{}, j);
+    for (; j < d; ++j) f(std::integral_constant<size_t, 1>{}, j);
+}
+
+vector<float> pack_rotation(span<const float> r, size_t d) {
+    vector<float> panels(d * d);
+    float* p = panels.data();
+    for_each_panel(d, [&](auto w, size_t j) {
+        for (size_t k = 0; k < d; ++k, p += w) std::copy_n(r.data() + k * d + j, w, p);
+    });
+    return panels;
+}
+
+void rotate(span<const float> panels, const float* in, size_t n, size_t d, float* out) {
+    // each output is fma(x[k], R[k][j], sum) for k = 0..d-1 in order, spelled
+    // out with std::fma so no compiler can fuse, split or reorder it: a vector
+    // rotates to the same floats on every platform (saved indexes hold rotated codes)
     constexpr size_t kRows = 64;
     parallel_for((n + kRows - 1) / kRows, [&](size_t block) {
         const size_t end = std::min(n, (block + 1) * kRows);
         for (size_t i = block * kRows; i < end; ++i) {
             const float* x = in + i * d;
-            float* y = out + i * d;
-            std::fill(y, y + d, 0.0f);
-            for (size_t k = 0; k < d; ++k) {
-                const float xk = x[k];
-                const float* row = r.data() + k * d;
-                for (size_t j = 0; j < d; ++j) y[j] += xk * row[j];
-            }
+            const float* p = panels.data();
+            for_each_panel(d, [&](auto w, size_t j) {
+                float acc[decltype(w)::value] = {};
+                for (size_t k = 0; k < d; ++k, p += w) {
+                    const float xk = x[k];
+                    for (size_t c = 0; c < w; ++c) acc[c] = std::fma(xk, p[c], acc[c]);
+                }
+                std::copy_n(acc, w, out + i * d + j);
+            });
         }
     });
 }
