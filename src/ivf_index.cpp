@@ -82,9 +82,9 @@ void IVFIndex::enable_pq(size_t num_subspaces, size_t centroids_per_subspace, bo
 }
 
 vector<float> IVFIndex::rotated(span<const float> vecs, size_t n) const {
-    assert(rotation_.size() == dim_ * dim_ && vecs.size() == n * dim_);
+    assert(rotation_panels_.size() == dim_ * dim_ && vecs.size() == n * dim_);
     vector<float> out(n * dim_);
-    detail::rotate(rotation_, vecs.data(), n, dim_, out.data());
+    detail::rotate(rotation_panels_, vecs.data(), n, dim_, out.data());
     return out;
 }
 
@@ -559,6 +559,7 @@ void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_i
     vector<float> rot;
     if (rotate_) {
         rotation_ = detail::balanced_pca_rotation(vectors, num_vectors, dim_, pq_->num_subspaces());
+        rotation_panels_ = detail::pack_rotation(rotation_, dim_);
         rot = rotated(vectors, num_vectors);
         vectors = rot;
     }
@@ -669,8 +670,11 @@ std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version
             index->rotation_ = read_vec<float>(in, dim * dim);
             if (index->rotation_.size() != (rotate && trained ? dim * dim : 0))
                 throw std::runtime_error("corrupt file: IVFIndex rotation length mismatch");
-            if (!index->rotation_.empty() && !detail::is_orthogonal(index->rotation_, dim))
-                throw std::runtime_error("corrupt file: IVFIndex rotation is not orthogonal");
+            if (!index->rotation_.empty()) {
+                if (!detail::is_orthogonal(index->rotation_, dim))
+                    throw std::runtime_error("corrupt file: IVFIndex rotation is not orthogonal");
+                index->rotation_panels_ = detail::pack_rotation(index->rotation_, dim);
+            }
         }
     }
 

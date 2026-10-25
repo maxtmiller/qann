@@ -154,7 +154,7 @@ TEST_CASE("balanced_pca_rotation is orthogonal, decorrelates and balances subspa
     REQUIRE(is_orthogonal(r, d));
 
     std::vector<float> y(n * d);
-    rotate(r, x.data(), n, d, y.data());
+    rotate(pack_rotation(r, d), x.data(), n, d, y.data());
     std::vector<double> mean(d, 0), cov(d * d, 0);
     for (size_t i = 0; i < n; ++i)
         for (size_t j = 0; j < d; ++j) mean[j] += y[i * d + j] / n;
@@ -197,7 +197,7 @@ TEST_CASE("rotate multiplies rows by R and preserves distances", "[rotation]") {
     const auto x = rot_gaussian(n, d, 3);
     const auto r = random_orthogonal(d, 4);
     std::vector<float> y(n * d);
-    rotate(r, x.data(), n, d, y.data());
+    rotate(pack_rotation(r, d), x.data(), n, d, y.data());
 
     for (size_t i = 0; i < n; ++i)
         for (size_t j = 0; j < d; ++j) {
