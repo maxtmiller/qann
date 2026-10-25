@@ -210,7 +210,37 @@ vector<vector<Neighbor>> IVFIndex::query_batch_impl(span<const float> queries, s
 #endif
 }
 
+void IVFIndex::update_centroid_sqnorms() {
+    centroid_sqnorms_.resize(coarse_centroids_.size() / dim_);
+    for (size_t c = 0; c < centroid_sqnorms_.size(); ++c) {
+        const float* centroid = coarse_centroids_.data() + c * dim_;
+        centroid_sqnorms_[c] = inner_product(centroid, centroid, dim_);
+    }
+}
+
 vector<IVFIndex::Probe> IVFIndex::coarse(span<const float> vec) const {
+    // Accelerate only: OpenBLAS's single-vector sgemv hasn't been measured against the loop
+#if defined(VECENGINE_USE_BLAS) && defined(__APPLE__)
+    if (dim_ >= kBlasCoarseMinDim) {
+        // One sgemv scores every centroid by ||c||^2 - 2 q.c (-q.c for InnerProduct),
+        // as coarse_batch does; the scores lose precision to cancellation, so the
+        // nprobe picked are recomputed exactly
+        const bool ip = metric_ == Metric::InnerProduct;
+        vector<float> score = ip ? vector<float>(nlist_, 0.0f) : centroid_sqnorms_;
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, static_cast<int>(nlist_), static_cast<int>(dim_), ip ? -1.0f : -2.0f,
+                    coarse_centroids_.data(), static_cast<int>(dim_), vec.data(), 1, 1.0f, score.data(), 1);
+        vector<pair<float, uint16_t>> scored(nlist_);
+        for (size_t c = 0; c < nlist_; ++c) scored[c] = {score[c], static_cast<uint16_t>(c)};
+        std::nth_element(scored.begin(), scored.begin() + (nprobe_ - 1), scored.end());
+        vector<Probe> probes(nprobe_);
+        for (size_t j = 0; j < nprobe_; ++j) {
+            const uint16_t list = scored[j].second;
+            probes[j] = {exact_score(vec.data(), coarse_centroids_.data() + list * dim_, dim_), list};
+        }
+        std::sort(probes.begin(), probes.end());
+        return probes;
+    }
+#endif
     // find the closest nprobe coarse centroids
     std::priority_queue<pair<float, uint16_t>, vector<pair<float, uint16_t>>, std::less<pair<float, uint16_t>>> maxCentroidHeap;
     for (size_t i = 0; i < nlist_; ++i) {
@@ -247,13 +277,7 @@ vector<IVFIndex::Probe> IVFIndex::coarse_all(span<const float> vec) const {
 
 #ifdef VECENGINE_USE_BLAS
 void IVFIndex::coarse_batch(const float* queries, size_t n, Probe* out) const {
-    vector<float> norms(nlist_);
-    for (size_t c = 0; c < nlist_; ++c) {
-        const float* centroid = coarse_centroids_.data() + c * dim_;
-        float sum = 0.0f;
-        for (size_t d = 0; d < dim_; ++d) sum += centroid[d] * centroid[d];
-        norms[c] = sum;
-    }
+    const vector<float>& norms = centroid_sqnorms_;
 
     // dots[i * nlist_ + c] = q_i . c for the whole block in one call
     vector<float> dots(n * nlist_);
@@ -542,6 +566,7 @@ void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_i
     // run kmeans
     auto res = vecengine::detail::kmeans(vectors.data(), num_vectors, dim_, dim_, nlist_, max_iters, seed);
     coarse_centroids_ = std::move(res.centroids);
+    update_centroid_sqnorms();
 
     // calculate residuals and run kmeans again on each subspace
     const vector<uint32_t>& assignments = res.assignments;
@@ -619,6 +644,7 @@ std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version
 
     auto coarse_centroids = read_vec<float>(in, n_list * dim);
     index->coarse_centroids_ = std::move(coarse_centroids);
+    index->update_centroid_sqnorms();
 
     if (pq_distance > static_cast<uint8_t>(PQDistance::SDC)) throw std::runtime_error("corrupt file: invalid IVFIndex shape");
     if (!trained && n_total > 0) throw std::runtime_error("corrupt file: invalid IVFIndex shape");
