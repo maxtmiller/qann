@@ -219,7 +219,8 @@ void IVFIndex::update_centroid_sqnorms() {
 }
 
 vector<IVFIndex::Probe> IVFIndex::coarse(span<const float> vec) const {
-#ifdef VECENGINE_USE_BLAS
+    // Accelerate only: OpenBLAS's single-vector sgemv hasn't been measured against the loop
+#if defined(VECENGINE_USE_BLAS) && defined(__APPLE__)
     if (dim_ >= kBlasCoarseMinDim) {
         // One sgemv scores every centroid by ||c||^2 - 2 q.c (-q.c for InnerProduct),
         // as coarse_batch does; the scores lose precision to cancellation, so the

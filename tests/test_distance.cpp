@@ -760,7 +760,7 @@ TEST_CASE("IVFIndex: batched coarse search matches query() in every mode", "[ivf
 }
 
 TEST_CASE("IVFIndex: single-query coarse step picks the nearest lists at high dimensions", "[ivf][coarse]") {
-    // From kBlasCoarseMinDim (256) up, BLAS builds rank a single query's centroids
+    // From kBlasCoarseMinDim (256) up, Accelerate builds rank a single query's centroids
     // with one sgemv. A filtered query allowing every id ranks them exactly
     // (coarse_all), so both must probe the same lists and return the same results.
     const size_t dim = 384, n = 4000, nq = 50, k = 10;

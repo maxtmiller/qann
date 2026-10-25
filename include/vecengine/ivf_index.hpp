@@ -185,7 +185,7 @@ private:
     vector<Neighbor> scan(span<const float> vec, span<Probe> probes, size_t k, const detail::SlotFilter* filter) const;
 
     static constexpr size_t kPrecomputedMaxBytes = size_t{256} << 20;
-    // With BLAS, a single query's coarse step uses one sgemv from this dimension up;
+    // With Accelerate, a single query's coarse step uses one sgemv from this dimension up;
     // below it the call's fixed cost outweighs the gain (measured on #62).
     static constexpr size_t kBlasCoarseMinDim = 256;
 
