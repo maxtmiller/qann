@@ -72,8 +72,8 @@ void IVFIndex::enable_pq(size_t num_subspaces, size_t centroids_per_subspace, bo
     if (id_map_.slots() > 0 || trained_)
         throw std::logic_error("enable_pq must be called before train()/add()");
     if (sq_bits_) throw std::logic_error("enable_pq cannot be combined with enable_sq");
-    if (fast_scan && (centroids_per_subspace != 16 || num_subspaces % 2 != 0 || num_subspaces > 256))
-        throw std::invalid_argument("fast_scan needs 16 centroids per subspace and an even num_subspaces <= 256");
+    if (fast_scan && (centroids_per_subspace != 16 || num_subspaces % 2 != 0 || num_subspaces > detail::kFsMaxSubspaces))
+        throw std::invalid_argument("fast_scan needs 16 centroids per subspace and an even num_subspaces <= 1024");
     if (fast_scan && pq_distance_ == PQDistance::SDC)
         throw std::invalid_argument("cannot use SDC with fast-scan");
     fast_scan_= fast_scan;
@@ -658,7 +658,7 @@ std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version
         if (version >= 4) {
             const auto fast_scan = read_pod<uint8_t>(in);
             const size_t m = index->pq_->num_subspaces();
-            if (fast_scan > 1 || (fast_scan && (index->pq_->centroids_per_subspace() != 16 || m % 2 != 0 || m > 256 ||
+            if (fast_scan > 1 || (fast_scan && (index->pq_->centroids_per_subspace() != 16 || m % 2 != 0 || m > detail::kFsMaxSubspaces ||
                                                 pq_distance != static_cast<uint8_t>(PQDistance::ADC))))
                 throw std::runtime_error("corrupt file: invalid IVFIndex fast-scan settings");
             index->fast_scan_ = fast_scan;

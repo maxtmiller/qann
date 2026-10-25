@@ -38,6 +38,10 @@ inline uint8_t fs_get(const uint8_t* block, size_t pos, size_t s) noexcept {
 // cuts their widening adds by 4x; on SIFT1M it costs no recall after re-ranking.
 inline constexpr uint8_t kLutMax = 63;
 
+// Most subspaces fast-scan allows: kFsMaxSubspaces * kLutMax = 64,512 keeps
+// every sum within uint16_t.
+inline constexpr size_t kFsMaxSubspaces = 1024;
+
 // Rounds an m x 16 float ADC table to bytes: lut[s * 16 + j] =
 // round((table[s * 16 + j] - min_s) * scale), with min_s the row's minimum and
 // one scale for all rows chosen so the widest row spans 0..kLutMax. A distance is
@@ -50,9 +54,10 @@ void quantize_lut(const float* table, size_t m, uint8_t* lut, float& scale, floa
 void quantize_lut_scalar(const float* table, size_t m, uint8_t* lut, float& scale, float& offset);
 
 // Sums of the lut entries picked by each of the block's 32 vectors: out[v] =
-// sum over s of lut[s * 16 + code(v, s)]. m <= 256 keeps the sums within
-// uint16_t. Uses NEON or SSSE3 when the build has them, which need every entry
-// <= kLutMax (quantize_lut guarantees it); the scalar version takes any table.
+// sum over s of lut[s * 16 + code(v, s)]. Needs every entry <= kLutMax
+// (quantize_lut guarantees it) and m <= kFsMaxSubspaces, so the SIMD versions
+// can add bytes and no sum overflows uint16_t. Uses NEON or SSSE3 when the
+// build has them.
 void fast_scan_block(const uint8_t* lut, const uint8_t* block, size_t m, uint16_t* out);
 
 // Portable version of fast_scan_block; the SIMD versions must match it exactly.

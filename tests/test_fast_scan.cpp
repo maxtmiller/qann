@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <random>
+#include <utility>
 #include <vector>
 
 using namespace vecengine::detail;
@@ -58,7 +59,7 @@ TEST_CASE("fast_scan_block_scalar sums the picked lut entries", "[fastscan]") {
 }
 
 TEST_CASE("fast_scan_block matches the scalar version", "[fastscan]") {
-    const size_t m = GENERATE(2, 16, 64, 256);
+    const size_t m = GENERATE(2, 16, 64, 256, 480, 1024);
     CAPTURE(m);
     std::mt19937 rng(static_cast<unsigned>(m));
     std::vector<uint8_t> lut(m * 16), block(fs_block_bytes(m));
@@ -71,6 +72,8 @@ TEST_CASE("fast_scan_block matches the scalar version", "[fastscan]") {
     fast_scan_block(lut.data(), block.data(), m, simd.data());
     fast_scan_block_scalar(lut.data(), block.data(), m, scalar.data());
     REQUIRE(simd == scalar);
+    if (lut[0] == kLutMax && lut[1] == kLutMax)
+        for (uint16_t x : simd) REQUIRE(x == m * kLutMax);   // no uint16_t wraparound
 }
 
 TEST_CASE("quantize_lut keeps distances within its error bound", "[fastscan]") {
@@ -203,7 +206,10 @@ static void require_identical(const Results& a, const Results& b) {
 }
 
 TEST_CASE("fast-scan matches the float ADC scan on the same codes", "[fastscan][ivf]") {
-    const size_t dim = 32, m = 16, n = 5000, nq = 200, k = 10;
+    const auto [dim, m] = GENERATE(std::pair<size_t, size_t>{32, 16}, std::pair<size_t, size_t>{960, 480},
+                                   std::pair<size_t, size_t>{1024, 1024});
+    const size_t n = 5000, nq = 200, k = 10;
+    CAPTURE(dim, m);
     auto data = fs_random(n, dim, 1);
     auto queries = fs_random(nq, dim, 2);
     const bool precomputed = GENERATE(true, false);
@@ -234,6 +240,10 @@ TEST_CASE("fast-scan matches the float ADC scan on the same codes", "[fastscan][
     flat.add_batch(data, n);
     const auto truth = flat.query_batch(queries, nq, k);
     REQUIRE(overlap(rf, truth) >= overlap(rr, truth) - 0.02);
+
+    std::stringstream s;
+    fast->save(s);
+    require_identical(vecengine::load_index(s)->query_batch(queries, nq, k), rf);
 }
 
 TEST_CASE("fast-scan: add and add_batch store the same codes", "[fastscan][ivf]") {
@@ -320,6 +330,10 @@ TEST_CASE("fast-scan settings are validated", "[fastscan][ivf]") {
     REQUIRE_THROWS_AS(index.enable_pq(16, 256, true), std::invalid_argument);   // needs 16 centroids
     IVFIndex odd(30, 100);
     REQUIRE_THROWS_AS(odd.enable_pq(15, 16, true), std::invalid_argument);      // needs an even m
+    IVFIndex wide(2052, 100);
+    REQUIRE_THROWS_AS(wide.enable_pq(1026, 16, true), std::invalid_argument);   // at most kFsMaxSubspaces
+    IVFIndex widest(1024, 100);
+    widest.enable_pq(1024, 16, true);
 
     index.enable_pq(16, 16, true);
     REQUIRE_THROWS_AS(index.set_pq_distance(PQDistance::SDC), std::invalid_argument);
@@ -331,7 +345,7 @@ TEST_CASE("fast-scan settings are validated", "[fastscan][ivf]") {
 }
 
 TEST_CASE("quantize_lut matches the scalar version exactly", "[fastscan]") {
-    const size_t m = GENERATE(2, 16, 64, 256);
+    const size_t m = GENERATE(2, 16, 64, 256, 480, 1024);
     CAPTURE(m);
     std::mt19937 rng(static_cast<unsigned>(m) + 100);
     std::uniform_real_distribution<float> d(-3000.0f, 3000.0f);
@@ -354,7 +368,7 @@ TEST_CASE("quantize_lut matches the scalar version exactly", "[fastscan]") {
 }
 
 TEST_CASE("fast_scan_block_mask flags exactly the sums below the limit", "[fastscan]") {
-    const size_t m = GENERATE(2, 16, 64, 256);
+    const size_t m = GENERATE(2, 16, 64, 256, 480, 1024);
     CAPTURE(m);
     std::mt19937 rng(static_cast<unsigned>(m) + 200);
     std::vector<uint8_t> lut(m * 16), block(fs_block_bytes(m));
