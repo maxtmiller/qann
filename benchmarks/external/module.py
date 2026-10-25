@@ -6,8 +6,12 @@ from ..base.module import BaseANN
 
 METRICS = {
     "euclidean": qann.Metric.L2,
-    "angular": qann.Metric.Cosine,
-    "cosine": qann.Metric.Cosine,
+    # Angular and cosine data is normalized here and searched by L2, which ranks unit vectors
+    # like cosine. qann.Metric.Cosine does the same internally but rejects zero vectors, and
+    # nytimes-256-angular has 239; here they stay zero, as in the hnswlib and faiss adapters
+    # (see _metric_for for how they are scored).
+    "angular": qann.Metric.L2,
+    "cosine": qann.Metric.L2,
     # VIBE's "normalized" datasets are unit length, so L2 ranks like cosine without rescaling.
     "normalized": qann.Metric.L2,
     "ip": qann.Metric.InnerProduct,
@@ -19,18 +23,29 @@ class _Qann(BaseANN):
         if metric not in METRICS:
             raise NotImplementedError(f"qann does not support metric {metric!r}")
         self.metric = METRICS[metric]
+        self.normalize = metric in ("angular", "cosine")
         self.pad = 0
+
+    def _metric_for(self, X):
+        # After normalizing, a zero vector is at L2 distance 1 from every query, as if its
+        # cosine were 0.5, so it would outrank true neighbors below that. Inner product gives
+        # it 0, cosine's value, and ranks unit vectors by cosine too; only used when needed so
+        # other datasets keep the L2 path.
+        if self.normalize and not np.all(np.any(X != 0, axis=1)):
+            return qann.Metric.InnerProduct
+        return self.metric
 
     def _prep(self, X):
         X = np.ascontiguousarray(X, dtype=np.float32)
+        if self.normalize:
+            norms = np.linalg.norm(X, axis=1, keepdims=True)
+            X = np.divide(X, norms, out=np.zeros_like(X), where=norms > 0)
         if self.pad:
             X = np.pad(X, ((0, 0), (0, self.pad)))
         return X
 
     def query(self, v, n):
-        if self.pad:
-            v = np.pad(v, (0, self.pad))
-        ids, _ = self.index.query(np.asarray(v, dtype=np.float32), n)
+        ids, _ = self.index.query(self._prep(np.asarray(v).reshape(1, -1))[0], n)
         return ids[ids >= 0]
 
     def batch_query(self, X, n):
@@ -48,6 +63,7 @@ class QannHNSW(_Qann):
     def fit(self, X):
         qann.set_num_threads(1)
         X = self._prep(X)
+        self.metric = self._metric_for(X)
         hnsw = qann.HNSWIndex(X.shape[1], M=self.M, ef_construction=self.ef_construction, metric=self.metric, seed=1)
         if self.sq_bits:
             hnsw.enable_sq(self.sq_bits)
@@ -89,6 +105,7 @@ class QannIVFFastScan(_Qann):
         # subspace divide evenly (glove-25 padded to 28 could only split into 4 or 14 subspaces).
         self.pad = -X.shape[1] % 8
         X = self._prep(X)
+        self.metric = self._metric_for(X)
         dim = X.shape[1]
         self.m = _pq_subspaces(dim, self.dims_per_subspace)
         # qann needs 100 <= nlist <= training vectors; small datasets get fewer clusters.

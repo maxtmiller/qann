@@ -15,6 +15,8 @@
 #                             checkout (default: qann==<version in pyproject.toml>). qann is always
 #                             compiled from source for the machine's CPU, as hnswlib is.
 #   --parallelism N           indexes benchmarked at once (default: min(cores - 1, RAM GB / 16))
+#   --timeout SECONDS         ann-benchmarks' limit per index, build and queries together (default
+#                             21600; its own default of 7200 cut off qann-hnsw builds on gist-960)
 #   --batch                   ann-benchmarks batch mode (all queries at once, all cores)
 #   --workdir DIR             where repos, images, datasets and results go (default ~/qann-bench)
 #
@@ -35,6 +37,7 @@ vibe_datasets=agnews-mxbai-1024-euclidean,arxiv-nomic-768-normalized,glove-200-c
 compare=hnswlib,faiss
 qann_spec="qann==$(grep -m1 '^version' "$REPO/pyproject.toml" | cut -d'"' -f2)"
 parallelism=""
+timeout=21600
 batch=""
 workdir="$HOME/qann-bench"
 setup=""
@@ -47,10 +50,11 @@ while [[ $# -gt 0 ]]; do
     --compare) compare="$2"; shift 2 ;;
     --qann) qann_spec="$2"; shift 2 ;;
     --parallelism) parallelism="$2"; shift 2 ;;
+    --timeout) timeout="$2"; shift 2 ;;
     --batch) batch="--batch"; shift ;;
     --workdir) workdir="$2"; shift 2 ;;
     --setup) setup=1; shift ;;
-    -h | --help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h | --help) sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -162,7 +166,7 @@ run_ann() {
     mkdir -p "$workdir/out/ann-benchmarks"
     for ds in ${ann_datasets//,/ }; do
         log "ann-benchmarks: $ds"
-        venv/bin/python run.py --dataset "$ds" --parallelism "$parallelism" $batch
+        venv/bin/python run.py --dataset "$ds" --parallelism "$parallelism" --timeout "$timeout" $batch
         # Containers write results as root, and plot.py opens them read-write to cache metrics.
         docker run --rm --entrypoint chown -v "$ab/results:/results" ann-benchmarks \
             -R "$(id -u):$(id -g)" /results
