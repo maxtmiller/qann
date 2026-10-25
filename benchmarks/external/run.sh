@@ -154,6 +154,10 @@ run_ann() {
         printf 'FROM ann-benchmarks\nRUN pip install --no-cache-dir faiss-cpu==1.14.3\n' \
             >"ann_benchmarks/algorithms/$lib/Dockerfile"
     done
+    # Upstream's faiss query returns faiss's -1 padding when fewer than k vectors are found
+    # (a small probed list, or a zero query normalized to NaN), and ann-benchmarks then
+    # rejects the whole index for duplicate ids. Drop the padding, as the batch path does.
+    sed -i 's/^        return I\[0\]$/        return I[0][I[0] >= 0]/' ann_benchmarks/algorithms/faiss/module.py
 
     log "Building images: qann ${compare}"
     venv/bin/python install.py --algorithm qann
