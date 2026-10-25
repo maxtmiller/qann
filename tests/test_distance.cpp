@@ -759,6 +759,36 @@ TEST_CASE("IVFIndex: batched coarse search matches query() in every mode", "[ivf
     require_batch_matches_query(idx, queries, nq, k);
 }
 
+TEST_CASE("IVFIndex: single-query coarse step picks the nearest lists at high dimensions", "[ivf][coarse]") {
+    // From kBlasCoarseMinDim (256) up, BLAS builds rank a single query's centroids
+    // with one sgemv. A filtered query allowing every id ranks them exactly
+    // (coarse_all), so both must probe the same lists and return the same results.
+    const size_t dim = 384, n = 4000, nq = 50, k = 10;
+    auto data = random_vectors(n, dim, /*seed=*/71);
+    auto queries = random_vectors(nq, dim, /*seed=*/72);
+    vecengine::Metric metric = vecengine::Metric::L2;
+    SECTION("L2") {}
+    SECTION("cosine") { metric = vecengine::Metric::Cosine; }
+    SECTION("inner product") { metric = vecengine::Metric::InnerProduct; }
+
+    vecengine::IVFIndex idx(dim, 100, 8, false, metric);
+    idx.train(data, n, 10, /*seed=*/1);
+    idx.add_batch(data, n);
+    std::vector<int64_t> all(n);
+    for (size_t i = 0; i < n; ++i) all[i] = static_cast<int64_t>(i);
+
+    for (size_t q = 0; q < nq; ++q) {
+        const std::span<const float> vec(queries.data() + q * dim, dim);
+        const auto plain = idx.query(vec, k);
+        const auto filtered = idx.query(vec, k, all);
+        REQUIRE(plain.size() == filtered.size());
+        for (size_t i = 0; i < plain.size(); ++i) {
+            REQUIRE(plain[i].index == filtered[i].index);
+            REQUIRE(plain[i].distance == filtered[i].distance);
+        }
+    }
+}
+
 TEST_CASE("IVFIndex: query_batch handles k above the live count and empty batches", "[ivf][batch][coarse]") {
     const size_t dim = 8, n = 300;
     auto data = random_vectors(n, dim, /*seed=*/63);
