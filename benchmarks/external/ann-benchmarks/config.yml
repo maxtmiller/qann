@@ -28,5 +28,7 @@ float:
     name: qann-ivf-fastscan
     run_groups:
       base:
-        args: [[1024, 2048, 4096], [2, 4]]
+        # rotation costs a dim x dim product per query and only helps when dimensions
+        # are correlated across subspaces, so each dataset gets both
+        args: [[1024, 2048, 4096], [2, 4], [true, false]]
         query_args: [[1, 2, 4, 8, 16, 32, 64, 128, 256], [4, 8, 16]]

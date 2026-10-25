@@ -78,9 +78,9 @@ def _pq_subspaces(dim, dims_per_subspace):
 
 
 class QannIVFFastScan(_Qann):
-    def __init__(self, metric, nlist, dims_per_subspace):
+    def __init__(self, metric, nlist, dims_per_subspace, rotate=True):
         super().__init__(metric)
-        self.nlist, self.dims_per_subspace = nlist, dims_per_subspace
+        self.nlist, self.dims_per_subspace, self.rotate = nlist, dims_per_subspace, rotate
         self.nprobe, self.k_factor = None, None
 
     def fit(self, X):
@@ -94,7 +94,7 @@ class QannIVFFastScan(_Qann):
         # qann needs 100 <= nlist <= training vectors; small datasets get fewer clusters.
         self.nlist_used = min(self.nlist, max(100, len(X) // 39))
         self.ivf = qann.IVFIndex(dim, self.nlist_used, metric=self.metric)
-        self.ivf.enable_pq(self.m, fast_scan=True, rotate=True)
+        self.ivf.enable_pq(self.m, fast_scan=True, rotate=self.rotate)
         rng = np.random.default_rng(1)
         sample = X[rng.choice(len(X), min(len(X), 256 * self.nlist_used), replace=False)]
         self.ivf.train(sample, seed=1)
@@ -108,6 +108,6 @@ class QannIVFFastScan(_Qann):
 
     def __str__(self):
         return (
-            f"qann.IVFFastScan(nlist={self.nlist_used}, m={self.m}, "
+            f"qann.IVFFastScan(nlist={self.nlist_used}, m={self.m}, rotate={self.rotate}, "
             f"nprobe={self.nprobe}, k_factor={self.k_factor})"
         )

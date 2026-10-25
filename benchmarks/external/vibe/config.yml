@@ -39,6 +39,9 @@ float:
           args:
             nlist: [1024, 2048, 4096]
             dims_per_subspace: [2, 4]
+            # rotation costs a dim x dim product per query and only helps when dimensions
+            # are correlated across subspaces, so each dataset gets both
+            rotate: [true, false]
           query_args:
             nprobe: [1, 2, 4, 8, 16, 32, 64, 128, 256]
             k_factor: [4, 8, 16]
