@@ -14,7 +14,8 @@
 #   --qann SPEC               pip requirement, path to an sdist, or "local" to build an sdist of this
 #                             checkout (default: qann==<version in pyproject.toml>). qann is always
 #                             compiled from source for the machine's CPU, as hnswlib is.
-#   --parallelism N           indexes benchmarked at once (default: min(cores - 1, RAM GB / 16))
+#   --parallelism N           indexes benchmarked at once (default: min(physical cores - NUMA nodes,
+#                             RAM GB / 16); VIBE refuses more than that many)
 #   --timeout SECONDS         ann-benchmarks' limit per index, build and queries together (default
 #                             21600; its own default of 7200 cut off qann-hnsw builds on gist-960)
 #   --batch                   ann-benchmarks batch mode (all queries at once, all cores)
@@ -87,9 +88,11 @@ if [[ "$suite" != ann ]] && ! command -v singularity >/dev/null; then
 fi
 
 if [[ -z "$parallelism" ]]; then
-    cores=$(nproc)
+    # physical cores less one per NUMA node, which VIBE reserves and checks
+    # (nproc counts SMT threads, twice the cores on Oracle's OCPUs)
+    cores=$(( $(lscpu -p=Core,Socket | grep -v '^#' | sort -u | wc -l) - $(lscpu -p=Node | grep -v '^#' | sort -u | wc -l) ))
     mem_gb=$(awk '/MemTotal/ {print int($2 / 1048576)}' /proc/meminfo)
-    parallelism=$(( cores - 1 < mem_gb / 16 ? cores - 1 : mem_gb / 16 ))
+    parallelism=$(( cores < mem_gb / 16 ? cores : mem_gb / 16 ))
     (( parallelism >= 1 )) || parallelism=1
 fi
 [[ -n "$batch" ]] && parallelism=1

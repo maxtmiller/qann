@@ -88,8 +88,8 @@ class QannHNSW(_Qann):
 
 
 def _pq_subspaces(dim, dims_per_subspace):
-    # Fast-scan needs an even subspace count, at most 256, dividing dim.
-    target = min(256, dim // dims_per_subspace)
+    # Fast-scan needs an even subspace count, at most 1024, dividing dim.
+    target = min(1024, dim // dims_per_subspace)
     return max(m for m in range(2, target + 1, 2) if dim % m == 0)
 
 
