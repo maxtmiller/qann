@@ -36,10 +36,13 @@ vector<float> balanced_pca_rotation(span<const float> vecs, size_t n, size_t d, 
 // reject corrupt files; O(d^3).
 bool is_orthogonal(span<const float> r, size_t d);
 
-// out = in * R for n rows of d floats (in and out must not overlap), on
-// num_threads() threads in blocks of 64 rows (one block runs on the caller, so
-// a single query can rotate inside a parallel_for). Plain loops, not BLAS, so
-// results are the same on every platform.
-void rotate(span<const float> r, const float* in, size_t n, size_t d, float* out);
+// R (d x d, row-major) rearranged into the column panels rotate() reads.
+vector<float> pack_rotation(span<const float> r, size_t d);
+
+// out = in * R for n rows of d floats, with R given as pack_rotation(R, d) (in
+// and out must not overlap), on num_threads() threads in blocks of 64 rows
+// (one block runs on the caller, so a single query can rotate inside a
+// parallel_for). Plain loops, not BLAS, so results are the same on every platform.
+void rotate(span<const float> panels, const float* in, size_t n, size_t d, float* out);
 
 } // namespace vecengine::detail

@@ -149,6 +149,9 @@ private:
     // the size cap. Called by train(), load_body() and set_precomputed_tables().
     void build_precomputed();
 
+    // Fills centroid_sqnorms_ from coarse_centroids_. Called by train() and load_body().
+    void update_centroid_sqnorms();
+
     // One probed list: its exact coarse distance ||q - c||^2 (term A of the
     // precomputed tables), or -(q . c) for InnerProduct, and its cluster id.
     // InnerProduct still clusters and assigns vectors by L2 k-means and only
@@ -182,6 +185,9 @@ private:
     vector<Neighbor> scan(span<const float> vec, span<Probe> probes, size_t k, const detail::SlotFilter* filter) const;
 
     static constexpr size_t kPrecomputedMaxBytes = size_t{256} << 20;
+    // With Accelerate, a single query's coarse step uses one sgemv from this dimension up;
+    // below it the call's fixed cost outweighs the gain (measured on #62).
+    static constexpr size_t kBlasCoarseMinDim = 256;
 
     size_t dim_; // dimension of each vector
     size_t nlist_; // num of coarse centroids
@@ -189,6 +195,7 @@ private:
     bool trained_ = false; // was function train run
 
     vector<float> coarse_centroids_; // coarse centroid vectors
+    vector<float> centroid_sqnorms_; // |c|^2 per coarse centroid, for the BLAS coarse steps
     std::unordered_map<uint16_t,InvertedList> data_; // map of coarse centroid ID to inverted list
     std::unique_ptr<PQCodebook> pq_; // pointer to PQ LUT if using PQ
     int sq_bits_ = 0; // 0 (no SQ), 4 or 8
@@ -200,6 +207,7 @@ private:
     bool fast_scan_ = false;
     bool rotate_ = false; // enable_pq(..., rotate) setting
     vector<float> rotation_; // dim_ x dim_, row-major (see src/rotation.hpp); empty until trained
+    vector<float> rotation_panels_; // rotation_ in the layout detail::rotate reads
 };
 
 } // namespace vecengine

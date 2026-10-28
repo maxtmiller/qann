@@ -468,7 +468,7 @@ NB_MODULE(qann, m) {
              "Enable PQ compression of residuals. Call before train()/add(). centroids_per_subspace defaults to "
              "256, or 16 with fast_scan=True, which stores 4-bit codes and scores 32 vectors per SIMD instruction "
              "(much faster; distances are approximate, so pair it with a RefineIndex). fast_scan needs an even "
-             "num_subspaces <= 256 and ADC. rotate=True makes train() also learn a rotation (PCA, with the "
+             "num_subspaces <= 1024 and ADC. rotate=True makes train() also learn a rotation (PCA, with the "
              "variance spread evenly over the subspaces) applied to every vector first: lower PQ error when "
              "dimensions are correlated (e.g. SIFT), no effect on near-isotropic embeddings")
         .def_prop_ro("pq_rotate",
