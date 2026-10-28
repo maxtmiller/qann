@@ -45,7 +45,7 @@ void quantize_lut_scalar(const float* table, size_t m, uint8_t* lut, float& scal
 // a 16-entry row are 4 loads and two reductions, and vcvtaq rounds to nearest
 // with ties away from zero exactly like std::lround, so the bytes are identical.
 static void quantize_lut_neon(const float* table, size_t m, uint8_t* lut, float& scale, float& offset) {
-    float row_min[256];
+    float row_min[kFsMaxSubspaces];
     float widest = 0.0f;
     offset = 0.0f;
     for (size_t i = 0; i < m; ++i) {
@@ -76,7 +76,7 @@ static void quantize_lut_neon(const float* table, size_t m, uint8_t* lut, float&
 
 void quantize_lut(const float* table, size_t m, uint8_t* lut, float& scale, float& offset) {
 #if defined(__ARM_NEON)
-    if (m <= 256) {   // row_min is on the stack; fast-scan never exceeds 256
+    if (m <= kFsMaxSubspaces) {   // row_min is on the stack
         quantize_lut_neon(table, m, lut, scale, offset);
         return;
     }

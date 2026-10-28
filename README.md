@@ -102,7 +102,7 @@ refine.add(x)
 
 - On SIFT1M with re-ranking (`k_factor=16`), 64 subspaces with fast-scan match 32 regular subspaces (recall@10 0.931 at `nprobe=16`, 0.995 at `nprobe=64`) and beat 16 regular ones, while scanning several times faster.
 - Without a `RefineIndex`, recall is lower than regular PQ at the same memory, and the returned distances are approximate: the lookup tables are rounded to 6 bits.
-- `num_subspaces` must be even and at most 256, `centroids_per_subspace` must be 16 (the default with `fast_scan`), and `pq_distance` stays `ADC`: setting `SDC` raises `ValueError`.
+- `num_subspaces` must be even and at most 1024, `centroids_per_subspace` must be 16 (the default with `fast_scan`), and `pq_distance` stays `ADC`: setting `SDC` raises `ValueError`.
 
 #### Rotation
 
