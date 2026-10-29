@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <cassert>
-#include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
@@ -97,6 +96,11 @@ Expr Expr::join(Op op, vector<Expr> children) {
     return Expr(std::make_shared<const Node>(Node{op, {}, {}, std::move(flat), below + 1}));
 }
 
+Expr Expr::between(std::string field, Value lo, Value hi) {
+    Expr ge = compare(field, Op::Ge, std::move(lo));
+    return ge & compare(std::move(field), Op::Le, std::move(hi));
+}
+
 Expr operator&(const Expr& a, const Expr& b) { return Expr::join(Expr::Op::And, {a, b}); }
 
 Expr operator|(const Expr& a, const Expr& b) { return Expr::join(Expr::Op::Or, {a, b}); }
@@ -133,16 +137,24 @@ private:
     }
 
     void skip_space() {
-        while (pos_ < sql_.size() && std::isspace(static_cast<unsigned char>(sql_[pos_]))) ++pos_;
+        while (pos_ < sql_.size() && std::string_view(" \t\n\r\f\v").find(sql_[pos_]) != std::string_view::npos) ++pos_;
     }
 
-    static bool word_char(char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '.'; }
+    // ASCII only, not <cctype>: its answers for bytes >= 0x80 depend on the locale
+    static bool is_alpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
+    static bool is_digit(char c) { return c >= '0' && c <= '9'; }
+    static bool is_ascii(char c) { return static_cast<unsigned char>(c) < 0x80; }
+    static char upper(char c) { return c >= 'a' && c <= 'z' ? static_cast<char>(c - 'a' + 'A') : c; }
+    static bool word_char(char c) { return is_alpha(c) || is_digit(c) || c == '_' || c == '.'; }
 
     std::string peek_word() {
         skip_space();
         size_t end = pos_;
         while (end < sql_.size() && word_char(sql_[end])) ++end;
-        if (end == pos_ && pos_ < sql_.size()) end = pos_ + 1;
+        if (end == pos_ && pos_ < sql_.size()) {
+            ++end;
+            while (end < sql_.size() && (static_cast<unsigned char>(sql_[end]) & 0xC0) == 0x80) ++end;  // rest of a UTF-8 character
+        }
         return std::string(sql_.substr(pos_, end - pos_));
     }
 
@@ -151,7 +163,7 @@ private:
         skip_space();
         if (sql_.size() - pos_ < kw.size()) return false;
         for (size_t i = 0; i < kw.size(); ++i)
-            if (std::toupper(static_cast<unsigned char>(sql_[pos_ + i])) != kw[i]) return false;
+            if (upper(sql_[pos_ + i]) != kw[i]) return false;
         if (pos_ + kw.size() < sql_.size() && word_char(sql_[pos_ + kw.size()])) return false;
         pos_ += kw.size();
         return true;
@@ -166,7 +178,7 @@ private:
 
     static bool is_keyword(const std::string& w) {
         std::string u = w;
-        for (char& c : u) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        for (char& c : u) c = upper(c);
         return u == "AND" || u == "OR" || u == "NOT" || u == "IN" || u == "IS" || u == "NULL" || u == "BETWEEN";
     }
 
@@ -208,8 +220,12 @@ private:
         skip_space();
         if (pos_ < sql_.size() && sql_[pos_] == '"') return quoted('"');
         const size_t start = pos_;
-        if (pos_ < sql_.size() && (std::isalpha(static_cast<unsigned char>(sql_[pos_])) || sql_[pos_] == '_'))
+        if (pos_ < sql_.size() && (is_alpha(sql_[pos_]) || sql_[pos_] == '_'))
             while (pos_ < sql_.size() && word_char(sql_[pos_])) ++pos_;
+        if (pos_ < sql_.size() && !is_ascii(sql_[pos_])) {
+            pos_ = start;
+            fail("a column name with non-ASCII characters needs double quotes");
+        }
         std::string w(sql_.substr(start, pos_ - start));
         if (w.empty() || is_keyword(w)) {
             pos_ = start;
@@ -268,26 +284,33 @@ private:
         if (sql_[i] == '-' || sql_[i] == '+') ++i;
         const size_t digits = i;
         bool is_float = false;
-        while (i < sql_.size() && std::isdigit(static_cast<unsigned char>(sql_[i]))) ++i;
+        while (i < sql_.size() && is_digit(sql_[i])) ++i;
         if (i < sql_.size() && sql_[i] == '.') {
             is_float = true;
             ++i;
-            while (i < sql_.size() && std::isdigit(static_cast<unsigned char>(sql_[i]))) ++i;
+            while (i < sql_.size() && is_digit(sql_[i])) ++i;
         }
         if (i == digits || (i == digits + 1 && is_float)) fail("expected a value");
         if (i < sql_.size() && (sql_[i] == 'e' || sql_[i] == 'E')) {
             size_t j = i + 1;
             if (j < sql_.size() && (sql_[j] == '-' || sql_[j] == '+')) ++j;
-            if (j < sql_.size() && std::isdigit(static_cast<unsigned char>(sql_[j]))) {
+            if (j < sql_.size() && is_digit(sql_[j])) {
                 is_float = true;
                 i = j;
-                while (i < sql_.size() && std::isdigit(static_cast<unsigned char>(sql_[i]))) ++i;
+                while (i < sql_.size() && is_digit(sql_[i])) ++i;
             }
         }
         if (i < sql_.size() && word_char(sql_[i])) fail("expected a value");
         const std::string text(sql_.substr(start, i - start));
         pos_ = i;
-        if (is_float) return std::strtod(text.c_str(), nullptr);
+        if (is_float) {
+            const double d = std::strtod(text.c_str(), nullptr);
+            if (std::isinf(d)) {
+                pos_ = start;
+                fail("number out of range");
+            }
+            return d;
+        }
         errno = 0;
         const long long v = std::strtoll(text.c_str(), nullptr, 10);
         if (errno == ERANGE) {
@@ -331,7 +354,7 @@ private:
             if (!keyword("AND")) fail("expected AND");
             Expr::Value hi = value();
             if (neg) return Expr::compare(field, Expr::Op::Lt, std::move(lo)) | Expr::compare(field, Expr::Op::Gt, std::move(hi));
-            return Expr::compare(field, Expr::Op::Ge, std::move(lo)) & Expr::compare(field, Expr::Op::Le, std::move(hi));
+            return Expr::between(field, std::move(lo), std::move(hi));
         }
         if (not_kw) fail("expected IN or BETWEEN");
         Expr::Op op;

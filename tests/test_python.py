@@ -1011,6 +1011,22 @@ def test_metadata_sql_where(data):
     with pytest.raises(ValueError):    # unknown column, found when evaluated
         index.query(queries[0], 10, where="size = 1")
 
+    # NumPy scalars work as values; bools compare as 0 / 1
+    same(("price < ? AND color = ?", [np.int32(30), np.str_("red")]), "price < 30 AND color = 'red'")
+    same(("price < ?", [np.float32(2.5)]), "price < 2.5")
+    same(f("price") < np.int64(30), "price < 30")
+    same(("price = ?", [True]), "price = 1")
+    same(("price < ?", (30,)), "price < 30")    # params may be any sequence
+    with pytest.raises(TypeError):
+        qann.where("price = ?", [None])
+    for bad in (("price < 5",), ("price < ?", [5], 1), 5, b"price < 5"):
+        with pytest.raises(TypeError):
+            index.query(queries[0], 10, where=bad)
+    with pytest.raises(ValueError, match="number out of range"):
+        qann.where("price < 1e400")
+    with pytest.raises(ValueError, match="non-ASCII characters needs double quotes"):
+        qann.where("prïce < 5")
+
     # deep nesting raises instead of overflowing the stack; long chains are fine
     with pytest.raises(ValueError, match="nested more than 256 levels"):
         index.query(queries[0], 10, where="(" * 100000 + "price = 1" + ")" * 100000)

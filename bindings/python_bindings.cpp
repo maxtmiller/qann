@@ -419,8 +419,7 @@ NB_MODULE(qann, m) {
         .def("is_null", [](const PyField& f) { return vecengine::Expr::is_null(f.name); },
              "Matches rows with no value in this column")
         .def("between", [](const PyField& f, vecengine::Expr::Value lo, vecengine::Expr::Value hi) {
-                 return field_compare(f, vecengine::Expr::Op::Ge, std::move(lo)) &
-                        field_compare(f, vecengine::Expr::Op::Le, std::move(hi));
+                 return vecengine::Expr::between(f.name, std::move(lo), std::move(hi));
              },
              nb::arg("lo"), nb::arg("hi"),
              "Matches rows with lo <= value <= hi, like SQL's BETWEEN: (field >= lo) & (field <= hi)")

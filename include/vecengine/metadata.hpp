@@ -66,12 +66,16 @@ public:
     // field has no value.
     static Expr is_null(std::string field);
 
+    // lo <= field <= hi, as (field >= lo) & (field <= hi); SQL's BETWEEN.
+    static Expr between(std::string field, Value lo, Value hi);
+
     // A SQL WHERE clause (issue #46), e.g. "category = 'shoes' AND price < 50":
     // comparisons (= != <> < <= > >=), [NOT] IN (...), IS [NOT] NULL,
     // [NOT] BETWEEN x AND y, combined with AND, OR, NOT and parentheses, with
     // SQL's precedence. Keywords are case-insensitive; strings are '...' ('' is
-    // a quote) and names that clash with keywords are "...". NOT keeps SQL's
-    // meaning: NOT (price < 50) excludes rows with no price, unlike ~.
+    // a quote) and names that clash with keywords or use non-ASCII characters
+    // are "...". NOT keeps SQL's meaning: NOT (price < 50) excludes rows with
+    // no price, unlike ~. Numbers that overflow (1e400) are an error.
     // Placeholders take values from params, bound after parsing so they can't
     // change the filter's structure: ? in order from the list, or :name from
     // the map. Throws std::invalid_argument naming the column of an error.

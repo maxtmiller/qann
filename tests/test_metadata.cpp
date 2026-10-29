@@ -546,6 +546,16 @@ TEST_CASE("Expr::parse builds the same tree as the operator form", "[metadata][p
         REQUIRE(std::holds_alternative<double>(Expr::parse("x = 42.0").values()[0]));
         REQUIRE(std::holds_alternative<double>(Expr::parse("x = 1e3").values()[0]));
         REQUIRE(std::get<int64_t>(Expr::parse("x = -9223372036854775808").values()[0]) == INT64_MIN);
+        same("x = .5", f("x", Op::Eq, 0.5));
+        same("x = -.5", f("x", Op::Eq, -0.5));
+        same("x = 1.", f("x", Op::Eq, 1.0));
+        same("x = 1e-400", f("x", Op::Eq, 0.0));    // underflow rounds to zero
+        same("\"café\" = 'thé'", f("café", Op::Eq, s("thé")));
+    }
+
+    SECTION("BETWEEN is Expr::between") {
+        same("x BETWEEN 1 AND 2.5", Expr::between("x", int64_t{1}, 2.5));
+        REQUIRE(Expr::between("x", int64_t{1}, int64_t{2}).to_string() == "((x >= 1) & (x <= 2))");
     }
 }
 
@@ -591,6 +601,13 @@ TEST_CASE("Expr::parse reports where a filter is wrong", "[metadata][parse]") {
     REQUIRE_THROWS_WITH(Expr::parse("a = x"), "expected a value at column 5");
     REQUIRE_THROWS_WITH(Expr::parse("a = 1abc"), "expected a value at column 5");
     REQUIRE_THROWS_WITH(Expr::parse("a = 99999999999999999999"), "integer out of range at column 5");
+    REQUIRE_THROWS_WITH(Expr::parse("a = -9223372036854775809"), "integer out of range at column 5");
+    REQUIRE_THROWS_WITH(Expr::parse("a = 1e400"), "number out of range at column 5");
+    REQUIRE_THROWS_WITH(Expr::parse("a IN (1, -1e400)"), "number out of range at column 10");
+    REQUIRE_THROWS_WITH(Expr::parse("a IN ()"), "expected a value at column 7");
+    REQUIRE_THROWS_WITH(Expr::parse("café = 1"), "a column name with non-ASCII characters needs double quotes at column 1");
+    REQUIRE_THROWS_WITH(Expr::parse("a = 1 AND é = 1"), "a column name with non-ASCII characters needs double quotes at column 11");
+    REQUIRE_THROWS_WITH(Expr::parse("a = 1 é"), "unexpected 'é' at column 7");
     REQUIRE_THROWS_AS(Expr::parse("a = 1 OR OR b = 2"), std::invalid_argument);
 }
 
