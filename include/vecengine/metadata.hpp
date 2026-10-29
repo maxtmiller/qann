@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <iosfwd>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -144,9 +145,18 @@ public:
     // passed. With no slots nothing changes.
     void update(const vector<uint32_t>& slots, const Metadata& md);
 
-    // A new column of this type, null for all `rows` slots. Throws
-    // std::invalid_argument on an empty name or one the store already has.
-    void add_column(std::string name, ColumnType type, size_t rows);
+    // check()'s rules for c as a column the store doesn't have yet, of n
+    // values that must fit `type`. Throws std::invalid_argument.
+    void check_new(const MetadataColumn& c, ColumnType type, size_t n) const;
+
+    // A new column of this type for all `rows` slots, each set to value, or
+    // null without one. Throws std::invalid_argument, changing nothing, on an
+    // empty or taken name or a value that doesn't fit the type.
+    void add_column(std::string name, ColumnType type, size_t rows, const std::optional<Expr::Value>& value = std::nullopt);
+
+    // Removes the column and its values. Throws std::invalid_argument if the
+    // store has no such column.
+    void drop_column(const std::string& name);
 
     // Appends n rows after the current `rows` (the index's slots before the
     // add). Requires check() to have passed. With n == 0 nothing changes, so

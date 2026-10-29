@@ -1133,6 +1133,66 @@ def test_metadata_none_and_update(tmp_path, data):
     assert refine.metadata_schema["rank"] == "float"
 
 
+def test_metadata_columns_defaults_values_and_drop(tmp_path, data):
+    f = qann.field
+    index = qann.FlatIndex(32, custom_ids=True)
+    index.add(data[:5], [1, 2, 3, 4, 5], metadata={"price": [0.5, 1.5, 2.5, 3.5, 4.5]})
+    q = data[0]
+
+    def match(where):
+        return sorted(index.query(q, 10, where=where)[0].tolist())
+
+    # whole-number prices are ints to NumPy; they fit a float column
+    index.add(data[5:6], [6], metadata={"price": [10]})
+    index.update_metadata([1], {"price": np.array([20, ], dtype=np.int32)})
+    assert index.metadata_schema["price"] == "float"
+    assert match("price = 10") == [6] and match("price = 20.0") == [1]
+    index.add_metadata_column("year", "int")
+    with pytest.raises(ValueError, match="holds int values; got float"):
+        index.update_metadata([1], {"year": [2024.5]})
+
+    index.add_metadata_column("in_stock", "int", default=1)
+    assert match("in_stock = 1") == [1, 2, 3, 4, 5, 6]
+    index.add_metadata_column("label", "str", default="new")
+    index.add_metadata_column("score", "float", default=np.int64(2))
+    assert match("label = 'new' AND score = 2") == [1, 2, 3, 4, 5, 6]
+    with pytest.raises(ValueError, match="holds str|holds string"):
+        index.add_metadata_column("bad", "str", default=1)
+
+    index.add_metadata_column("tag", "str", ids=[4, 2], values=["d", None])
+    assert match("tag = 'd'") == [4]
+    assert match("tag IS NULL") == [1, 2, 3, 5, 6]
+    index.add_metadata_column("flags", "int", ids=[3], values=[None])    # all null is fine: the type is given
+
+    schema = dict(index.metadata_schema)
+    with pytest.raises(TypeError, match="not both"):
+        index.add_metadata_column("x", "int", default=0, ids=[1], values=[1])
+    with pytest.raises(TypeError, match="together"):
+        index.add_metadata_column("x", "int", ids=[1])
+    with pytest.raises(TypeError, match="together"):
+        index.add_metadata_column("x", "int", values=[1])
+    with pytest.raises(ValueError, match="id 99 is not in the index"):
+        index.add_metadata_column("x", "int", ids=[99], values=[1])
+    with pytest.raises(ValueError, match="one value per id"):
+        index.add_metadata_column("x", "int", ids=[1, 2], values=[1])
+    with pytest.raises(ValueError, match="already exists"):
+        index.add_metadata_column("tag", "str", default="a")
+    assert index.metadata_schema == schema
+
+    index.drop_metadata_column("tag")
+    assert "tag" not in index.metadata_schema
+    with pytest.raises(ValueError, match="no metadata column 'tag'"):
+        index.drop_metadata_column("tag")
+    with pytest.raises(ValueError):
+        index.query(q, 3, where="tag = 'd'")
+    index.add_metadata_column("tag", "int", default=0)    # the name is free again
+    path = tmp_path / "columns.qann"
+    index.save(path)
+    loaded = qann.load(path)
+    assert loaded.metadata_schema == index.metadata_schema
+    assert sorted(loaded.query(q, 10, where="in_stock = 1 AND tag = 0")[0].tolist()) == [1, 2, 3, 4, 5, 6]
+
+
 def test_concurrent_metadata_adds_and_filtered_queries(data):
     # adds with metadata (exclusive lock) interleaved with where= queries (shared):
     # every result must satisfy the filter as of some consistent state

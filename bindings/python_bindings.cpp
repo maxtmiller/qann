@@ -268,16 +268,31 @@ static void index_update_metadata(vecengine::Index& self, IdsArg ids, nb::dict m
     });
 }
 
-// Add an empty metadata column; type is 'int', 'float' or 'str', as metadata_schema reports them.
-static void index_add_metadata_column(vecengine::Index& self, std::string name, const std::string& type) {
+// Add a metadata column; type is 'int', 'float' or 'str', as metadata_schema
+// reports them. Either fill (one value for every vector) or ids and values.
+static void index_add_metadata_column(vecengine::Index& self, std::string name, const std::string& type,
+                                      std::optional<vecengine::Expr::Value> fill, std::optional<IdsArg> ids,
+                                      nb::object values) {
     vecengine::ColumnType t;
     if (type == "int") t = vecengine::ColumnType::Int64;
     else if (type == "float") t = vecengine::ColumnType::Float64;
     else if (type == "str") t = vecengine::ColumnType::String;
     else throw std::invalid_argument("metadata column type must be 'int', 'float' or 'str'; got '" + type + "'");
+    if (ids.has_value() != !values.is_none()) throw nb::type_error("ids and values must be passed together");
+    if (fill && ids) throw nb::type_error("pass either default or ids and values, not both");
+    if (!ids) {
+        write_locked(self, [&] {
+            refuse_if_wrapped(self, "add a metadata column");
+            self.add_metadata_column(std::move(name), t, std::move(fill));
+        });
+        return;
+    }
+    IdVector id_array = as_ids(*ids);
+    vecengine::MetadataColumn col = as_column(name, values, id_array.shape(0), "id");
     write_locked(self, [&] {
         refuse_if_wrapped(self, "add a metadata column");
-        self.add_metadata_column(std::move(name), t);
+        self.add_metadata_column(std::move(name), t, std::span<const int64_t>(id_array.data(), id_array.shape(0)),
+                                 std::move(col.values), std::move(col.valid));
     });
 }
 
@@ -502,9 +517,21 @@ NB_MODULE(qann, m) {
              "Overwrite metadata in place: metadata is {name: one value per id}, None sets a value to null, and "
              "columns left out keep their values. Unknown, deleted or repeated ids, and columns the index "
              "doesn't have (see add_metadata_column), raise ValueError; a failed call changes nothing")
-        .def("add_metadata_column", &index_add_metadata_column, nb::arg("name"), nb::arg("type"),
-             "Add an empty metadata column of type 'int', 'float' or 'str', null for every vector; fill it "
-             "with update_metadata or later adds. Raises ValueError if the name is taken")
+        .def("add_metadata_column", &index_add_metadata_column, nb::arg("name"), nb::arg("type"), nb::kw_only(),
+             nb::arg("default").none() = nb::none(), nb::arg("ids").none() = nb::none(),
+             nb::arg("values").none() = nb::none(),
+             "Add a metadata column of type 'int', 'float' or 'str'. With default, every vector gets that value; "
+             "with ids and values (one per id, None for null), those vectors get them and the rest are null; "
+             "with neither, every vector is null. default can't be combined with ids and values (TypeError). "
+             "Later adds that leave the column out store null. Raises ValueError, changing nothing, if the "
+             "name is taken, a value doesn't fit the type, or an id is unknown, deleted or repeated")
+        .def("drop_metadata_column", [](vecengine::Index& self, const std::string& name) {
+                 write_locked(self, [&] {
+                     refuse_if_wrapped(self, "drop a metadata column");
+                     self.drop_metadata_column(name);
+                 });
+             },
+             nb::arg("name"), "Remove a metadata column and its values from every vector; raises ValueError if there is none")
         .def("remove", &index_remove, nb::arg("ids"),
              "Delete the vectors with these ids; unknown ids are skipped. Returns how many were deleted")
         .def("compact", &index_compact,

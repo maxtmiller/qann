@@ -104,10 +104,22 @@ public:
     // reject.
     void update_metadata(span<const int64_t> ids, const Metadata& metadata);
 
-    // Adds an empty metadata column: null for every vector, to fill with
-    // update_metadata() or later adds. Throws std::invalid_argument if the
-    // name is empty or taken.
-    void add_metadata_column(std::string name, ColumnType type);
+    // Adds a metadata column with value for every vector, or null for every
+    // vector without one; fill it further with update_metadata() or later
+    // adds. Throws std::invalid_argument if the name is empty or taken, or the
+    // value doesn't fit the type (ints fit a Float64 column).
+    void add_metadata_column(std::string name, ColumnType type, std::optional<Expr::Value> value = std::nullopt);
+
+    // Adds a metadata column holding values for the vectors with these ids
+    // (valid as in MetadataColumn), null for every other vector, in one step.
+    // Throws std::invalid_argument before changing anything on update_metadata()'s
+    // errors, a taken name, or values that don't fit the type.
+    void add_metadata_column(std::string name, ColumnType type, span<const int64_t> ids, MetadataColumn::Values values,
+                             vector<uint8_t> valid = {});
+
+    // Removes a metadata column and its values from every vector. Throws
+    // std::invalid_argument if the index has no such column.
+    void drop_metadata_column(const std::string& name);
 
     // Each metadata column's name and type, in the order they were created.
     vector<std::pair<std::string, ColumnType>> metadata_schema() const { return metadata_.schema(); }

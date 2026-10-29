@@ -464,26 +464,46 @@ void compare_rows(vector<uint64_t>& words, size_t slots, const vector<uint8_t>& 
 
 } // namespace
 
+// Whether values of type `given` can go into a column of type `col`: the
+// same type, or ints into a float column (converted; the reverse would lose data).
+static bool fits(ColumnType col, ColumnType given) {
+    return col == given || (col == ColumnType::Float64 && given == ColumnType::Int64);
+}
+
+static std::invalid_argument wrong_type(const std::string& name, ColumnType col, ColumnType given) {
+    return std::invalid_argument("metadata column '" + name + "' holds " + type_name(col) + " values; got " + type_name(given));
+}
+
+// The rules every column of n values meets; type is the column's, or nullptr
+// when the values decide it (a column an add creates).
+static void check_values(const MetadataColumn& c, size_t n, const ColumnType* type) {
+    if (length_of(c) != n)
+        throw std::invalid_argument("metadata column '" + c.name + "' has " + std::to_string(length_of(c)) +
+                                    " values for " + std::to_string(n) + " vectors");
+    if (!c.valid.empty() && c.valid.size() != n)
+        throw std::invalid_argument("metadata column '" + c.name + "' has " + std::to_string(c.valid.size()) +
+                                    " null flags for " + std::to_string(n) + " vectors");
+    // an all-null column carries no values, so its type doesn't matter, but a new one has none to take
+    const bool all_null = n > 0 && !c.valid.empty() && std::find(c.valid.begin(), c.valid.end(), 1) == c.valid.end();
+    if (type && n > 0 && !all_null && !fits(*type, type_of(c))) throw wrong_type(c.name, *type, type_of(c));
+    if (!type && all_null)
+        throw std::invalid_argument("metadata column '" + c.name + "' is new and has only nulls, so it has no type");
+}
+
 void MetadataStore::check(size_t n, const Metadata& md) const {
     std::unordered_set<std::string> names;
     for (const MetadataColumn& c : md) {
         if (c.name.empty()) throw std::invalid_argument("metadata column names must not be empty");
         if (!names.insert(c.name).second) throw std::invalid_argument("metadata column '" + c.name + "' appears twice");
-        if (length_of(c) != n)
-            throw std::invalid_argument("metadata column '" + c.name + "' has " + std::to_string(length_of(c)) +
-                                        " values for " + std::to_string(n) + " vectors");
-        if (!c.valid.empty() && c.valid.size() != n)
-            throw std::invalid_argument("metadata column '" + c.name + "' has " + std::to_string(c.valid.size()) +
-                                        " null flags for " + std::to_string(n) + " vectors");
-        // an all-null column carries no values, so its type doesn't matter, but a new one has none to take
-        const bool all_null = n > 0 && !c.valid.empty() && std::find(c.valid.begin(), c.valid.end(), 1) == c.valid.end();
         const Column* existing = find(c.name);
-        if (existing && n > 0 && !all_null && existing->type != type_of(c))
-            throw std::invalid_argument("metadata column '" + c.name + "' holds " + type_name(existing->type) +
-                                        " values; got " + type_name(type_of(c)));
-        if (!existing && all_null)
-            throw std::invalid_argument("metadata column '" + c.name + "' is new and has only nulls, so it has no type");
+        check_values(c, n, existing ? &existing->type : nullptr);
     }
+}
+
+void MetadataStore::check_new(const MetadataColumn& c, ColumnType type, size_t n) const {
+    if (c.name.empty()) throw std::invalid_argument("metadata column names must not be empty");
+    if (find(c.name)) throw std::invalid_argument("metadata column '" + c.name + "' already exists");
+    check_values(c, n, &type);
 }
 
 void MetadataStore::check_update(size_t n, const Metadata& md) const {
@@ -498,7 +518,10 @@ void MetadataStore::write_row(Column& col, size_t to, const MetadataColumn& c, s
     const bool has = c.valid.empty() || c.valid[i];
     col.valid[to] = has;
     if (col.type == ColumnType::Int64) col.ints[to] = has ? std::get<vector<int64_t>>(c.values)[i] : 0;
-    else if (col.type == ColumnType::Float64) col.floats[to] = has ? std::get<vector<double>>(c.values)[i] : 0.0;
+    else if (col.type == ColumnType::Float64) {
+        const auto* ints = std::get_if<vector<int64_t>>(&c.values);  // ints fit a float column
+        col.floats[to] = !has ? 0.0 : ints ? static_cast<double>((*ints)[i]) : std::get<vector<double>>(c.values)[i];
+    }
     else if (!has) col.codes[to] = 0;
     else {
         const std::string& s = std::get<vector<std::string>>(c.values)[i];
@@ -519,14 +542,31 @@ void MetadataStore::update(const vector<uint32_t>& slots, const Metadata& md) {
     }
 }
 
-void MetadataStore::add_column(std::string name, ColumnType type, size_t rows) {
+void MetadataStore::add_column(std::string name, ColumnType type, size_t rows, const std::optional<Expr::Value>& value) {
     if (name.empty()) throw std::invalid_argument("metadata column names must not be empty");
     if (find(name)) throw std::invalid_argument("metadata column '" + name + "' already exists");
-    Column col{std::move(name), type, vector<uint8_t>(rows, 0), {}, {}, {}, {}, {}};
-    if (type == ColumnType::Int64) col.ints.assign(rows, 0);
-    else if (type == ColumnType::Float64) col.floats.assign(rows, 0.0);
-    else col.codes.assign(rows, 0);
+    const ColumnType given = value ? static_cast<ColumnType>(value->index()) : type;  // Value's order matches ColumnType
+    if (!fits(type, given)) throw wrong_type(name, type, given);
+    Column col{std::move(name), type, vector<uint8_t>(rows, value.has_value()), {}, {}, {}, {}, {}};
+    if (type == ColumnType::Int64) {
+        col.ints.assign(rows, value ? std::get<int64_t>(*value) : 0);
+    } else if (type == ColumnType::Float64) {
+        const auto* i = value ? std::get_if<int64_t>(&*value) : nullptr;
+        col.floats.assign(rows, !value ? 0.0 : i ? static_cast<double>(*i) : std::get<double>(*value));
+    } else {
+        col.codes.assign(rows, 0);
+        if (value && rows > 0) {
+            col.dict.push_back(std::get<std::string>(*value));
+            col.code_of.emplace(col.dict[0], 0);
+        }
+    }
     columns_.push_back(std::move(col));
+}
+
+void MetadataStore::drop_column(const std::string& name) {
+    auto it = std::find_if(columns_.begin(), columns_.end(), [&](const Column& c) { return c.name == name; });
+    if (it == columns_.end()) throw std::invalid_argument("the index has no metadata column '" + name + "'");
+    columns_.erase(it);
 }
 
 void MetadataStore::append(size_t rows, size_t n, const Metadata& md) {
