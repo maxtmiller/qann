@@ -260,11 +260,18 @@ index.add(vectors, metadata={"category": categories, "price": prices, "year": ye
 f = qann.field
 ids, dists = index.batch_query(queries, 10, where=(f("category") == "shoes") & (f("price") < 50))
 ids, dists = index.batch_query(queries, 10, where=f("year").isin([2024, 2025]) | f("price").is_null())
+
+# or as a SQL WHERE clause, with values passed separately
+ids, dists = index.batch_query(queries, 10, where="category = 'shoes' AND price < 50")
+ids, dists = index.batch_query(queries, 10, where=("user_id = ? AND year IN (?, ?)", [uid, 2024, 2025]))
 ```
 
 - **Columns** are named and hold ints, floats or strings, one value per vector, as NumPy arrays or lists (bool arrays become ints). A column's type is fixed by the first add that has it.
 - **Missing values:** a column added later is null for the vectors already in the index, and an add that leaves a column out stores null for its vectors. Nulls fail every comparison and `isin`, so `~(f("price") < 50)` includes vectors with no price; use `f("price").is_null()` to select or exclude them.
 - **Filters:** `==`, `!=`, `<`, `<=`, `>`, `>=`, `.isin([...])` and `.is_null()`, combined with `&` (and), `|` (or) and `~` (not). Parenthesize comparisons, since `&` binds tighter than `<`: `(f("a") < 1) & (f("b") == 2)`. Python's `and`, `or`, `not` and chained comparisons such as `0 < f("a") < 5` raise `TypeError` instead of silently dropping part of the filter.
+- **SQL strings:** `where` also takes a SQL `WHERE` clause: `=`, `!=` / `<>`, `<`, `<=`, `>`, `>=`, `[NOT] IN (...)`, `IS [NOT] NULL`, `[NOT] BETWEEN x AND y`, `AND`, `OR`, `NOT` and parentheses, with SQL's precedence and case-insensitive keywords. Strings are `'...'` (`''` for a quote); quote column names that are keywords as `"..."`. `LIKE`, functions, arithmetic and comparing two columns aren't supported. A syntax error raises `ValueError` with its column.
+- **Parameters:** pass values as `(sql, [values])` for `?` or `(sql, {name: value})` for `:name` instead of pasting them into the string. They are bound after parsing, so user input can't change the filter (`"1 OR 1 = 1"` is just a value). `qann.where(sql, params)` returns the filter, to reuse it or combine it with `qann.field` filters through `&`, `|` and `~`.
+- **`NOT` vs `~`:** SQL's `NOT` excludes nulls, as in SQL: `NOT price < 50` doesn't match vectors with no price, while `~(f("price") < 50)` does.
 - **Types:** ints and floats compare as numbers; strings compare with strings (`<` is alphabetical). Filtering on a column the index doesn't have, or comparing a number column with a string, raises `ValueError`.
 - **Same search as `allowed`:** a `where` filter becomes the set of matching vectors and runs the [filtered search](#filtered-search) for every index, with the same recall behavior. With both `where` and `allowed`, only vectors passing both are returned.
 - **Cost:** each query call scans the columns its filter names once, shared by every row of a `batch_query`: about 0.4 ms per condition per million vectors. Strings are stored once per distinct value, plus 4 bytes per vector; ints and floats take 8 bytes per vector; each column also takes 1 byte per vector for its null flag.

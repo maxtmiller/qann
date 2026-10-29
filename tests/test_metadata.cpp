@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "vecengine/flat_index.hpp"
 #include "vecengine/hnsw_index.hpp"
@@ -8,10 +9,12 @@
 #include "vecengine/refine_index.hpp"
 #include "serialize.hpp"
 
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <random>
 #include <set>
 #include <sstream>
@@ -472,5 +475,279 @@ TEST_CASE("Metadata filters at 100k rows match a reference evaluation", "[metada
         CAPTURE(c);
         const auto ids = ids_where(n, cases[c].match);
         md_require_identical(flat.query_batch(queries, nq, k, cases[c].where), flat.query_batch(queries, nq, k, ids));
+    }
+}
+
+TEST_CASE("Expr::parse builds the same tree as the operator form", "[metadata][parse]") {
+    auto same = [](const std::string& sql, const Expr& e) {
+        INFO(sql);
+        REQUIRE(Expr::parse(sql).to_string() == e.to_string());
+    };
+    const auto i = [](int64_t v) { return Expr::Value{v}; };
+    const auto s = [](const char* v) { return Expr::Value{std::string(v)}; };
+
+    same("category = 'shoes' AND price < 50", f("category", Op::Eq, s("shoes")) & f("price", Op::Lt, i(50)));
+    same("a = 1", f("a", Op::Eq, i(1)));
+    same("a == 1", f("a", Op::Eq, i(1)));
+    same("a != 1", f("a", Op::Ne, i(1)));
+    same("a <> 1", f("a", Op::Ne, i(1)));
+    same("a<1", f("a", Op::Lt, i(1)));
+    same("a <= 1", f("a", Op::Le, i(1)));
+    same("a > -1", f("a", Op::Gt, i(-1)));
+    same("a >= +1", f("a", Op::Ge, i(1)));
+    same("c IN ('a', 'b')", Expr::isin("c", {s("a"), s("b")}));
+    same("c NOT IN (1)", ~Expr::isin("c", {i(1)}) & ~Expr::is_null("c"));
+    same("c IS NULL", Expr::is_null("c"));
+    same("c IS NOT NULL", ~Expr::is_null("c"));
+    same("p BETWEEN 1 AND 5", f("p", Op::Ge, i(1)) & f("p", Op::Le, i(5)));
+    same("p NOT BETWEEN 1 AND 5", f("p", Op::Lt, i(1)) | f("p", Op::Gt, i(5)));
+
+    SECTION("NOT is pushed down to the leaves") {
+        same("NOT p < 5", f("p", Op::Ge, i(5)));
+        same("NOT p >= 5", f("p", Op::Lt, i(5)));
+        same("NOT p = 5", f("p", Op::Ne, i(5)));
+        same("NOT NOT p = 5", f("p", Op::Eq, i(5)));
+        same("NOT (a = 1 AND b = 2)", f("a", Op::Ne, i(1)) | f("b", Op::Ne, i(2)));
+        same("NOT (a = 1 OR b = 2)", f("a", Op::Ne, i(1)) & f("b", Op::Ne, i(2)));
+        same("NOT a IS NULL", ~Expr::is_null("a"));
+        same("NOT a IS NOT NULL", Expr::is_null("a"));
+        same("NOT a NOT IN (1)", Expr::isin("a", {i(1)}));
+        same("NOT a BETWEEN 1 AND 5", f("a", Op::Lt, i(1)) | f("a", Op::Gt, i(5)));
+    }
+
+    SECTION("precedence: comparisons, then NOT, AND, OR") {
+        const Expr a = f("a", Op::Eq, i(1)), b = f("b", Op::Eq, i(2)), c = f("c", Op::Eq, i(3));
+        same("a = 1 OR b = 2 AND c = 3", a | (b & c));
+        same("a = 1 AND b = 2 OR c = 3", (a & b) | c);
+        same("(a = 1 OR b = 2) AND c = 3", (a | b) & c);
+        same("a = 1 AND b = 2 AND c = 3", (a & b) & c);
+        same("NOT a = 1 AND b = 2", f("a", Op::Ne, i(1)) & b);
+        same("((a = 1))", a);
+        same("a BETWEEN 1 AND 2 AND b = 2", (f("a", Op::Ge, i(1)) & f("a", Op::Le, i(2))) & b);
+    }
+
+    SECTION("keywords are case-insensitive and only whole words") {
+        same("a in (1) and b is not null Or c between 1 aNd 2",
+             (Expr::isin("a", {i(1)}) & ~Expr::is_null("b")) | (f("c", Op::Ge, i(1)) & f("c", Op::Le, i(2))));
+        same("notes = 1 AND android = 2 OR order_id IN (3)",
+             (f("notes", Op::Eq, i(1)) & f("android", Op::Eq, i(2))) | Expr::isin("order_id", {i(3)}));
+    }
+
+    SECTION("quoting and values") {
+        same("x = 'it''s'", f("x", Op::Eq, s("it's")));
+        same("x = ''", f("x", Op::Eq, s("")));
+        same("x = 'a AND b = 1'", f("x", Op::Eq, s("a AND b = 1")));
+        same("\"and\" = 1", f("and", Op::Eq, i(1)));
+        same("\"a\"\"b c\" = 1", f("a\"b c", Op::Eq, i(1)));
+        same("user.id = 1", f("user.id", Op::Eq, i(1)));
+        same("x = -3e2", f("x", Op::Eq, -300.0));
+        same("x = 2.5", f("x", Op::Eq, 2.5));
+        REQUIRE(std::holds_alternative<int64_t>(Expr::parse("x = 42").values()[0]));
+        REQUIRE(std::holds_alternative<double>(Expr::parse("x = 42.0").values()[0]));
+        REQUIRE(std::holds_alternative<double>(Expr::parse("x = 1e3").values()[0]));
+        REQUIRE(std::get<int64_t>(Expr::parse("x = -9223372036854775808").values()[0]) == INT64_MIN);
+    }
+}
+
+TEST_CASE("Expr::parse binds parameters without changing the structure", "[metadata][parse]") {
+    using Params = std::vector<Expr::Value>;
+    using Named = std::unordered_map<std::string, Expr::Value>;
+
+    REQUIRE(Expr::parse("a = ? AND b IN (?, ?)", Params{int64_t{7}, std::string("x"), 2.5}).to_string() ==
+            (f("a", Op::Eq, int64_t{7}) & Expr::isin("b", {std::string("x"), 2.5})).to_string());
+    REQUIRE(Expr::parse("a = :uid AND b < :p OR c = :uid", Named{{"uid", int64_t{3}}, {"p", 9.5}}).to_string() ==
+            ((f("a", Op::Eq, int64_t{3}) & f("b", Op::Lt, 9.5)) | f("c", Op::Eq, int64_t{3})).to_string());
+
+    // an injected string stays one value
+    const Expr e = Expr::parse("a = ?", Params{std::string("1 OR 1=1")});
+    REQUIRE(e.op() == Op::Eq);
+    REQUIRE(std::get<std::string>(e.values()[0]) == "1 OR 1=1");
+
+    REQUIRE_THROWS_WITH(Expr::parse("a = ?"), "? placeholder, but no parameters were given at column 5");
+    REQUIRE_THROWS_WITH(Expr::parse("a = ? AND b = ?", Params{int64_t{1}}), "more ? placeholders than parameters at column 15");
+    REQUIRE_THROWS_WITH(Expr::parse("a = ?", Params{int64_t{1}, int64_t{2}}), "filter has 1 ? placeholders but 2 parameters were given");
+    REQUIRE_THROWS_WITH(Expr::parse("a = 1", Params{int64_t{1}}), "filter has 0 ? placeholders but 1 parameters were given");
+    REQUIRE_THROWS_WITH(Expr::parse("a = ?", Named{{"x", int64_t{1}}}), "? placeholder, but parameters were given by name at column 5");
+    REQUIRE_THROWS_WITH(Expr::parse("a = :x", Params{int64_t{1}}), ":x placeholder, but parameters were given as a list at column 5");
+    REQUIRE_THROWS_WITH(Expr::parse("a = :x"), ":x placeholder, but no parameters were given at column 5");
+    REQUIRE_THROWS_WITH(Expr::parse("a = :y", Named{{"x", int64_t{1}}}), "no parameter named 'y' at column 5");
+    REQUIRE_THROWS_WITH(Expr::parse("a = :", Named{{"x", int64_t{1}}}), "expected a parameter name after ':' at column 5");
+}
+
+TEST_CASE("Expr::parse reports where a filter is wrong", "[metadata][parse]") {
+    REQUIRE_THROWS_WITH(Expr::parse(""), "expected a column name at end of filter");
+    REQUIRE_THROWS_WITH(Expr::parse("a = 1 AND"), "expected a column name at end of filter");
+    REQUIRE_THROWS_WITH(Expr::parse("and = 1"), "expected a column name at column 1");
+    REQUIRE_THROWS_WITH(Expr::parse("a = 1 b = 2"), "unexpected 'b' at column 7");
+    REQUIRE_THROWS_WITH(Expr::parse("(a = 1"), "expected ')' at end of filter");
+    REQUIRE_THROWS_WITH(Expr::parse("a < 'x"), "unterminated string at column 5");
+    REQUIRE_THROWS_WITH(Expr::parse("\"a = 1"), "unterminated quoted name at column 1");
+    REQUIRE_THROWS_WITH(Expr::parse("a IN 1"), "expected '(' at column 6");
+    REQUIRE_THROWS_WITH(Expr::parse("a IN (1 2)"), "expected ',' or ')' at column 9");
+    REQUIRE_THROWS_WITH(Expr::parse("a NOT = 1"), "expected IN or BETWEEN at column 7");
+    REQUIRE_THROWS_WITH(Expr::parse("a BETWEEN 1 OR 2"), "expected AND at column 13");
+    REQUIRE_THROWS_WITH(Expr::parse("a IS 1"), "expected NULL at column 6");
+    REQUIRE_THROWS_WITH(Expr::parse("a ~ 1"), "expected a comparison, IN, BETWEEN or IS at column 3");
+    REQUIRE_THROWS_WITH(Expr::parse("a = x"), "expected a value at column 5");
+    REQUIRE_THROWS_WITH(Expr::parse("a = 1abc"), "expected a value at column 5");
+    REQUIRE_THROWS_WITH(Expr::parse("a = 99999999999999999999"), "integer out of range at column 5");
+    REQUIRE_THROWS_AS(Expr::parse("a = 1 OR OR b = 2"), std::invalid_argument);
+}
+
+TEST_CASE("Expr::parse matches SQL's three-valued logic on rows with nulls (fuzz)", "[metadata][parse]") {
+    // Columns a (int), b (float), s (string). Batches leave columns out so
+    // every combination of nulls appears.
+    constexpr size_t kRows = 40;
+    std::vector<std::optional<int64_t>> A(kRows);
+    std::vector<std::optional<double>> B(kRows);
+    std::vector<std::optional<std::string>> S(kRows);
+    MetadataStore store;
+    for (size_t batch = 0; batch < 4; ++batch) {
+        const bool has_a = batch < 2, has_bs = batch == 0 || batch == 2;
+        std::vector<int64_t> a;
+        std::vector<double> b;
+        std::vector<std::string> s;
+        for (size_t r = batch * 10; r < batch * 10 + 10; ++r) {
+            if (has_a) a.push_back(A[r].emplace(static_cast<int64_t>(r % 7)));
+            if (has_bs) {
+                b.push_back(B[r].emplace(static_cast<double>(r % 9) * 0.5));
+                s.push_back(S[r].emplace(std::string(1, static_cast<char>('x' + r % 3))));
+            }
+        }
+        Metadata md;
+        if (has_a) md.push_back({"a", a});
+        if (has_bs) md.push_back({"b", b}), md.push_back({"s", s});
+        store.check(10, md);
+        store.append(batch * 10, 10, md);
+    }
+
+    enum class T { F, U, Tr };
+    const auto not3 = [](T x) { return x == T::U ? T::U : (x == T::Tr ? T::F : T::Tr); };
+    const auto and3 = [](T x, T y) { return x == T::F || y == T::F ? T::F : (x == T::Tr && y == T::Tr ? T::Tr : T::U); };
+    const auto or3 = [](T x, T y) { return x == T::Tr || y == T::Tr ? T::Tr : (x == T::F && y == T::F ? T::F : T::U); };
+    const auto tri = [](bool b) { return b ? T::Tr : T::F; };
+
+    struct Lit {
+        std::string sql;
+        double num = 0;
+        std::string str;
+    };
+    struct Node {
+        std::string sql;
+        std::function<T(size_t)> eval;
+    };
+    const char* names[] = {"a", "b", "s"};
+    std::mt19937 rng(46);
+    auto pick = [&](size_t n) { return static_cast<size_t>(rng() % n); };
+    auto kw = [&](const char* w) {
+        std::string out = w;
+        if (pick(2)) for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return out;
+    };
+    auto lit = [&](size_t c) {
+        if (c == 0) {
+            const int64_t v = static_cast<int64_t>(pick(8));
+            return Lit{std::to_string(v), static_cast<double>(v), ""};
+        }
+        if (c == 1) {
+            const double v = static_cast<double>(pick(10)) * 0.5;
+            std::ostringstream o;
+            o << v;
+            return Lit{o.str(), v, ""};
+        }
+        const std::string v(1, static_cast<char>('w' + pick(4)));
+        return Lit{"'" + v + "'", 0, v};
+    };
+    // sign of row r's value against l, or nullopt when the row is null
+    auto cmp = [&](size_t c, size_t r, const Lit& l) -> std::optional<int> {
+        if (c == 2) {
+            if (!S[r]) return std::nullopt;
+            return (*S[r] > l.str) - (*S[r] < l.str);
+        }
+        double x;
+        if (c == 0) {
+            if (!A[r]) return std::nullopt;
+            x = static_cast<double>(*A[r]);
+        } else {
+            if (!B[r]) return std::nullopt;
+            x = *B[r];
+        }
+        return (x > l.num) - (x < l.num);
+    };
+
+    std::function<Node(int)> gen = [&](int depth) -> Node {
+        if (depth == 0 || pick(3) == 0) {
+            const size_t c = pick(3);
+            const std::string col = names[c];
+            switch (pick(6)) {
+                case 0: {
+                    static const char* ops[] = {"=", "==", "!=", "<>", "<", "<=", ">", ">="};
+                    const size_t op = pick(8);
+                    const Lit l = lit(c);
+                    return {col + " " + ops[op] + " " + l.sql, [=](size_t r) {
+                                const auto sg = cmp(c, r, l);
+                                if (!sg) return T::U;
+                                switch (op) {
+                                    case 0: case 1: return tri(*sg == 0);
+                                    case 2: case 3: return tri(*sg != 0);
+                                    case 4: return tri(*sg < 0);
+                                    case 5: return tri(*sg <= 0);
+                                    case 6: return tri(*sg > 0);
+                                    default: return tri(*sg >= 0);
+                                }
+                            }};
+                }
+                case 1: case 2: {
+                    const bool negated = pick(2);
+                    std::vector<Lit> ls(1 + pick(3));
+                    std::string sql = col + (negated ? " " + kw("NOT") : "") + " " + kw("IN") + " (";
+                    for (size_t k = 0; k < ls.size(); ++k) sql += (k ? ", " : "") + (ls[k] = lit(c)).sql;
+                    return {sql + ")", [=](size_t r) {
+                                if (!cmp(c, r, ls[0])) return T::U;
+                                bool in = false;
+                                for (const Lit& l : ls) in = in || *cmp(c, r, l) == 0;
+                                return tri(in != negated);
+                            }};
+                }
+                case 3: {
+                    const bool negated = pick(2);
+                    return {col + " " + kw("IS") + (negated ? " " + kw("NOT") : "") + " " + kw("NULL"), [=](size_t r) {
+                                const bool null = c == 0 ? !A[r] : c == 1 ? !B[r] : !S[r];
+                                return tri(null != negated);
+                            }};
+                }
+                default: {
+                    const bool negated = pick(2);
+                    const Lit lo = lit(c), hi = lit(c);
+                    return {col + (negated ? " " + kw("NOT") : "") + " " + kw("BETWEEN") + " " + lo.sql + " " + kw("AND") + " " + hi.sql,
+                            [=](size_t r) {
+                                const auto a = cmp(c, r, lo), b = cmp(c, r, hi);
+                                if (!a) return T::U;
+                                return tri((*a >= 0 && *b <= 0) != negated);
+                            }};
+                }
+            }
+        }
+        switch (pick(3)) {
+            case 0: {
+                const Node x = gen(depth - 1), y = gen(depth - 1);
+                return {"(" + x.sql + " " + kw("AND") + " " + y.sql + ")", [=](size_t r) { return and3(x.eval(r), y.eval(r)); }};
+            }
+            case 1: {
+                const Node x = gen(depth - 1), y = gen(depth - 1);
+                return {"(" + x.sql + " " + kw("OR") + " " + y.sql + ")", [=](size_t r) { return or3(x.eval(r), y.eval(r)); }};
+            }
+            default: {
+                const Node x = gen(depth - 1);
+                return {kw("NOT") + " (" + x.sql + ")", [=](size_t r) { return not3(x.eval(r)); }};
+            }
+        }
+    };
+
+    for (int iter = 0; iter < 2000; ++iter) {
+        const Node n = gen(4);
+        INFO(n.sql);
+        const auto want = ids_where(kRows, [&](size_t r) { return n.eval(r) == T::Tr; });
+        REQUIRE(bits_to_ids(store.evaluate(Expr::parse(n.sql), kRows), kRows) == want);
     }
 }

@@ -965,6 +965,46 @@ def test_metadata_input_and_filter_errors(data):
             misuse()
 
 
+
+def test_metadata_sql_where(data):
+    index = qann.FlatIndex(32)
+    i = np.arange(200)
+    index.add(data[:200], metadata={"price": i % 100, "color": COLORS[i % 4]})
+    index.add(data[200:210])    # no metadata: price and color null
+    f = qann.field
+    queries = data[:20] + 0.01
+
+    def same(where, expr):
+        np.testing.assert_array_equal(index.batch_query(queries, 10, where=where)[0],
+                                      index.batch_query(queries, 10, where=expr)[0])
+
+    same("price < 30 AND color != 'red'", (f("price") < 30) & (f("color") != "red"))
+    same("color IN ('red', 'blue') OR price BETWEEN 10 AND 20",
+         f("color").isin(["red", "blue"]) | ((f("price") >= 10) & (f("price") <= 20)))
+    same(("price < ? AND color = ?", [30, "red"]), (f("price") < 30) & (f("color") == "red"))
+    same(("price >= :lo AND price < :hi", {"lo": 5, "hi": 9.5}), (f("price") >= 5) & (f("price") < 9.5))
+    same(qann.where("price < ?", [30]) & (f("color") == "red"), (f("price") < 30) & (f("color") == "red"))
+    assert index.query(queries[0], 10, where="price IS NULL")[0].tolist() == \
+        index.query(queries[0], 10, allowed=np.arange(200, 210))[0].tolist()
+
+    # SQL's NOT excludes nulls; ~ includes them
+    nulls = np.arange(200, 210)
+    assert not np.isin(nulls, index.query(data[200], 210, where="NOT price < 50")[0]).any()
+    assert np.isin(nulls, index.query(data[200], 210, where=~(f("price") < 50))[0]).all()
+    assert repr(qann.where("NOT (price < 5 OR color IS NULL)")) == "qann.Expr(((price >= 5) & ~is_null(color)))"
+
+    # a parameter is one value, whatever it contains
+    assert index.query(queries[0], 10, where=("color = ?", ["red' OR 'a' = 'a"]))[0].size == 0
+
+    with pytest.raises(ValueError, match="unexpected .color. at column 11"):
+        index.query(queries[0], 10, where="price < 5 color = 'red'")
+    with pytest.raises(ValueError, match="no parameter named 'hi'"):
+        qann.where("price < :hi", {"lo": 1})
+    with pytest.raises(ValueError, match="placeholders"):
+        index.query(queries[0], 10, where=("price < ?", [1, 2]))
+    with pytest.raises(ValueError):    # unknown column, found when evaluated
+        index.query(queries[0], 10, where="size = 1")
+
 def test_metadata_unsigned_overflow_and_empty_adds(data):
     index = qann.FlatIndex(32)
     with pytest.raises(ValueError):    # would wrap to a negative int64
