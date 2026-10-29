@@ -1224,6 +1224,54 @@ def test_metadata_columns_defaults_values_and_drop(tmp_path, data):
     assert sorted(loaded.query(q, 10, where="in_stock = 1 AND tag = 0")[0].tolist()) == [1, 2, 3, 4, 5, 6]
 
 
+def test_add_returns_ids(data):
+    index = qann.FlatIndex(32)
+    ids = index.add(data[:10])
+    assert ids.dtype == np.int64 and ids.tolist() == list(range(10))
+    index.remove([2, 5, 8])
+    index.compact()
+    assert index.size() == 7
+    assert index.add(data[10:11]).tolist() == [10]    # not 7: auto ids never repeat
+    assert index.add(data[:0]).tolist() == []
+
+    custom = qann.HNSWIndex(32, custom_ids=True, seed=1)
+    assert custom.add(data[:3], [30, 10, 20]).tolist() == [30, 10, 20]
+    refine = qann.RefineIndex(qann.FlatIndex(32), k_factor=2)
+    assert refine.add(data[:4]).tolist() == [0, 1, 2, 3]
+    assert refine.add(data[4:6]).tolist() == [4, 5]
+
+
+def test_any_of_and_all_of(data):
+    f = qann.field
+    index = qann.FlatIndex(32)
+    index.add(data[:200], metadata={"price": np.arange(200) % 100, "color": COLORS[np.arange(200) % 4]})
+    queries = data[:20] + 0.01
+
+    def same(a, b):
+        np.testing.assert_array_equal(index.batch_query(queries, 10, where=a)[0],
+                                      index.batch_query(queries, 10, where=b)[0])
+
+    same(qann.any_of([f("price") == 1, f("price") == 2, f("color") == "red"]),
+         (f("price") == 1) | (f("price") == 2) | (f("color") == "red"))
+    same(qann.all_of([f("price") < 50, qann.where("color = 'blue'")]), (f("price") < 50) & (f("color") == "blue"))
+    assert repr(qann.any_of([f("price") == 1])) == "qann.Expr((price == 1))"
+    for fn in (qann.any_of, qann.all_of):
+        with pytest.raises(ValueError, match="at least one filter"):
+            fn([])
+        with pytest.raises(TypeError):
+            fn([f("price")])    # a Field, not a filter
+
+    # a long chain is built in one step, and isn't subject to the SQL condition limit
+    chain = qann.any_of([f("price") == p for p in range(100000)])
+    same(chain, "price IS NOT NULL")
+    assert len(repr(chain)) > 100000
+    # nesting is still capped
+    deep = f("price") == 1
+    with pytest.raises(ValueError, match="nested more than 256 levels"):
+        for i in range(300):
+            deep = qann.any_of([qann.all_of([deep, f("price") == i]), f("color") == "red"])
+
+
 def test_concurrent_metadata_adds_and_filtered_queries(data):
     # adds with metadata (exclusive lock) interleaved with where= queries (shared):
     # every result must satisfy the filter as of some consistent state
