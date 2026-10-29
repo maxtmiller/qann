@@ -132,7 +132,7 @@ public:
     void append(size_t rows, size_t n, const Metadata& md);
 
     // Moves row old to remap[old] and drops rows marked IdMap::kRemoved, like
-    // the index's own compaction.
+    // the index's own compaction. Strings no remaining row uses are freed.
     void compact(const vector<uint32_t>& remap);
 
     // One bit per slot (slots bits, 64 per word), set where the row matches

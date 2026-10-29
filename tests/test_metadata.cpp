@@ -113,6 +113,33 @@ TEST_CASE("MetadataStore: columns, nulls and validation", "[metadata]") {
     }
 }
 
+TEST_CASE("MetadataStore: compact frees strings only removed rows used", "[metadata]") {
+    MetadataStore store;
+    const Metadata md = {{"tag", std::vector<std::string>{"lost", "kept", "gone", "kept", "lost"}}};
+    store.append(0, 5, md);
+    store.append(5, 1, {});    // a null row
+    store.compact({IdMap::kRemoved, 0, IdMap::kRemoved, 1, IdMap::kRemoved, 2});
+
+    std::ostringstream out;
+    store.save(out);
+    REQUIRE(out.str().find("kept") != std::string::npos);
+    REQUIRE(out.str().find("lost") == std::string::npos);
+    REQUIRE(out.str().find("gone") == std::string::npos);
+
+    const auto tag = [](const char* v) { return f("tag", Op::Eq, std::string(v)); };
+    REQUIRE(bits_to_ids(store.evaluate(tag("kept"), 3), 3) == std::vector<int64_t>{0, 1});
+    REQUIRE(bits_to_ids(store.evaluate(tag("lost"), 3), 3).empty());
+    REQUIRE(bits_to_ids(store.evaluate(Expr::is_null("tag"), 3), 3) == std::vector<int64_t>{2});
+    std::istringstream in(out.str());
+    MetadataStore loaded = MetadataStore::load(in, 3);
+    REQUIRE(bits_to_ids(loaded.evaluate(tag("kept"), 3), 3) == std::vector<int64_t>{0, 1});
+
+    // a freed string can come back
+    loaded.append(3, 2, {{"tag", std::vector<std::string>{"lost", "kept"}}});
+    REQUIRE(bits_to_ids(loaded.evaluate(tag("lost"), 5), 5) == std::vector<int64_t>{3});
+    REQUIRE(bits_to_ids(loaded.evaluate(tag("kept"), 5), 5) == std::vector<int64_t>{0, 1, 4});
+}
+
 TEST_CASE("MetadataStore: every operator matches a hand-computed mask", "[metadata]") {
     const size_t n = 1000;
     MetadataStore store;

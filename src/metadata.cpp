@@ -536,6 +536,25 @@ void MetadataStore::compact(const vector<uint32_t>& remap) {
         col.ints.resize(col.type == ColumnType::Int64 ? kept : 0);
         col.floats.resize(col.type == ColumnType::Float64 ? kept : 0);
         col.codes.resize(col.type == ColumnType::String ? kept : 0);
+        if (col.type != ColumnType::String) continue;
+        // drop strings only removed rows used, renumbering in first-seen order
+        vector<uint32_t> renum(col.dict.size(), UINT32_MAX);
+        vector<std::string> dict;
+        for (size_t i = 0; i < kept; ++i) {
+            if (!col.valid[i]) {
+                col.codes[i] = 0;
+                continue;
+            }
+            uint32_t& code = renum[col.codes[i]];
+            if (code == UINT32_MAX) {
+                code = static_cast<uint32_t>(dict.size());
+                dict.push_back(std::move(col.dict[col.codes[i]]));
+            }
+            col.codes[i] = code;
+        }
+        col.dict = std::move(dict);
+        col.code_of.clear();
+        for (uint32_t c = 0; c < col.dict.size(); ++c) col.code_of.emplace(col.dict[c], c);
     }
 }
 
