@@ -50,7 +50,7 @@ inline constexpr size_t kFsMaxSubspaces = 1024;
 // constant gets scale 1.
 void quantize_lut(const float* table, size_t m, uint8_t* lut, float& scale, float& offset);
 
-// Portable version of quantize_lut; the NEON version must match it exactly.
+// Portable version of quantize_lut; the NEON and SSE versions must match it exactly.
 void quantize_lut_scalar(const float* table, size_t m, uint8_t* lut, float& scale, float& offset);
 
 // Sums of the lut entries picked by each of the block's 32 vectors: out[v] =
