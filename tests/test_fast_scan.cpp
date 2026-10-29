@@ -367,6 +367,25 @@ TEST_CASE("quantize_lut matches the scalar version exactly", "[fastscan]") {
     REQUIRE(oa == ob);
 }
 
+TEST_CASE("quantize_lut rounds halves away from zero like the scalar version", "[fastscan]") {
+    // Row 0 spans 0..kLutMax, so scale is exactly 1 and every entry is its own
+    // rounding input: exact halves, and the floats either side of 0.5.
+    const size_t m = 2;
+    std::vector<float> table(m * 16, 0.0f);
+    table[1] = kLutMax;
+    const float probes[] = {0.5f, 1.5f, 2.5f, 62.5f, std::nextafter(0.5f, 0.0f), std::nextafter(0.5f, 1.0f),
+                            std::nextafter(1.5f, 0.0f), 0.25f, 3.0f};
+    std::copy(std::begin(probes), std::end(probes), table.begin() + 16 + 1);   // row 1, min 0 at entry 0
+
+    std::vector<uint8_t> a(m * 16), b(m * 16);
+    float sa = 0, oa = 0, sb = 0, ob = 0;
+    quantize_lut(table.data(), m, a.data(), sa, oa);
+    quantize_lut_scalar(table.data(), m, b.data(), sb, ob);
+    REQUIRE(sa == 1.0f);
+    REQUIRE(a == b);
+    REQUIRE(std::vector<uint8_t>(a.begin() + 17, a.begin() + 26) == std::vector<uint8_t>{1, 2, 3, 63, 0, 1, 1, 0, 3});
+}
+
 TEST_CASE("fast_scan_block_mask flags exactly the sums below the limit", "[fastscan]") {
     const size_t m = GENERATE(2, 16, 64, 256, 480, 1024);
     CAPTURE(m);

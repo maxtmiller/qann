@@ -72,12 +72,64 @@ static void quantize_lut_neon(const float* table, size_t m, uint8_t* lut, float&
         vst1q_u8(lut + i * 16, vcombine_u8(vqmovn_u16(lo16), vqmovn_u16(hi16)));
     }
 }
+#elif defined(__SSSE3__)
+static inline float hmin_ps(__m128 v) {
+    v = _mm_min_ps(v, _mm_shuffle_ps(v, v, _MM_SHUFFLE(1, 0, 3, 2)));
+    return _mm_cvtss_f32(_mm_min_ps(v, _mm_shuffle_ps(v, v, _MM_SHUFFLE(2, 3, 0, 1))));
+}
+
+static inline float hmax_ps(__m128 v) {
+    v = _mm_max_ps(v, _mm_shuffle_ps(v, v, _MM_SHUFFLE(1, 0, 3, 2)));
+    return _mm_cvtss_f32(_mm_max_ps(v, _mm_shuffle_ps(v, v, _MM_SHUFFLE(2, 3, 0, 1))));
+}
+
+// Same arithmetic as quantize_lut_scalar, 4 floats per instruction. SSE has no
+// round-half-away-from-zero like std::lround, but every value here is >= 0:
+// truncate, then add 1 when the (exact) remainder is >= 0.5, which gives the
+// same bytes. floor(x + 0.5) would not: 0.49999997f + 0.5f rounds up to 1.
+static void quantize_lut_sse(const float* table, size_t m, uint8_t* lut, float& scale, float& offset) {
+    float row_min[kFsMaxSubspaces];
+    float widest = 0.0f;
+    offset = 0.0f;
+    for (size_t i = 0; i < m; ++i) {
+        const float* row = table + i * 16;
+        const __m128 a = _mm_loadu_ps(row), b = _mm_loadu_ps(row + 4), c = _mm_loadu_ps(row + 8), d = _mm_loadu_ps(row + 12);
+        const float lo = hmin_ps(_mm_min_ps(_mm_min_ps(a, b), _mm_min_ps(c, d)));
+        const float hi = hmax_ps(_mm_max_ps(_mm_max_ps(a, b), _mm_max_ps(c, d)));
+        row_min[i] = lo;
+        offset += lo;
+        widest = std::max(widest, hi - lo);
+    }
+
+    scale = widest > 0.0f ? kLutMax / widest : 1.0f;
+    const __m128 vscale = _mm_set1_ps(scale), half = _mm_set1_ps(0.5f);
+    const __m128i one = _mm_set1_epi32(1);
+
+    for (size_t i = 0; i < m; ++i) {
+        const float* row = table + i * 16;
+        const __m128 vmin = _mm_set1_ps(row_min[i]);
+        __m128i q[4];
+        for (int k = 0; k < 4; ++k) {
+            const __m128 x = _mm_mul_ps(_mm_sub_ps(_mm_loadu_ps(row + 4 * k), vmin), vscale);
+            const __m128i t = _mm_cvttps_epi32(x);
+            const __m128 up = _mm_cmpge_ps(_mm_sub_ps(x, _mm_cvtepi32_ps(t)), half);
+            q[k] = _mm_add_epi32(t, _mm_and_si128(_mm_castps_si128(up), one));
+        }
+        const __m128i lo16 = _mm_packs_epi32(q[0], q[1]), hi16 = _mm_packs_epi32(q[2], q[3]);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(lut + i * 16), _mm_packus_epi16(lo16, hi16));
+    }
+}
 #endif
 
 void quantize_lut(const float* table, size_t m, uint8_t* lut, float& scale, float& offset) {
 #if defined(__ARM_NEON)
     if (m <= kFsMaxSubspaces) {   // row_min is on the stack
         quantize_lut_neon(table, m, lut, scale, offset);
+        return;
+    }
+#elif defined(__SSSE3__)
+    if (m <= kFsMaxSubspaces) {
+        quantize_lut_sse(table, m, lut, scale, offset);
         return;
     }
 #endif

@@ -108,6 +108,9 @@ if(VECENGINE_PROFILE)
   add_executable(profile_query benchmarks/profile_query.cpp)
   target_include_directories(profile_query PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
   target_link_libraries(profile_query PRIVATE vecengine_core)
+  add_executable(profile_fastscan benchmarks/profile_fastscan.cpp)
+  target_include_directories(profile_fastscan PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+  target_link_libraries(profile_fastscan PRIVATE vecengine_core)
 endif()
 
 # k-means assignment uses cblas_sgemm when available: Accelerate on Apple (runs
