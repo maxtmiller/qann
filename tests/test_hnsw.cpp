@@ -9,6 +9,7 @@
 #include "vecengine/threads.hpp"
 #include "serialize.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -80,6 +81,33 @@ TEST_CASE("HNSW: high recall against exact search", "[hnsw]") {
     // a wider beam never loses recall here
     hnsw.set_ef_search(256);
     REQUIRE(hnsw_recall(hnsw.query_batch(queries, nq, k), truth) >= r64);
+}
+
+TEST_CASE("HNSW: exact duplicates stay connected", "[hnsw]") {
+    // 2,000 distinct vectors, each stored 4 times in shuffled order. Ties make
+    // ids ambiguous, so recall counts results at most the true k-th distance.
+    const size_t distinct = 2000, copies = 4, n = distinct * copies, dim = 16, nq = 200, k = 10;
+    const auto base = hnsw_random(distinct, dim, 40);
+    std::vector<size_t> order(n);
+    for (size_t i = 0; i < n; ++i) order[i] = i % distinct;
+    std::shuffle(order.begin(), order.end(), std::mt19937(41));
+    std::vector<float> data(n * dim);
+    for (size_t i = 0; i < n; ++i) std::copy_n(base.data() + order[i] * dim, dim, data.data() + i * dim);
+    const auto queries = hnsw_random(nq, dim, 42);
+
+    OneThread one_thread;
+    HNSWIndex hnsw(dim, 8, 100, false, 1);
+    hnsw.add_batch(data, n);
+    hnsw.set_ef_search(32);
+    FlatIndex flat(dim);
+    flat.add_batch(data, n);
+    const auto truth = flat.query_batch(queries, nq, k);
+    const auto got = hnsw.query_batch(queries, nq, k);
+
+    double hits = 0;
+    for (size_t q = 0; q < nq; ++q)
+        for (const auto& nb : got[q]) hits += nb.distance <= truth[q][k - 1].distance;
+    REQUIRE(hits / (nq * k) >= 0.75);   // 0.84 here; pruning ties as well gave 0.52
 }
 
 TEST_CASE("HNSW: results are sorted, distinct and at exact distances", "[hnsw]") {
