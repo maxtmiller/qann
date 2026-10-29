@@ -771,16 +771,22 @@ TEST_CASE("Expr: And / Or chains are flattened, and nesting is capped", "[metada
         MetadataStore store;
         store.append(0, 10, {{"a", std::vector<int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}}});
         std::string sql = "a = 100";
-        Expr built = a(100);
+        std::vector<Expr> terms{a(100)};
         for (int64_t i = 0; i < 200000; ++i) {
             sql += " OR a = " + std::to_string(i % 3 == 0 ? 100 + i : i % 10);
-            built = built | a(i % 3 == 0 ? 100 + i : i % 10);
+            terms.push_back(a(i % 3 == 0 ? 100 + i : i % 10));
         }
         const Expr parsed = Expr::parse(sql);
+        const Expr joined = Expr::join(Op::Or, terms);
         REQUIRE(parsed.children().size() == 200001);
-        REQUIRE(built.children().size() == 200001);
+        REQUIRE(joined.children().size() == 200001);
+        // each | copies the left chain, so keep the operator form short
+        Expr built = terms[0];
+        for (size_t i = 1; i < 1000; ++i) built = built | terms[i];
+        REQUIRE(built.children().size() == 1000);
         const auto all = std::vector<int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
         REQUIRE(bits_to_ids(store.evaluate(parsed, 10), 10) == all);
+        REQUIRE(bits_to_ids(store.evaluate(joined, 10), 10) == all);
         REQUIRE(bits_to_ids(store.evaluate(built, 10), 10) == all);
         REQUIRE(parsed.to_string().size() > 200000);
     }
