@@ -984,6 +984,12 @@ def test_metadata_sql_where(data):
     same(("price < ? AND color = ?", [30, "red"]), (f("price") < 30) & (f("color") == "red"))
     same(("price >= :lo AND price < :hi", {"lo": 5, "hi": 9.5}), (f("price") >= 5) & (f("price") < 9.5))
     same(qann.where("price < ?", [30]) & (f("color") == "red"), (f("price") < 30) & (f("color") == "red"))
+    same(f("price").between(10, 20), "price BETWEEN 10 AND 20")
+    same(f("price").between(10, 20), (f("price") >= 10) & (f("price") <= 20))
+    assert repr(f("price").between(1, 2.5)) == "qann.Expr(((price >= 1) & (price <= 2.5)))"
+    ends = index.query(data[0], 210, where=f("price").between(10, 10))[0]
+    assert sorted(ends.tolist()) == [10, 110]    # both ends included; nulls never match
+    assert index.query(data[0], 10, where=f("price").between(20, 10))[0].size == 0
     assert index.query(queries[0], 10, where="price IS NULL")[0].tolist() == \
         index.query(queries[0], 10, allowed=np.arange(200, 210))[0].tolist()
 

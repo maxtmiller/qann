@@ -400,7 +400,7 @@ NB_MODULE(qann, m) {
         // silently drop part of the filter, so refuse instead
         .def("__bool__", [](const vecengine::Expr&) -> bool {
             throw nb::type_error("a filter has no truth value: combine filters with & | ~ (not and / or / not), "
-                                 "and write ranges as (f > 0) & (f < 5)");
+                                 "and write ranges as f.between(0, 5) or (f > 0) & (f < 5)");
         })
         .def("__repr__", [](const vecengine::Expr& e) { return "qann.Expr(" + e.to_string() + ")"; });
 
@@ -418,6 +418,12 @@ NB_MODULE(qann, m) {
              nb::arg("values"), "Matches rows whose value is one of values")
         .def("is_null", [](const PyField& f) { return vecengine::Expr::is_null(f.name); },
              "Matches rows with no value in this column")
+        .def("between", [](const PyField& f, vecengine::Expr::Value lo, vecengine::Expr::Value hi) {
+                 return field_compare(f, vecengine::Expr::Op::Ge, std::move(lo)) &
+                        field_compare(f, vecengine::Expr::Op::Le, std::move(hi));
+             },
+             nb::arg("lo"), nb::arg("hi"),
+             "Matches rows with lo <= value <= hi, like SQL's BETWEEN: (field >= lo) & (field <= hi)")
         .def("__repr__", [](const PyField& f) { return "qann.field('" + f.name + "')"; });
 
     m.def("field", [](std::string name) { return PyField{std::move(name)}; }, nb::arg("name"),
