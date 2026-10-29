@@ -110,7 +110,10 @@ size_t RefineIndex::remove(span<const int64_t> ids) {
 
 size_t RefineIndex::compact() {
     auto remap = id_map_.compact(true);
-    if (remap.empty()) return 0;
+    if (remap.empty()) {
+        metadata_.drop_unused_strings();
+        return 0;
+    }
 
     base_.compact_as_base();
     metadata_.compact(remap);

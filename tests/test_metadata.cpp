@@ -113,6 +113,33 @@ TEST_CASE("MetadataStore: columns, nulls and validation", "[metadata]") {
     }
 }
 
+TEST_CASE("MetadataStore: compact frees strings only removed rows used", "[metadata]") {
+    MetadataStore store;
+    const Metadata md = {{"tag", std::vector<std::string>{"lost", "kept", "gone", "kept", "lost"}}};
+    store.append(0, 5, md);
+    store.append(5, 1, {});    // a null row
+    store.compact({IdMap::kRemoved, 0, IdMap::kRemoved, 1, IdMap::kRemoved, 2});
+
+    std::ostringstream out;
+    store.save(out);
+    REQUIRE(out.str().find("kept") != std::string::npos);
+    REQUIRE(out.str().find("lost") == std::string::npos);
+    REQUIRE(out.str().find("gone") == std::string::npos);
+
+    const auto tag = [](const char* v) { return f("tag", Op::Eq, std::string(v)); };
+    REQUIRE(bits_to_ids(store.evaluate(tag("kept"), 3), 3) == std::vector<int64_t>{0, 1});
+    REQUIRE(bits_to_ids(store.evaluate(tag("lost"), 3), 3).empty());
+    REQUIRE(bits_to_ids(store.evaluate(Expr::is_null("tag"), 3), 3) == std::vector<int64_t>{2});
+    std::istringstream in(out.str());
+    MetadataStore loaded = MetadataStore::load(in, 3);
+    REQUIRE(bits_to_ids(loaded.evaluate(tag("kept"), 3), 3) == std::vector<int64_t>{0, 1});
+
+    // a freed string can come back
+    loaded.append(3, 2, {{"tag", std::vector<std::string>{"lost", "kept"}}});
+    REQUIRE(bits_to_ids(loaded.evaluate(tag("lost"), 5), 5) == std::vector<int64_t>{3});
+    REQUIRE(bits_to_ids(loaded.evaluate(tag("kept"), 5), 5) == std::vector<int64_t>{0, 1, 4});
+}
+
 TEST_CASE("MetadataStore: every operator matches a hand-computed mask", "[metadata]") {
     const size_t n = 1000;
     MetadataStore store;
@@ -435,6 +462,276 @@ TEST_CASE("Metadata: a re-added id gets its new row, and empty adds create no co
     REQUIRE(empty.metadata_schema().empty());
     empty.add_batch(std::span<const float>(data.data(), dim), 1, nullptr, {{"a", std::vector<std::string>{"x"}}});
     REQUIRE(empty.metadata_schema() == std::vector<std::pair<std::string, ColumnType>>{{"a", ColumnType::String}});
+}
+
+TEST_CASE("update_metadata overwrites rows in place and validates first", "[metadata]") {
+    const size_t dim = 4, n = 6;
+    const auto data = md_random(n, dim, 11);
+    FlatIndex flat(dim, n, true);
+    const std::vector<int64_t> ids = {10, 11, 12, 13, 14, 15};
+    flat.add_batch(data, n, ids.data(),
+                   {{"price", std::vector<int64_t>{1, 2, 3, 4, 5, 6}},
+                    {"color", std::vector<std::string>{"red", "red", "blue", "blue", "red", "blue"}}});
+    const std::span<const float> q(data.data(), dim);
+    const auto match = [&](const Expr& e) {
+        std::vector<int64_t> out;
+        for (const auto& nb : flat.query(q, n, e)) out.push_back(static_cast<int64_t>(nb.index));
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+    const auto color = [](const char* c) { return f("color", Op::Eq, std::string(c)); };
+    using Ids = std::vector<int64_t>;
+
+    // only the given rows and columns change
+    flat.update_metadata(Ids{12, 10}, {{"price", std::vector<int64_t>{30, 10}}});
+    REQUIRE(match(f("price", Op::Eq, int64_t{30})) == Ids{12});
+    REQUIRE(match(f("price", Op::Eq, int64_t{10})) == Ids{10});
+    REQUIRE(match(color("red")) == Ids{10, 11, 14});
+
+    // a null flag clears a value; a new string joins the dictionary
+    flat.update_metadata(Ids{11, 13}, {{"color", std::vector<std::string>{"", "green"}, {0, 1}}});
+    REQUIRE(match(Expr::is_null("color")) == Ids{11});
+    REQUIRE(match(color("green")) == Ids{13});
+    // an all-null update fits a column of any type
+    flat.update_metadata(Ids{15}, {{"price", std::vector<std::string>{""}, {0}}});
+    REQUIRE(match(Expr::is_null("price")) == Ids{15});
+
+    SECTION("bad calls throw and change nothing") {
+        const auto before = match(f("price", Op::Ge, int64_t{0}));
+        const Metadata one = {{"price", std::vector<int64_t>{99}}};
+        REQUIRE_THROWS_WITH(flat.update_metadata(Ids{99}, one), "id 99 is not in the index");
+        flat.remove(Ids{14});
+        REQUIRE_THROWS_WITH(flat.update_metadata(Ids{14}, one), "id 14 is not in the index");
+        REQUIRE_THROWS_WITH(flat.update_metadata(Ids{10, 11, 10}, {{"price", std::vector<int64_t>{1, 2, 3}}}),
+                            "id 10 appears twice");
+        REQUIRE_THROWS_AS(flat.update_metadata(Ids{10, 11}, one), std::invalid_argument);                    // length
+        REQUIRE_THROWS_AS(flat.update_metadata(Ids{10}, {{"price", std::vector<double>{1.5}}}), std::invalid_argument);
+        REQUIRE_THROWS_WITH(flat.update_metadata(Ids{10}, {{"prcie", std::vector<int64_t>{1}}}),
+                            "the index has no metadata column 'prcie'; add it with add_metadata_column");
+        // a bad second column stops the first from being written too
+        REQUIRE_THROWS_AS(flat.update_metadata(Ids{10}, {{"price", std::vector<int64_t>{77}}, {"color", std::vector<int64_t>{1}}}),
+                          std::invalid_argument);
+        REQUIRE(match(f("price", Op::Ge, int64_t{0})) == Ids{10, 11, 12, 13});
+        REQUIRE(before == Ids{10, 11, 12, 13, 14});
+        REQUIRE(match(f("price", Op::Eq, int64_t{77})).empty());
+    }
+
+    SECTION("add_metadata_column adds a typed all-null column to fill with updates") {
+        flat.add_metadata_column("year", ColumnType::Int64);
+        REQUIRE(match(Expr::is_null("year")) == Ids{10, 11, 12, 13, 14, 15});
+        flat.update_metadata(Ids{13}, {{"year", std::vector<int64_t>{2024}}});
+        REQUIRE(match(f("year", Op::Eq, int64_t{2024})) == Ids{13});
+        REQUIRE_THROWS_WITH(flat.add_metadata_column("year", ColumnType::Float64), "metadata column 'year' already exists");
+        REQUIRE_THROWS_AS(flat.add_metadata_column("", ColumnType::Int64), std::invalid_argument);
+        REQUIRE_THROWS_AS(flat.update_metadata(Ids{13}, {{"year", std::vector<double>{1.5}}}), std::invalid_argument);
+        // later adds fill it like any column
+        const int64_t next = 16;
+        flat.add_batch(std::span<const float>(data.data(), dim), 1, &next, {{"year", std::vector<int64_t>{2025}}});
+        REQUIRE(match(f("year", Op::Eq, int64_t{2025})) == Ids{16});
+    }
+
+    SECTION("no ids change nothing, but an unknown column still throws") {
+        flat.update_metadata(Ids{}, {{"price", std::vector<double>{}}});    // no values, so no type to clash
+        REQUIRE(match(f("price", Op::Ge, int64_t{0})) == Ids{10, 11, 12, 13, 14});
+        REQUIRE_THROWS_AS(flat.update_metadata(Ids{}, {{"year", std::vector<int64_t>{}}}), std::invalid_argument);
+        REQUIRE(flat.metadata_schema().size() == 2);
+    }
+
+    SECTION("updates survive compact and save / load, and replaced strings are freed") {
+        flat.update_metadata(Ids{12, 15}, {{"color", std::vector<std::string>{"teal", "teal"}}});
+        flat.remove(Ids{11});
+        flat.compact();
+        std::stringstream buf;
+        flat.save(buf);
+        REQUIRE(buf.str().find("teal") != std::string::npos);
+        auto loaded = load_index(buf);
+        const auto got = loaded->query(q, n, color("teal"));
+        REQUIRE(got.size() == 2);
+        flat.update_metadata(Ids{12, 15}, {{"color", std::vector<std::string>{"red", "red"}}});
+        flat.compact();
+        std::stringstream again;
+        flat.save(again);
+        REQUIRE(again.str().find("teal") == std::string::npos);
+    }
+}
+
+TEST_CASE("update_metadata on auto ids after compaction, and through a RefineIndex", "[metadata]") {
+    const size_t dim = 4, n = 8;
+    const auto data = md_random(n, dim, 12);
+    using Ids = std::vector<int64_t>;
+
+    FlatIndex flat(dim);
+    flat.add_batch(data, n, nullptr, {{"price", std::vector<int64_t>{0, 1, 2, 3, 4, 5, 6, 7}}});
+    flat.remove(Ids{0, 1});
+    flat.compact();    // ids 2..7 now sit in slots 0..5
+    flat.update_metadata(Ids{7, 2}, {{"price", std::vector<int64_t>{70, 20}}});
+    const std::span<const float> q(data.data(), dim);
+    REQUIRE(flat.query(q, n, f("price", Op::Eq, int64_t{70}))[0].index == 7);
+    REQUIRE(flat.query(q, n, f("price", Op::Eq, int64_t{20}))[0].index == 2);
+    REQUIRE_THROWS_AS(flat.update_metadata(Ids{0}, {{"price", std::vector<int64_t>{1}}}), std::invalid_argument);
+
+    FlatIndex base(dim);
+    RefineIndex refine(base, 2, true);
+    const Ids rids = {100, 200, 300};
+    refine.add_batch(std::span<const float>(data.data(), 3 * dim), 3, rids.data(),
+                     {{"color", std::vector<std::string>{"a", "b", "c"}}});
+    refine.update_metadata(Ids{200}, {{"color", std::vector<std::string>{"a"}}});
+    REQUIRE(refine.query(q, 3, f("color", Op::Eq, std::string("a"))).size() == 2);
+    REQUIRE(base.metadata_schema().empty());
+    refine.add_metadata_column("rank", ColumnType::Float64);
+    refine.update_metadata(Ids{300}, {{"rank", std::vector<double>{0.5}}});
+    REQUIRE(refine.query(q, 3, f("rank", Op::Gt, 0.0))[0].index == 300);
+    REQUIRE(base.metadata_schema().empty());
+
+    // a column on an empty index: adds without it fill it with nulls
+    FlatIndex fresh(dim);
+    fresh.add_metadata_column("tag", ColumnType::String);
+    fresh.add_batch(std::span<const float>(data.data(), dim), 1);
+    REQUIRE(fresh.metadata_schema() == std::vector<std::pair<std::string, ColumnType>>{{"tag", ColumnType::String}});
+    REQUIRE(fresh.query(q, 1, Expr::is_null("tag")).size() == 1);
+}
+
+TEST_CASE("add_metadata_column: a default, values by id, ints into floats, and drop", "[metadata]") {
+    const size_t dim = 4, n = 5;
+    const auto data = md_random(n, dim, 14);
+    FlatIndex flat(dim, n, true);
+    const std::vector<int64_t> ids = {1, 2, 3, 4, 5};
+    flat.add_batch(data, n, ids.data(), {{"weight", std::vector<double>{0.5, 1.5, 2.5, 3.5, 4.5}}});
+    const std::span<const float> q(data.data(), dim);
+    using Ids = std::vector<int64_t>;
+    const auto match = [&](const Expr& e) {
+        Ids out;
+        for (const auto& nb : flat.query(q, 16, e)) out.push_back(static_cast<int64_t>(nb.index));    // more than the index holds
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+
+    // ints fit a float column, in adds and updates; floats don't fit an int column
+    const int64_t six = 6;
+    flat.add_batch(std::span<const float>(data.data(), dim), 1, &six, {{"weight", std::vector<int64_t>{7}}});
+    flat.update_metadata(Ids{1}, {{"weight", std::vector<int64_t>{9}}});
+    REQUIRE(match(f("weight", Op::Eq, 7.0)) == Ids{6});
+    REQUIRE(match(f("weight", Op::Eq, int64_t{9})) == Ids{1});
+    REQUIRE(flat.metadata_schema()[0].second == ColumnType::Float64);
+
+    SECTION("a default fills every vector") {
+        flat.add_metadata_column("in_stock", ColumnType::Int64, Expr::Value{int64_t{1}});
+        REQUIRE(match(f("in_stock", Op::Eq, int64_t{1})) == Ids{1, 2, 3, 4, 5, 6});
+        flat.add_metadata_column("score", ColumnType::Float64, Expr::Value{int64_t{2}});    // an int default for a float column
+        REQUIRE(match(f("score", Op::Eq, 2.0)).size() == 6);
+        flat.add_metadata_column("label", ColumnType::String, Expr::Value{std::string("new")});
+        REQUIRE(match(f("label", Op::Eq, std::string("new"))).size() == 6);
+        REQUIRE_THROWS_WITH(flat.add_metadata_column("bad", ColumnType::Int64, Expr::Value{1.5}),
+                            "metadata column 'bad' holds int values; got float");
+        REQUIRE_THROWS_AS(flat.add_metadata_column("bad", ColumnType::String, Expr::Value{int64_t{1}}), std::invalid_argument);
+        REQUIRE(flat.metadata_schema().size() == 4);
+        // a later add that leaves it out stores null
+        const int64_t seven = 7;
+        flat.add_batch(std::span<const float>(data.data(), dim), 1, &seven);
+        REQUIRE(match(Expr::is_null("in_stock")) == Ids{7});
+    }
+
+    SECTION("values by id fill those vectors, null for the rest, in one step") {
+        flat.add_metadata_column("tag", ColumnType::String, Ids{4, 2}, std::vector<std::string>{"d", ""}, {1, 0});
+        REQUIRE(match(f("tag", Op::Eq, std::string("d"))) == Ids{4});
+        REQUIRE(match(Expr::is_null("tag")) == Ids{1, 2, 3, 5, 6});
+        flat.add_metadata_column("rank", ColumnType::Float64, Ids{3}, std::vector<int64_t>{8});
+        REQUIRE(match(f("rank", Op::Eq, 8.0)) == Ids{3});
+        // every error leaves the schema unchanged
+        const auto schema = flat.metadata_schema();
+        REQUIRE_THROWS_WITH(flat.add_metadata_column("x", ColumnType::Int64, Ids{99}, std::vector<int64_t>{1}),
+                            "id 99 is not in the index");
+        REQUIRE_THROWS_AS(flat.add_metadata_column("x", ColumnType::Int64, Ids{1, 1}, std::vector<int64_t>{1, 2}),
+                          std::invalid_argument);
+        REQUIRE_THROWS_AS(flat.add_metadata_column("x", ColumnType::Int64, Ids{1, 2}, std::vector<int64_t>{1}),
+                          std::invalid_argument);
+        REQUIRE_THROWS_AS(flat.add_metadata_column("x", ColumnType::Int64, Ids{1}, std::vector<double>{1.5}),
+                          std::invalid_argument);
+        REQUIRE_THROWS_WITH(flat.add_metadata_column("tag", ColumnType::String, Ids{1}, std::vector<std::string>{"a"}),
+                            "metadata column 'tag' already exists");
+        REQUIRE(flat.metadata_schema() == schema);
+        // all-null values are fine: the type is given
+        flat.add_metadata_column("empty", ColumnType::Int64, Ids{1}, std::vector<int64_t>{0}, {0});
+        REQUIRE(match(Expr::is_null("empty")).size() == 6);
+    }
+
+    SECTION("drop removes a column and its values") {
+        flat.add_metadata_column("tag", ColumnType::String, Ids{1}, std::vector<std::string>{"gone"});
+        flat.drop_metadata_column("tag");
+        REQUIRE(flat.metadata_schema().size() == 1);
+        REQUIRE_THROWS_AS(flat.query(q, 1, Expr::is_null("tag")), std::invalid_argument);
+        REQUIRE_THROWS_WITH(flat.drop_metadata_column("tag"), "the index has no metadata column 'tag'");
+        std::stringstream buf;
+        flat.save(buf);
+        REQUIRE(buf.str().find("gone") == std::string::npos);
+        // the name can be reused, with another type
+        flat.add_metadata_column("tag", ColumnType::Int64);
+        const int64_t eight = 8;
+        flat.add_batch(std::span<const float>(data.data(), dim), 1, &eight, {{"tag", std::vector<int64_t>{3}}});
+        REQUIRE(match(f("tag", Op::Eq, int64_t{3})) == Ids{8});
+    }
+}
+
+TEST_CASE("update_metadata and string cleanup on compact work on every index", "[metadata]") {
+    const size_t n = 1000, dim = 8;
+    const auto data = md_random(n, dim, 15);
+    std::vector<std::string> tags(n, "common");
+    tags[5] = "rare";
+
+    auto flat = std::make_unique<FlatIndex>(dim);
+    auto ivf = std::make_unique<IVFIndex>(dim, 100, 100);    // every list probed, so results are exact
+    ivf->train(data, n, 25, 1);
+    auto hnsw = std::make_unique<HNSWIndex>(dim, 16, 100, false, 1);
+    auto base = std::make_unique<FlatIndex>(dim);
+    auto refine = std::make_unique<RefineIndex>(*base, 4);
+    std::vector<std::pair<std::string, Index*>> indexes = {
+        {"flat", flat.get()}, {"ivf", ivf.get()}, {"hnsw", hnsw.get()}, {"refine", refine.get()}};
+
+    using Ids = std::vector<int64_t>;
+    const std::span<const float> q(data.data(), dim);
+    for (auto& [name, index] : indexes) {
+        INFO(name);
+        index->add_batch(data, n, nullptr, {{"tag", tags}});
+        index->update_metadata(Ids{5, 9}, {{"tag", std::vector<std::string>{"common", "fresh"}}});
+        const auto fresh = index->query(q, n, f("tag", Op::Eq, std::string("fresh")));
+        REQUIRE(fresh.size() == 1);
+        REQUIRE(fresh[0].index == 9);
+        REQUIRE(index->query(q, n, f("tag", Op::Eq, std::string("rare"))).empty());
+
+        // nothing is deleted, so compact frees only the string no row uses
+        REQUIRE(index->compact() == 0);
+        std::stringstream buf;
+        index->save(buf);
+        REQUIRE(buf.str().find("rare") == std::string::npos);
+        REQUIRE(buf.str().find("fresh") != std::string::npos);
+        auto loaded = load_index(buf);
+        const auto again = loaded->query(q, n, f("tag", Op::Eq, std::string("fresh")));
+        REQUIRE(again.size() == 1);
+        REQUIRE(again[0].index == 9);
+
+        // a column left with no values survives compact
+        index->add_metadata_column("empty", ColumnType::Int64);
+        index->remove(Ids{0});
+        index->compact();
+        REQUIRE(index->metadata_schema().size() == 2);
+    }
+    REQUIRE(base->metadata_schema().empty());
+}
+
+TEST_CASE("add_batch takes null flags", "[metadata]") {
+    const size_t dim = 4;
+    const auto data = md_random(3, dim, 13);
+    FlatIndex flat(dim);
+    flat.add_batch(data, 3, nullptr, {{"tag", std::vector<std::string>{"x", "", "y"}, {1, 0, 1}}});
+    const std::span<const float> q(data.data(), dim);
+    REQUIRE(flat.query(q, 3, Expr::is_null("tag"))[0].index == 1);
+    REQUIRE_THROWS_AS(flat.add_batch(std::span<const float>(data.data(), dim), 1, nullptr,
+                                     {{"tag", std::vector<std::string>{"x"}, {1, 1}}}),
+                      std::invalid_argument);    // flags must match the values
+    REQUIRE_THROWS_AS(flat.add_batch(std::span<const float>(data.data(), dim), 1, nullptr,
+                                     {{"new", std::vector<int64_t>{0}, {0}}}),
+                      std::invalid_argument);    // a new all-null column has no type
+    REQUIRE(flat.size() == 3);
 }
 
 TEST_CASE("Metadata filters at 100k rows match a reference evaluation", "[metadata]") {

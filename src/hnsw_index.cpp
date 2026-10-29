@@ -157,7 +157,10 @@ size_t HNSWIndex::compact_as_base() { return compact_impl(false); }
 
 size_t HNSWIndex::compact_impl(bool keep_ids) {
     auto remap = id_map_.compact(keep_ids);
-    if (remap.size() == 0) return 0;
+    if (remap.size() == 0) {
+        metadata_.drop_unused_strings();
+        return 0;
+    }
     metadata_.compact(remap);
 
     size_t write_slot = 0;

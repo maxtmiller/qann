@@ -97,6 +97,30 @@ public:
     vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k,
                                          const Expr& where, span<const int64_t> allowed) const;
 
+    // Overwrites the given metadata columns of the vectors with these ids; other
+    // columns keep their values. Throws std::invalid_argument before changing
+    // anything on an unknown, deleted or repeated id, a column the index
+    // doesn't have (see add_metadata_column), or metadata add_batch() would
+    // reject.
+    void update_metadata(span<const int64_t> ids, const Metadata& metadata);
+
+    // Adds a metadata column with value for every vector, or null for every
+    // vector without one; fill it further with update_metadata() or later
+    // adds. Throws std::invalid_argument if the name is empty or taken, or the
+    // value doesn't fit the type (ints fit a Float64 column).
+    void add_metadata_column(std::string name, ColumnType type, std::optional<Expr::Value> value = std::nullopt);
+
+    // Adds a metadata column holding values for the vectors with these ids
+    // (valid as in MetadataColumn), null for every other vector, in one step.
+    // Throws std::invalid_argument before changing anything on update_metadata()'s
+    // errors, a taken name, or values that don't fit the type.
+    void add_metadata_column(std::string name, ColumnType type, span<const int64_t> ids, MetadataColumn::Values values,
+                             vector<uint8_t> valid = {});
+
+    // Removes a metadata column and its values from every vector. Throws
+    // std::invalid_argument if the index has no such column.
+    void drop_metadata_column(const std::string& name);
+
     // Each metadata column's name and type, in the order they were created.
     vector<std::pair<std::string, ColumnType>> metadata_schema() const { return metadata_.schema(); }
 

@@ -44,6 +44,27 @@ void Index::add_batch(span<const float> vecs, size_t n, const int64_t* ids, cons
     metadata_.append(rows, n, metadata);
 }
 
+void Index::update_metadata(span<const int64_t> ids, const Metadata& metadata) {
+    const vector<uint32_t> slots = id_map().slots_of(ids);
+    metadata_.check_update(slots.size(), metadata);
+    metadata_.update(slots, metadata);
+}
+
+void Index::add_metadata_column(std::string name, ColumnType type, std::optional<Expr::Value> value) {
+    metadata_.add_column(std::move(name), type, slots(), value);
+}
+
+void Index::add_metadata_column(std::string name, ColumnType type, span<const int64_t> ids, MetadataColumn::Values values,
+                                vector<uint8_t> valid) {
+    const vector<uint32_t> slots = id_map().slots_of(ids);
+    MetadataColumn col(std::move(name), std::move(values), std::move(valid));
+    metadata_.check_new(col, type, slots.size());
+    metadata_.add_column(col.name, type, this->slots());
+    metadata_.update(slots, {std::move(col)});
+}
+
+void Index::drop_metadata_column(const std::string& name) { metadata_.drop_column(name); }
+
 vector<Neighbor> Index::query(span<const float> vec, size_t k) const {
     assert(vec.size() == dim());
     return std::move(query_prepared(vec, 1, k, nullptr, false)[0]);

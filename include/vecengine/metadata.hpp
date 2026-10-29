@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <iosfwd>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -28,10 +29,18 @@ enum class ColumnType : uint8_t {
     String = 2,  // stored dictionary-encoded: each distinct string once, rows hold codes
 };
 
-// One column of an add: a value for each of the batch's n rows.
+// One column of an add or update: a value for each of the batch's n rows.
+// valid is empty when every row has a value, or n flags with 0 where the row
+// is null (its entry in values is then ignored).
 struct MetadataColumn {
+    using Values = std::variant<vector<int64_t>, vector<double>, vector<std::string>>;
+
+    MetadataColumn(std::string name, Values values, vector<uint8_t> valid = {})
+        : name(std::move(name)), values(std::move(values)), valid(std::move(valid)) {}
+
     std::string name;
-    std::variant<vector<int64_t>, vector<double>, vector<std::string>> values;
+    Values values;
+    vector<uint8_t> valid;
 };
 
 // The metadata of one add: any number of columns, each with one value per row.
@@ -119,6 +128,7 @@ namespace detail {
 // created by the first add that mentions it, with earlier rows null; an add
 // that leaves a column out fills its rows with null. remove() needs nothing
 // here (deleted slots stay until compact(), and filters drop them).
+// update() overwrites rows in place.
 class MetadataStore {
 public:
     // Runs append()'s validation without changing anything, for a batch of n
@@ -126,14 +136,40 @@ public:
     // column that exists keeps its type. Throws std::invalid_argument.
     void check(size_t n, const Metadata& md) const;
 
+    // update()'s validation without changing anything: check()'s rules, and
+    // every column must already exist (update never creates one).
+    void check_update(size_t n, const Metadata& md) const;
+
+    // Writes md's rows into the given slots (one per row, distinct), leaving
+    // other columns and rows unchanged. Requires check_update() to have
+    // passed. With no slots nothing changes.
+    void update(const vector<uint32_t>& slots, const Metadata& md);
+
+    // check()'s rules for c as a column the store doesn't have yet, of n
+    // values that must fit `type`. Throws std::invalid_argument.
+    void check_new(const MetadataColumn& c, ColumnType type, size_t n) const;
+
+    // A new column of this type for all `rows` slots, each set to value, or
+    // null without one. Throws std::invalid_argument, changing nothing, on an
+    // empty or taken name or a value that doesn't fit the type.
+    void add_column(std::string name, ColumnType type, size_t rows, const std::optional<Expr::Value>& value = std::nullopt);
+
+    // Removes the column and its values. Throws std::invalid_argument if the
+    // store has no such column.
+    void drop_column(const std::string& name);
+
     // Appends n rows after the current `rows` (the index's slots before the
     // add). Requires check() to have passed. With n == 0 nothing changes, so
     // an empty add creates no columns.
     void append(size_t rows, size_t n, const Metadata& md);
 
     // Moves row old to remap[old] and drops rows marked IdMap::kRemoved, like
-    // the index's own compaction.
+    // the index's own compaction. Strings no remaining row uses are freed.
     void compact(const vector<uint32_t>& remap);
+
+    // Frees strings no row uses (left behind by update()), for a compaction
+    // that removes no rows.
+    void drop_unused_strings();
 
     // One bit per slot (slots bits, 64 per word), set where the row matches
     // `where`. Deleted slots are not cleared here. Throws
@@ -171,6 +207,9 @@ private:
 
     // The column with this name, or nullptr.
     const Column* find(const std::string& name) const;
+
+    // Writes row i of c into row `to` of col, which has c's type.
+    static void write_row(Column& col, size_t to, const MetadataColumn& c, size_t i);
 
     // Bits of the rows of one leaf (comparison, In or IsNull).
     vector<uint64_t> evaluate_leaf(const Expr& leaf, size_t slots) const;

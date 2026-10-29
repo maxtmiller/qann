@@ -83,6 +83,34 @@ size_t IdMap::remove(span<const int64_t> ids, vector<uint32_t>* removed_slots) {
     return counter;
 }
 
+vector<uint32_t> IdMap::slots_of(span<const int64_t> ids) const {
+    vector<uint32_t> slots;
+    slots.reserve(ids.size());
+    for (int64_t id : ids) {
+        uint32_t slot = 0;
+        bool found;
+        if (custom_ids_) {
+            auto it = slot_of_.find(id);
+            found = it != slot_of_.end();
+            if (found) slot = it->second;
+        } else if (labels_.empty()) {
+            found = id >= 0 && static_cast<uint64_t>(id) < slots_;
+            if (found) slot = static_cast<uint32_t>(id);
+        } else {
+            auto it = std::lower_bound(labels_.begin(), labels_.end(), id);
+            found = it != labels_.end() && *it == id;
+            if (found) slot = static_cast<uint32_t>(it - labels_.begin());
+        }
+        if (!found || deleted_[slot]) throw std::invalid_argument("id " + std::to_string(id) + " is not in the index");
+        slots.push_back(slot);
+    }
+    vector<uint32_t> sorted = slots;
+    std::sort(sorted.begin(), sorted.end());
+    if (auto dup = std::adjacent_find(sorted.begin(), sorted.end()); dup != sorted.end())
+        throw std::invalid_argument("id " + std::to_string(label(*dup)) + " appears twice");
+    return slots;
+}
+
 SlotFilter IdMap::filter(span<const int64_t> ids) const {
     SlotFilter f;
     f.words.assign((slots_ + 63) / 64, 0);
