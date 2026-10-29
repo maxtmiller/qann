@@ -1035,9 +1035,32 @@ def test_metadata_sql_where(data):
         for _ in range(300):
             e = ~e
     chain = " OR ".join(f"price = {p}" for p in range(100000))
-    np.testing.assert_array_equal(index.batch_query(queries, 10, where=chain)[0],
-                                  index.batch_query(queries, 10, where="price IS NOT NULL")[0])
-    assert len(repr(qann.where(chain))) > 100000
+    with pytest.raises(ValueError, match="more than 1024 conditions"):
+        qann.where(chain)
+    qann.set_max_filter_conditions(100000)
+    try:
+        np.testing.assert_array_equal(index.batch_query(queries, 10, where=chain)[0],
+                                      index.batch_query(queries, 10, where="price IS NOT NULL")[0])
+        assert len(repr(qann.where(chain))) > 100000
+    finally:
+        qann.set_max_filter_conditions(1024)
+
+    # the limit: an IN list counts once, code-built filters are free, and it must be >= 1
+    assert qann.get_max_filter_conditions() == 1024
+    same(("price IN (" + ", ".join(["?"] * 5000) + ")", list(range(5000))), "price IS NOT NULL")
+    assert len(repr(qann.field("price").isin(list(range(5000))))) > 5000
+    qann.set_max_filter_conditions(1)
+    try:
+        qann.where("price < 5")
+        with pytest.raises(ValueError, match="more than 1 conditions"):
+            qann.where("price < 5 AND color = 'red'")
+    finally:
+        qann.set_max_filter_conditions(1024)
+    with pytest.raises(ValueError, match="at least 1"):
+        qann.set_max_filter_conditions(0)
+    with pytest.raises(TypeError):
+        qann.set_max_filter_conditions(-1)
+    assert qann.get_max_filter_conditions() == 1024
 
 def test_metadata_unsigned_overflow_and_empty_adds(data):
     index = qann.FlatIndex(32)

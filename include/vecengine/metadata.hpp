@@ -91,6 +91,14 @@ public:
     static Expr parse(std::string_view sql, const vector<Value>& params = {});
     static Expr parse(std::string_view sql, const std::unordered_map<std::string, Value>& params);
 
+    // The most conditions (comparisons, IN, IS NULL, BETWEEN; an IN list
+    // counts once) parse() accepts, so a filter string from user input can't
+    // make every query scan its columns thousands of times. Process-wide;
+    // filters built with compare / isin / & / | aren't limited. n must be >= 1.
+    static constexpr size_t kDefaultMaxConditions = 1024;
+    static size_t max_conditions() noexcept;
+    static void set_max_conditions(size_t n);
+
     // All (op And) or any (op Or) of children, as one node: children that are
     // themselves the same op are merged in, so a long chain stays one level.
     static Expr join(Op op, vector<Expr> children);

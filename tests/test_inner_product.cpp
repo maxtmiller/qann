@@ -361,7 +361,11 @@ TEST_CASE("HNSW finds inner product neighbors at exact -dot distances", "[ip][hn
 
     HNSWIndex hnsw(dim, 16, 100, false, 1, Metric::InnerProduct);
     hnsw.set_ef_search(200);
-    hnsw.add_batch(data, n);
+    {
+        // a parallel build varies run to run, enough to cross the threshold about 1 in 200 times
+        OneThread one_thread;
+        hnsw.add_batch(data, n);
+    }
     const auto got = hnsw.query_batch(queries, nq, k);
     REQUIRE(recall(got, truth) >= 0.97);
     for (size_t q = 0; q < nq; ++q) {

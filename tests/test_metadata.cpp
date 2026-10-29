@@ -60,6 +60,13 @@ std::vector<int64_t> ids_where(size_t n, const std::function<bool(size_t)>& pred
     return out;
 }
 
+// Raises the parser's condition limit for one scope.
+struct ConditionLimit {
+    size_t saved = Expr::max_conditions();
+    explicit ConditionLimit(size_t n) { Expr::set_max_conditions(n); }
+    ~ConditionLimit() { Expr::set_max_conditions(saved); }
+};
+
 // The slots set in a bit vector.
 std::vector<int64_t> bits_to_ids(const std::vector<uint64_t>& words, size_t slots) {
     std::vector<int64_t> out;
@@ -1066,6 +1073,43 @@ TEST_CASE("Expr::parse matches SQL's three-valued logic on rows with nulls (fuzz
     }
 }
 
+TEST_CASE("Expr::parse caps the number of conditions", "[metadata][parse]") {
+    REQUIRE(Expr::max_conditions() == Expr::kDefaultMaxConditions);
+    const auto chain = [](size_t n) {
+        std::string sql = "a = 0";
+        for (size_t i = 1; i < n; ++i) sql += " OR a = " + std::to_string(i);
+        return sql;
+    };
+    REQUIRE(Expr::parse(chain(1024)).children().size() == 1024);
+    const std::string over = chain(1025);
+    REQUIRE_THROWS_WITH(Expr::parse(over), "filter has more than 1024 conditions; combine values with IN (...) or "
+                                           "raise the limit at column " + std::to_string(over.rfind("a = ") + 1));
+
+    // one IN list, BETWEEN or negated form is one condition, however it expands
+    std::string in = "a IN (0";
+    for (int i = 1; i < 5000; ++i) in += ", " + std::to_string(i);
+    REQUIRE(Expr::parse(in + ")").values().size() == 5000);
+    std::string mixed;
+    for (int i = 0; i < 1024; ++i) mixed += std::string(i ? " AND " : "") + (i % 2 ? "a NOT BETWEEN 1 AND 2" : "a NOT IN (1, 2)");
+    REQUIRE_NOTHROW(Expr::parse(mixed));
+    REQUIRE_THROWS_AS(Expr::parse(mixed + " AND a IS NULL"), std::invalid_argument);
+
+    // filters built in code aren't limited
+    std::vector<Expr> terms;
+    for (int64_t i = 0; i < 5000; ++i) terms.push_back(Expr::compare("a", Op::Eq, i));
+    REQUIRE(Expr::join(Op::Or, terms).children().size() == 5000);
+
+    {
+        const ConditionLimit two(2);
+        REQUIRE_NOTHROW(Expr::parse("a = 1 AND b = 2"));
+        REQUIRE_THROWS_WITH(Expr::parse("a = 1 AND b = 2 AND c = 3"),
+                            "filter has more than 2 conditions; combine values with IN (...) or raise the limit at column 21");
+    }
+    REQUIRE(Expr::max_conditions() == 1024);
+    REQUIRE_THROWS_AS(Expr::set_max_conditions(0), std::invalid_argument);
+    REQUIRE(Expr::max_conditions() == 1024);
+}
+
 TEST_CASE("Expr: And / Or chains are flattened, and nesting is capped", "[metadata][parse]") {
     const auto a = [](int64_t v) { return f("a", Op::Eq, v); };
 
@@ -1084,6 +1128,7 @@ TEST_CASE("Expr: And / Or chains are flattened, and nesting is capped", "[metada
     SECTION("a long chain evaluates and prints without deep recursion") {
         MetadataStore store;
         store.append(0, 10, {{"a", std::vector<int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}}});
+        const ConditionLimit unlimited(1000000);
         std::string sql = "a = 100";
         std::vector<Expr> terms{a(100)};
         for (int64_t i = 0; i < 200000; ++i) {
