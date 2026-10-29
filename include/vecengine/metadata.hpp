@@ -9,6 +9,7 @@
 #include <iosfwd>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -50,6 +51,12 @@ public:
     using Value = std::variant<int64_t, double, std::string>;
     enum class Op : uint8_t { Eq, Ne, Lt, Le, Gt, Ge, In, IsNull, And, Or, Not };
 
+    // The deepest filter allowed, in levels of nesting. Evaluation recurses
+    // per level, so deeper filters throw std::invalid_argument instead of
+    // risking the stack. And / Or chains are flattened, so their length
+    // doesn't count.
+    static constexpr size_t kMaxDepth = 256;
+
     // field <op> value, for op one of Eq, Ne, Lt, Le, Gt, Ge.
     static Expr compare(std::string field, Op op, Value value);
 
@@ -59,6 +66,26 @@ public:
     // field has no value.
     static Expr is_null(std::string field);
 
+    // lo <= field <= hi, as (field >= lo) & (field <= hi); SQL's BETWEEN.
+    static Expr between(std::string field, Value lo, Value hi);
+
+    // A SQL WHERE clause (issue #46), e.g. "category = 'shoes' AND price < 50":
+    // comparisons (= != <> < <= > >=), [NOT] IN (...), IS [NOT] NULL,
+    // [NOT] BETWEEN x AND y, combined with AND, OR, NOT and parentheses, with
+    // SQL's precedence. Keywords are case-insensitive; strings are '...' ('' is
+    // a quote) and names that clash with keywords or use non-ASCII characters
+    // are "...". NOT keeps SQL's meaning: NOT (price < 50) excludes rows with
+    // no price, unlike ~. Numbers that overflow (1e400) are an error.
+    // Placeholders take values from params, bound after parsing so they can't
+    // change the filter's structure: ? in order from the list, or :name from
+    // the map. Throws std::invalid_argument naming the column of an error.
+    static Expr parse(std::string_view sql, const vector<Value>& params = {});
+    static Expr parse(std::string_view sql, const std::unordered_map<std::string, Value>& params);
+
+    // All (op And) or any (op Or) of children, as one node: children that are
+    // themselves the same op are merged in, so a long chain stays one level.
+    static Expr join(Op op, vector<Expr> children);
+
     // Both, either, and the negation of filters.
     friend Expr operator&(const Expr& a, const Expr& b);
     friend Expr operator|(const Expr& a, const Expr& b);
@@ -67,7 +94,7 @@ public:
     Op op() const noexcept { return node_->op; }
     const std::string& field() const noexcept { return node_->field; }        // leaves only
     const vector<Value>& values() const noexcept { return node_->values; }    // one for comparisons, any number for In
-    const vector<Expr>& children() const noexcept { return node_->children; } // two for And / Or, one for Not
+    const vector<Expr>& children() const noexcept { return node_->children; } // two or more for And / Or, one for Not
 
     // A readable form, e.g. (price < 50) & ~is_null(category).
     std::string to_string() const;
@@ -78,6 +105,7 @@ private:
         std::string field;
         vector<Value> values;
         vector<Expr> children;
+        size_t depth = 1;  // levels in this subtree, at most kMaxDepth
     };
     explicit Expr(std::shared_ptr<const Node> node) : node_(std::move(node)) {}
 

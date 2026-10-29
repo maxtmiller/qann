@@ -8,6 +8,7 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/map.h>
+#include <nanobind/stl/unordered_map.h>
 
 #include <cstdint>
 #include <limits>
@@ -144,6 +145,25 @@ static vecengine::Expr field_compare(const PyField& f, vecengine::Expr::Op op, v
     return vecengine::Expr::compare(f.name, op, std::move(value));
 }
 
+using SqlParams = std::variant<std::vector<vecengine::Expr::Value>, std::unordered_map<std::string, vecengine::Expr::Value>>;
+
+// where=: a qann.field filter, a SQL WHERE string, or (string, params) with
+// params a list for ? or a dict for :name.
+using WhereArg = std::variant<vecengine::Expr, std::string, std::pair<std::string, SqlParams>>;
+
+static vecengine::Expr parse_sql(const std::string& sql, const std::optional<SqlParams>& params) {
+    if (!params) return vecengine::Expr::parse(sql);
+    return std::visit([&](const auto& p) { return vecengine::Expr::parse(sql, p); }, *params);
+}
+
+static std::optional<vecengine::Expr> to_expr(const std::optional<WhereArg>& where) {
+    if (!where) return std::nullopt;
+    if (auto* e = std::get_if<vecengine::Expr>(&*where)) return *e;
+    if (auto* sql = std::get_if<std::string>(&*where)) return vecengine::Expr::parse(*sql);
+    const auto& [sql, params] = std::get<std::pair<std::string, SqlParams>>(*where);
+    return parse_sql(sql, params);
+}
+
 // Converts add()'s metadata argument, {name: values}, to columns of n values.
 // Values go through numpy.asarray: integer and bool arrays become Int64
 // columns, float arrays Float64, and str arrays (or object arrays of str)
@@ -237,10 +257,11 @@ static std::size_t index_size(const vecengine::Index& self) {
 // float32).
 static std::pair<NumpyArray<int64_t>, NumpyArray<float>>
 index_query(const vecengine::Index &self, FloatVector query, std::size_t k, std::optional<IdsArg> allowed,
-            std::optional<vecengine::Expr> where) {
+            std::optional<WhereArg> where_arg) {
     if (query.shape(0) != self.dim())
         throw std::invalid_argument("query dimension does not match index dimension");
 
+    const std::optional<vecengine::Expr> where = to_expr(where_arg);
     std::optional<IdVector> allowed_ids;
     if (allowed) allowed_ids = as_ids(*allowed);
     auto results = read_locked(self, [&] {
@@ -266,11 +287,12 @@ index_query(const vecengine::Index &self, FloatVector query, std::size_t k, std:
 // results are padded with -1 / inf.
 static std::pair<NumpyArray<int64_t>, NumpyArray<float>>
 index_batch_query(const vecengine::Index &self, FloatMatrix query, std::size_t k, std::optional<IdsArg> allowed,
-                  std::optional<vecengine::Expr> where) {
+                  std::optional<WhereArg> where_arg) {
     if (query.shape(1) != self.dim())
         throw std::invalid_argument("query dimension does not match index dimension");
 
     const std::size_t num_queries = query.shape(0);
+    const std::optional<vecengine::Expr> where = to_expr(where_arg);
     std::optional<IdVector> allowed_ids;
     if (allowed) allowed_ids = as_ids(*allowed);
     auto results = read_locked(self, [&] {
@@ -370,7 +392,7 @@ NB_MODULE(qann, m) {
                "Negative inner product -(a . b), so the largest inner product comes first");
 
     // Filters for where=: qann.field("price") < 50, combined with & | ~.
-    nb::class_<vecengine::Expr>(m, "Expr", "A metadata filter for where=; build one with qann.field()")
+    nb::class_<vecengine::Expr>(m, "Expr", "A metadata filter for where=; build one with qann.field() or qann.where()")
         .def("__and__", [](const vecengine::Expr& a, const vecengine::Expr& b) { return a & b; }, nb::arg("other"))
         .def("__or__", [](const vecengine::Expr& a, const vecengine::Expr& b) { return a | b; }, nb::arg("other"))
         .def("__invert__", [](const vecengine::Expr& a) { return ~a; })
@@ -378,7 +400,7 @@ NB_MODULE(qann, m) {
         // silently drop part of the filter, so refuse instead
         .def("__bool__", [](const vecengine::Expr&) -> bool {
             throw nb::type_error("a filter has no truth value: combine filters with & | ~ (not and / or / not), "
-                                 "and write ranges as (f > 0) & (f < 5)");
+                                 "and write ranges as f.between(0, 5) or (f > 0) & (f < 5)");
         })
         .def("__repr__", [](const vecengine::Expr& e) { return "qann.Expr(" + e.to_string() + ")"; });
 
@@ -396,10 +418,23 @@ NB_MODULE(qann, m) {
              nb::arg("values"), "Matches rows whose value is one of values")
         .def("is_null", [](const PyField& f) { return vecengine::Expr::is_null(f.name); },
              "Matches rows with no value in this column")
+        .def("between", [](const PyField& f, vecengine::Expr::Value lo, vecengine::Expr::Value hi) {
+                 return vecengine::Expr::between(f.name, std::move(lo), std::move(hi));
+             },
+             nb::arg("lo"), nb::arg("hi"),
+             "Matches rows with lo <= value <= hi, like SQL's BETWEEN: (field >= lo) & (field <= hi)")
         .def("__repr__", [](const PyField& f) { return "qann.field('" + f.name + "')"; });
 
     m.def("field", [](std::string name) { return PyField{std::move(name)}; }, nb::arg("name"),
           "A metadata column, for filters such as (qann.field('price') < 50) & (qann.field('color') == 'red')");
+
+    m.def("where", &parse_sql, nb::arg("sql"), nb::arg("params").none() = nb::none(),
+          "A filter from a SQL WHERE clause, e.g. \"category = 'shoes' AND price < ?\" with params [50]: "
+          "comparisons (= != <> < <= > >=), [NOT] IN (...), IS [NOT] NULL, [NOT] BETWEEN x AND y, AND, OR, "
+          "NOT and parentheses. Placeholders take values from params (a list for ?, a dict for :name), so "
+          "user input never changes the filter's structure. NOT follows SQL: NOT (price < 50) excludes rows "
+          "with no price, unlike ~. Combines with qann.field filters through & | ~; raises ValueError "
+          "naming the column of a syntax error");
 
     nb::class_<vecengine::Index>(m, "Index")
         .def("save", [](const vecengine::Index& self, const std::filesystem::path& path) {
@@ -419,12 +454,14 @@ NB_MODULE(qann, m) {
         .def("query", &index_query, nb::arg("query"), nb::arg("k"), nb::kw_only(), nb::arg("allowed").none() = nb::none(),
              nb::arg("where").none() = nb::none(),
              "Query k-NN for a (dim,) vector; returns 1D (indices, distances). With allowed (ids), only those "
-             "vectors can be returned; unknown and deleted ids in it are ignored. With where (a filter built from "
-             "qann.field), only vectors whose metadata matches; with both, only those that pass both")
+             "vectors can be returned; unknown and deleted ids in it are ignored. With where (a qann.field filter, "
+             "a SQL WHERE string as in qann.where, or (string, params)), only vectors whose metadata matches; "
+             "with both, only those that pass both")
         .def("batch_query", &index_batch_query, nb::arg("query"), nb::arg("k"), nb::kw_only(),
              nb::arg("allowed").none() = nb::none(), nb::arg("where").none() = nb::none(),
              "Query k-NN for each row; returns (indices, distances) arrays of shape (num_queries, k), padded with "
-             "-1 / inf. allowed (ids) and where (a qann.field filter) restrict the results as in query(), for every row")
+             "-1 / inf. allowed (ids) and where (a filter, SQL string or (string, params)) restrict the results as "
+             "in query(), for every row")
         .def_prop_ro("metadata_schema",
                      [](const vecengine::Index& self) {
                          auto schema = read_locked(self, [&] { return self.metadata_schema(); });

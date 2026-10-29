@@ -965,6 +965,80 @@ def test_metadata_input_and_filter_errors(data):
             misuse()
 
 
+
+def test_metadata_sql_where(data):
+    index = qann.FlatIndex(32)
+    i = np.arange(200)
+    index.add(data[:200], metadata={"price": i % 100, "color": COLORS[i % 4]})
+    index.add(data[200:210])    # no metadata: price and color null
+    f = qann.field
+    queries = data[:20] + 0.01
+
+    def same(where, expr):
+        np.testing.assert_array_equal(index.batch_query(queries, 10, where=where)[0],
+                                      index.batch_query(queries, 10, where=expr)[0])
+
+    same("price < 30 AND color != 'red'", (f("price") < 30) & (f("color") != "red"))
+    same("color IN ('red', 'blue') OR price BETWEEN 10 AND 20",
+         f("color").isin(["red", "blue"]) | ((f("price") >= 10) & (f("price") <= 20)))
+    same(("price < ? AND color = ?", [30, "red"]), (f("price") < 30) & (f("color") == "red"))
+    same(("price >= :lo AND price < :hi", {"lo": 5, "hi": 9.5}), (f("price") >= 5) & (f("price") < 9.5))
+    same(qann.where("price < ?", [30]) & (f("color") == "red"), (f("price") < 30) & (f("color") == "red"))
+    same(f("price").between(10, 20), "price BETWEEN 10 AND 20")
+    same(f("price").between(10, 20), (f("price") >= 10) & (f("price") <= 20))
+    assert repr(f("price").between(1, 2.5)) == "qann.Expr(((price >= 1) & (price <= 2.5)))"
+    ends = index.query(data[0], 210, where=f("price").between(10, 10))[0]
+    assert sorted(ends.tolist()) == [10, 110]    # both ends included; nulls never match
+    assert index.query(data[0], 10, where=f("price").between(20, 10))[0].size == 0
+    assert index.query(queries[0], 10, where="price IS NULL")[0].tolist() == \
+        index.query(queries[0], 10, allowed=np.arange(200, 210))[0].tolist()
+
+    # SQL's NOT excludes nulls; ~ includes them
+    nulls = np.arange(200, 210)
+    assert not np.isin(nulls, index.query(data[200], 210, where="NOT price < 50")[0]).any()
+    assert np.isin(nulls, index.query(data[200], 210, where=~(f("price") < 50))[0]).all()
+    assert repr(qann.where("NOT (price < 5 OR color IS NULL)")) == "qann.Expr(((price >= 5) & ~is_null(color)))"
+
+    # a parameter is one value, whatever it contains
+    assert index.query(queries[0], 10, where=("color = ?", ["red' OR 'a' = 'a"]))[0].size == 0
+
+    with pytest.raises(ValueError, match="unexpected .color. at column 11"):
+        index.query(queries[0], 10, where="price < 5 color = 'red'")
+    with pytest.raises(ValueError, match="no parameter named 'hi'"):
+        qann.where("price < :hi", {"lo": 1})
+    with pytest.raises(ValueError, match="placeholders"):
+        index.query(queries[0], 10, where=("price < ?", [1, 2]))
+    with pytest.raises(ValueError):    # unknown column, found when evaluated
+        index.query(queries[0], 10, where="size = 1")
+
+    # NumPy scalars work as values; bools compare as 0 / 1
+    same(("price < ? AND color = ?", [np.int32(30), np.str_("red")]), "price < 30 AND color = 'red'")
+    same(("price < ?", [np.float32(2.5)]), "price < 2.5")
+    same(f("price") < np.int64(30), "price < 30")
+    same(("price = ?", [True]), "price = 1")
+    same(("price < ?", (30,)), "price < 30")    # params may be any sequence
+    with pytest.raises(TypeError):
+        qann.where("price = ?", [None])
+    for bad in (("price < 5",), ("price < ?", [5], 1), 5, b"price < 5"):
+        with pytest.raises(TypeError):
+            index.query(queries[0], 10, where=bad)
+    with pytest.raises(ValueError, match="number out of range"):
+        qann.where("price < 1e400")
+    with pytest.raises(ValueError, match="non-ASCII characters needs double quotes"):
+        qann.where("prïce < 5")
+
+    # deep nesting raises instead of overflowing the stack; long chains are fine
+    with pytest.raises(ValueError, match="nested more than 256 levels"):
+        index.query(queries[0], 10, where="(" * 100000 + "price = 1" + ")" * 100000)
+    with pytest.raises(ValueError, match="nested more than 256 levels"):
+        e = f("price") == 1
+        for _ in range(300):
+            e = ~e
+    chain = " OR ".join(f"price = {p}" for p in range(100000))
+    np.testing.assert_array_equal(index.batch_query(queries, 10, where=chain)[0],
+                                  index.batch_query(queries, 10, where="price IS NOT NULL")[0])
+    assert len(repr(qann.where(chain))) > 100000
+
 def test_metadata_unsigned_overflow_and_empty_adds(data):
     index = qann.FlatIndex(32)
     with pytest.raises(ValueError):    # would wrap to a negative int64
