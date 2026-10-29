@@ -501,6 +501,13 @@ NB_MODULE(qann, m) {
           "with no price, unlike ~. Combines with qann.field filters through & | ~; raises ValueError "
           "naming the column of a syntax error");
 
+    m.def("get_max_filter_conditions", &vecengine::Expr::max_conditions,
+          "The most conditions a SQL where= string may have (default 1024); see set_max_filter_conditions");
+    m.def("set_max_filter_conditions", &vecengine::Expr::set_max_conditions, nb::arg("n"),
+          "Set the most conditions (comparisons, IN, IS NULL, BETWEEN; an IN list counts once) a SQL where= "
+          "string may have, for the whole process. Longer strings raise ValueError, so user input can't make "
+          "a query scan its columns thousands of times. Filters built with qann.field aren't limited");
+
     nb::class_<vecengine::Index>(m, "Index")
         .def("save", [](const vecengine::Index& self, const std::filesystem::path& path) {
                  read_locked(self, [&] { vecengine::save_index(self, path); });

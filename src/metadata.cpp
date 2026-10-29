@@ -3,6 +3,7 @@
 #include "serialize.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cerrno>
 #include <cmath>
@@ -110,6 +111,15 @@ Expr operator~(const Expr& a) {
     return Expr(std::make_shared<const Expr::Node>(Expr::Node{Expr::Op::Not, {}, {}, {a}, a.node_->depth + 1}));
 }
 
+static std::atomic<size_t> g_max_conditions{Expr::kDefaultMaxConditions};
+
+size_t Expr::max_conditions() noexcept { return g_max_conditions.load(std::memory_order_relaxed); }
+
+void Expr::set_max_conditions(size_t n) {
+    if (n == 0) throw std::invalid_argument("the filter condition limit must be at least 1");
+    g_max_conditions.store(n, std::memory_order_relaxed);
+}
+
 namespace {
 
 // Recursive descent over a SQL WHERE clause (see Expr::parse). NOT is pushed
@@ -119,7 +129,7 @@ namespace {
 class SqlParser {
 public:
     SqlParser(std::string_view sql, const vector<Expr::Value>* list, const std::unordered_map<std::string, Expr::Value>* named)
-        : sql_(sql), list_(list), named_(named) {}
+        : sql_(sql), list_(list), named_(named), max_conditions_(Expr::max_conditions()) {}
 
     Expr parse() {
         Expr e = or_expr(false);
@@ -332,6 +342,9 @@ private:
     }
 
     Expr predicate(bool neg) {
+        if (++conditions_ > max_conditions_)
+            fail("filter has more than " + std::to_string(max_conditions_) +
+                 " conditions; combine values with IN (...) or raise the limit");
         const std::string field = name();
         if (keyword("IS")) {
             const bool is_not = keyword("NOT");
@@ -374,6 +387,8 @@ private:
     const std::unordered_map<std::string, Expr::Value>* named_;
     size_t used_ = 0;
     size_t depth_ = 0;
+    size_t conditions_ = 0;
+    size_t max_conditions_;
 };
 
 } // namespace
