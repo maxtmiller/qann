@@ -135,15 +135,18 @@ public:
     // column that exists keeps its type. Throws std::invalid_argument.
     void check(size_t n, const Metadata& md) const;
 
-    // update()'s validation without changing anything: check()'s rules, and a
-    // column the store doesn't have is an error unless create is set.
-    void check_update(size_t n, const Metadata& md, bool create) const;
+    // update()'s validation without changing anything: check()'s rules, and
+    // every column must already exist (update never creates one).
+    void check_update(size_t n, const Metadata& md) const;
 
     // Writes md's rows into the given slots (one per row, distinct), leaving
-    // other columns and rows unchanged. A new column is created null for all
-    // `rows` slots first. Requires check_update() to have passed. With no
-    // slots nothing changes.
-    void update(const vector<uint32_t>& slots, size_t rows, const Metadata& md);
+    // other columns and rows unchanged. Requires check_update() to have
+    // passed. With no slots nothing changes.
+    void update(const vector<uint32_t>& slots, const Metadata& md);
+
+    // A new column of this type, null for all `rows` slots. Throws
+    // std::invalid_argument on an empty name or one the store already has.
+    void add_column(std::string name, ColumnType type, size_t rows);
 
     // Appends n rows after the current `rows` (the index's slots before the
     // add). Requires check() to have passed. With n == 0 nothing changes, so

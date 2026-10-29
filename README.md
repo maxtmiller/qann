@@ -45,7 +45,8 @@ Every index has the same core methods:
 | `batch_query(queries, k, *, allowed=None, where=None)` | k nearest neighbors for each row of an `(nq, dim)` array, run in parallel. Returns `(ids, dists)`. `allowed` restricts results to those ids and `where` to vectors whose metadata matches; see [Filtered search](#filtered-search). |
 | `query(query, k, *, allowed=None, where=None)` | k nearest neighbors for a single `(dim,)` vector such as `x[i]`. Returns 1D `(ids, dists)`. |
 | `metadata_schema` | Each metadata column's name and type (`'int'`, `'float'` or `'str'`). |
-| `update_metadata(ids, metadata, *, create=False)` | Overwrite metadata columns of existing vectors in place; see [Metadata](#metadata). |
+| `update_metadata(ids, metadata)` | Overwrite metadata columns of existing vectors in place; see [Metadata](#metadata). |
+| `add_metadata_column(name, type)` | Add an empty metadata column (`'int'`, `'float'` or `'str'`), null for every vector. |
 | `remove(ids)` | Delete vectors by id; returns how many were deleted. |
 | `compact()` | Free the memory of deleted vectors; returns how many were freed. Ids are unchanged, and so are results, except that `HNSWIndex` rebuilds its graph. |
 | `size()` | Number of vectors in the index (deleted ones excluded). |
@@ -276,7 +277,7 @@ ids, dists = index.batch_query(queries, 10, where=("user_id = ? AND year IN (?, 
 - **Types:** ints and floats compare as numbers; strings compare with strings (`<` is alphabetical). Filtering on a column the index doesn't have, or comparing a number column with a string, raises `ValueError`.
 - **Same search as `allowed`:** a `where` filter becomes the set of matching vectors and runs the [filtered search](#filtered-search) for every index, with the same recall behavior. With both `where` and `allowed`, only vectors passing both are returned.
 - **Cost:** each query call scans the columns its filter names once, shared by every row of a `batch_query`: about 0.4 ms per condition per million vectors. Strings are stored once per distinct value, plus 4 bytes per vector; ints and floats take 8 bytes per vector; each column also takes 1 byte per vector for its null flag.
-- **Updating:** `index.update_metadata(ids, {"price": [10, None]})` overwrites the given columns for those vectors in place (no re-insert), with one value per id; other columns keep their values. A column the index doesn't have raises `ValueError` so a typo can't create one; pass `create=True` to add it (null for every other vector). Unknown, deleted or repeated ids raise `ValueError`, and a failed call changes nothing. Strings no vector uses any more are freed by `compact()`.
+- **Updating:** `index.update_metadata(ids, {"price": [10, None]})` overwrites the given columns for those vectors in place (no re-insert), with one value per id; other columns keep their values. A column the index doesn't have raises `ValueError`, so a typo can't create one: add a column to existing vectors with `index.add_metadata_column("year", "int")`, which makes it null for every vector, then fill it with `update_metadata`. Unknown, deleted or repeated ids raise `ValueError`, and a failed call changes nothing. Strings no vector uses any more are freed by `compact()`.
 - **Kept with the index:** `remove` and `compact` keep metadata with its vector, and `save` / `qann.load` store it. A `RefineIndex` holds the metadata itself; add through it as usual.
 
 ## Saving and loading

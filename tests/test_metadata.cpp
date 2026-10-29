@@ -507,7 +507,7 @@ TEST_CASE("update_metadata overwrites rows in place and validates first", "[meta
         REQUIRE_THROWS_AS(flat.update_metadata(Ids{10, 11}, one), std::invalid_argument);                    // length
         REQUIRE_THROWS_AS(flat.update_metadata(Ids{10}, {{"price", std::vector<double>{1.5}}}), std::invalid_argument);
         REQUIRE_THROWS_WITH(flat.update_metadata(Ids{10}, {{"prcie", std::vector<int64_t>{1}}}),
-                            "the index has no metadata column 'prcie'; pass create=True to add it");
+                            "the index has no metadata column 'prcie'; add it with add_metadata_column");
         // a bad second column stops the first from being written too
         REQUIRE_THROWS_AS(flat.update_metadata(Ids{10}, {{"price", std::vector<int64_t>{77}}, {"color", std::vector<int64_t>{1}}}),
                           std::invalid_argument);
@@ -516,18 +516,25 @@ TEST_CASE("update_metadata overwrites rows in place and validates first", "[meta
         REQUIRE(match(f("price", Op::Eq, int64_t{77})).empty());
     }
 
-    SECTION("create adds a column, null for every other vector") {
-        flat.update_metadata(Ids{13}, {{"year", std::vector<int64_t>{2024}}}, true);
+    SECTION("add_metadata_column adds a typed all-null column to fill with updates") {
+        flat.add_metadata_column("year", ColumnType::Int64);
+        REQUIRE(match(Expr::is_null("year")) == Ids{10, 11, 12, 13, 14, 15});
+        flat.update_metadata(Ids{13}, {{"year", std::vector<int64_t>{2024}}});
         REQUIRE(match(f("year", Op::Eq, int64_t{2024})) == Ids{13});
-        REQUIRE(match(Expr::is_null("year")) == Ids{10, 11, 12, 14, 15});
-        REQUIRE_THROWS_WITH(flat.update_metadata(Ids{13}, {{"tag", std::vector<std::string>{""}, {0}}}, true),
-                            "metadata column 'tag' is new and has only nulls, so it has no type");
+        REQUIRE_THROWS_WITH(flat.add_metadata_column("year", ColumnType::Float64), "metadata column 'year' already exists");
+        REQUIRE_THROWS_AS(flat.add_metadata_column("", ColumnType::Int64), std::invalid_argument);
+        REQUIRE_THROWS_AS(flat.update_metadata(Ids{13}, {{"year", std::vector<double>{1.5}}}), std::invalid_argument);
+        // later adds fill it like any column
+        const int64_t next = 16;
+        flat.add_batch(std::span<const float>(data.data(), dim), 1, &next, {{"year", std::vector<int64_t>{2025}}});
+        REQUIRE(match(f("year", Op::Eq, int64_t{2025})) == Ids{16});
     }
 
-    SECTION("no ids change nothing and create no columns") {
-        flat.update_metadata(Ids{}, {{"year", std::vector<int64_t>{}}}, true);
-        REQUIRE(flat.metadata_schema().size() == 2);
+    SECTION("no ids change nothing, but an unknown column still throws") {
+        flat.update_metadata(Ids{}, {{"price", std::vector<double>{}}});    // no values, so no type to clash
+        REQUIRE(match(f("price", Op::Ge, int64_t{0})) == Ids{10, 11, 12, 13, 14});
         REQUIRE_THROWS_AS(flat.update_metadata(Ids{}, {{"year", std::vector<int64_t>{}}}), std::invalid_argument);
+        REQUIRE(flat.metadata_schema().size() == 2);
     }
 
     SECTION("updates survive compact and save / load, and replaced strings are freed") {
@@ -571,6 +578,17 @@ TEST_CASE("update_metadata on auto ids after compaction, and through a RefineInd
     refine.update_metadata(Ids{200}, {{"color", std::vector<std::string>{"a"}}});
     REQUIRE(refine.query(q, 3, f("color", Op::Eq, std::string("a"))).size() == 2);
     REQUIRE(base.metadata_schema().empty());
+    refine.add_metadata_column("rank", ColumnType::Float64);
+    refine.update_metadata(Ids{300}, {{"rank", std::vector<double>{0.5}}});
+    REQUIRE(refine.query(q, 3, f("rank", Op::Gt, 0.0))[0].index == 300);
+    REQUIRE(base.metadata_schema().empty());
+
+    // a column on an empty index: adds without it fill it with nulls
+    FlatIndex fresh(dim);
+    fresh.add_metadata_column("tag", ColumnType::String);
+    fresh.add_batch(std::span<const float>(data.data(), dim), 1);
+    REQUIRE(fresh.metadata_schema() == std::vector<std::pair<std::string, ColumnType>>{{"tag", ColumnType::String}});
+    REQUIRE(fresh.query(q, 1, Expr::is_null("tag")).size() == 1);
 }
 
 TEST_CASE("add_batch takes null flags", "[metadata]") {

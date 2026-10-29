@@ -44,10 +44,14 @@ void Index::add_batch(span<const float> vecs, size_t n, const int64_t* ids, cons
     metadata_.append(rows, n, metadata);
 }
 
-void Index::update_metadata(span<const int64_t> ids, const Metadata& metadata, bool create) {
+void Index::update_metadata(span<const int64_t> ids, const Metadata& metadata) {
     const vector<uint32_t> slots = id_map().slots_of(ids);
-    metadata_.check_update(slots.size(), metadata, create);
-    metadata_.update(slots, this->slots(), metadata);
+    metadata_.check_update(slots.size(), metadata);
+    metadata_.update(slots, metadata);
+}
+
+void Index::add_metadata_column(std::string name, ColumnType type) {
+    metadata_.add_column(std::move(name), type, slots());
 }
 
 vector<Neighbor> Index::query(span<const float> vec, size_t k) const {

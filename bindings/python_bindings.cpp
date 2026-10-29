@@ -259,12 +259,25 @@ static void index_add(vecengine::Index &self, FloatMatrix data, std::optional<Id
 }
 
 // Overwrite metadata columns of the vectors with these ids.
-static void index_update_metadata(vecengine::Index& self, IdsArg ids, nb::dict metadata, bool create) {
+static void index_update_metadata(vecengine::Index& self, IdsArg ids, nb::dict metadata) {
     IdVector id_array = as_ids(ids);
     const vecengine::Metadata md = as_metadata(metadata, id_array.shape(0), "id");
     write_locked(self, [&] {
         refuse_if_wrapped(self, "update metadata");
-        self.update_metadata(std::span<const int64_t>(id_array.data(), id_array.shape(0)), md, create);
+        self.update_metadata(std::span<const int64_t>(id_array.data(), id_array.shape(0)), md);
+    });
+}
+
+// Add an empty metadata column; type is 'int', 'float' or 'str', as metadata_schema reports them.
+static void index_add_metadata_column(vecengine::Index& self, std::string name, const std::string& type) {
+    vecengine::ColumnType t;
+    if (type == "int") t = vecengine::ColumnType::Int64;
+    else if (type == "float") t = vecengine::ColumnType::Float64;
+    else if (type == "str") t = vecengine::ColumnType::String;
+    else throw std::invalid_argument("metadata column type must be 'int', 'float' or 'str'; got '" + type + "'");
+    write_locked(self, [&] {
+        refuse_if_wrapped(self, "add a metadata column");
+        self.add_metadata_column(std::move(name), t);
     });
 }
 
@@ -485,12 +498,13 @@ NB_MODULE(qann, m) {
              "metadata is {name: n values} (ints, floats or strings) to filter queries on with where=; a new "
              "column is null for earlier vectors, and a column left out of an add is null for its vectors. "
              "None in a column's values is a null")
-        .def("update_metadata", &index_update_metadata, nb::arg("ids"), nb::arg("metadata"), nb::kw_only(),
-             nb::arg("create") = false,
+        .def("update_metadata", &index_update_metadata, nb::arg("ids"), nb::arg("metadata"),
              "Overwrite metadata in place: metadata is {name: one value per id}, None sets a value to null, and "
-             "columns left out keep their values. A column the index doesn't have raises ValueError unless "
-             "create=True, which adds it (null for every other vector). Unknown, deleted or repeated ids raise "
-             "ValueError, and a failed call changes nothing")
+             "columns left out keep their values. Unknown, deleted or repeated ids, and columns the index "
+             "doesn't have (see add_metadata_column), raise ValueError; a failed call changes nothing")
+        .def("add_metadata_column", &index_add_metadata_column, nb::arg("name"), nb::arg("type"),
+             "Add an empty metadata column of type 'int', 'float' or 'str', null for every vector; fill it "
+             "with update_metadata or later adds. Raises ValueError if the name is taken")
         .def("remove", &index_remove, nb::arg("ids"),
              "Delete the vectors with these ids; unknown ids are skipped. Returns how many were deleted")
         .def("compact", &index_compact,

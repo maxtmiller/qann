@@ -1086,7 +1086,7 @@ def test_metadata_none_and_update(tmp_path, data):
         index.update_metadata([100, 101], {"price": [1]})
     with pytest.raises(ValueError, match="holds int values; got string"):
         index.update_metadata([100], {"price": ["x"]})
-    with pytest.raises(ValueError, match="no metadata column 'prcie'; pass create=True"):
+    with pytest.raises(ValueError, match="no metadata column 'prcie'; add it with add_metadata_column"):
         index.update_metadata([100], {"prcie": [1]})
     with pytest.raises(ValueError):    # the bad second column stops the first
         index.update_metadata([104], {"price": [77], "color": [1]})
@@ -1097,16 +1097,20 @@ def test_metadata_none_and_update(tmp_path, data):
     with pytest.raises(ValueError, match="id 104 is not in the index"):
         index.update_metadata([104], {"price": [1]})
 
-    # create adds a column, null for the rest; a new all-None column has no type
-    index.update_metadata([105, 106], {"year": [2024, 2025]}, create=True)
+    # add_metadata_column adds a typed column, null for every vector, to fill with updates
+    index.add_metadata_column("year", "int")
     assert index.metadata_schema["year"] == "int"
+    index.update_metadata([105, 106], {"year": [2024, 2025]})
     assert match(f("year").is_null()) == [100, 101, 102, 103, 107, 108, 109]
-    with pytest.raises(ValueError, match="only nulls"):
-        index.update_metadata([105], {"tag": [None]}, create=True)
-    with pytest.raises(ValueError, match="only nulls"):
+    with pytest.raises(ValueError, match="already exists"):
+        index.add_metadata_column("year", "float")
+    with pytest.raises(ValueError, match="'int', 'float' or 'str'"):
+        index.add_metadata_column("score", "double")
+    with pytest.raises(ValueError, match="only nulls"):    # add() still infers a new column's type
         index.add(data[10:11], [200], metadata={"tag": [None]})
-    index.update_metadata([], {"never": []}, create=True)    # no ids: nothing happens
-    assert "never" not in index.metadata_schema
+    index.update_metadata([], {"year": []})    # no ids: nothing happens
+    with pytest.raises(ValueError, match="no metadata column 'never'"):
+        index.update_metadata([], {"never": []})
 
     # survives save / load
     path = tmp_path / "updated.qann"
@@ -1123,6 +1127,10 @@ def test_metadata_none_and_update(tmp_path, data):
     assert sorted(refine.query(q, 3, where=f("color") == "a")[0].tolist()) == [0, 1]
     with pytest.raises(ValueError, match="through the RefineIndex"):
         ivf.update_metadata([0], {"color": ["z"]})
+    with pytest.raises(ValueError, match="through the RefineIndex"):
+        ivf.add_metadata_column("rank", "float")
+    refine.add_metadata_column("rank", "float")
+    assert refine.metadata_schema["rank"] == "float"
 
 
 def test_concurrent_metadata_adds_and_filtered_queries(data):
