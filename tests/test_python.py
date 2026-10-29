@@ -1186,6 +1186,14 @@ def test_metadata_columns_defaults_values_and_drop(tmp_path, data):
     with pytest.raises(ValueError):
         index.query(q, 3, where="tag = 'd'")
     index.add_metadata_column("tag", "int", default=0)    # the name is free again
+
+    # None in a float column, an all-None update to a string column, a negative id
+    index.update_metadata([2], {"price": [None]})
+    assert match("price IS NULL") == [2]
+    index.update_metadata([1, 3], {"label": [None, None]})
+    assert match("label IS NULL") == [1, 3]
+    with pytest.raises(ValueError, match="id -1 is not in the index"):
+        index.update_metadata([-1], {"price": [1.0]})
     path = tmp_path / "columns.qann"
     index.save(path)
     loaded = qann.load(path)

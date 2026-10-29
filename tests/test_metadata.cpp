@@ -672,6 +672,52 @@ TEST_CASE("add_metadata_column: a default, values by id, ints into floats, and d
     }
 }
 
+TEST_CASE("update_metadata and string cleanup on compact work on every index", "[metadata]") {
+    const size_t n = 1000, dim = 8;
+    const auto data = md_random(n, dim, 15);
+    std::vector<std::string> tags(n, "common");
+    tags[5] = "rare";
+
+    auto flat = std::make_unique<FlatIndex>(dim);
+    auto ivf = std::make_unique<IVFIndex>(dim, 100, 100);    // every list probed, so results are exact
+    ivf->train(data, n, 25, 1);
+    auto hnsw = std::make_unique<HNSWIndex>(dim, 16, 100, false, 1);
+    auto base = std::make_unique<FlatIndex>(dim);
+    auto refine = std::make_unique<RefineIndex>(*base, 4);
+    std::vector<std::pair<std::string, Index*>> indexes = {
+        {"flat", flat.get()}, {"ivf", ivf.get()}, {"hnsw", hnsw.get()}, {"refine", refine.get()}};
+
+    using Ids = std::vector<int64_t>;
+    const std::span<const float> q(data.data(), dim);
+    for (auto& [name, index] : indexes) {
+        INFO(name);
+        index->add_batch(data, n, nullptr, {{"tag", tags}});
+        index->update_metadata(Ids{5, 9}, {{"tag", std::vector<std::string>{"common", "fresh"}}});
+        const auto fresh = index->query(q, n, f("tag", Op::Eq, std::string("fresh")));
+        REQUIRE(fresh.size() == 1);
+        REQUIRE(fresh[0].index == 9);
+        REQUIRE(index->query(q, n, f("tag", Op::Eq, std::string("rare"))).empty());
+
+        // nothing is deleted, so compact frees only the string no row uses
+        REQUIRE(index->compact() == 0);
+        std::stringstream buf;
+        index->save(buf);
+        REQUIRE(buf.str().find("rare") == std::string::npos);
+        REQUIRE(buf.str().find("fresh") != std::string::npos);
+        auto loaded = load_index(buf);
+        const auto again = loaded->query(q, n, f("tag", Op::Eq, std::string("fresh")));
+        REQUIRE(again.size() == 1);
+        REQUIRE(again[0].index == 9);
+
+        // a column left with no values survives compact
+        index->add_metadata_column("empty", ColumnType::Int64);
+        index->remove(Ids{0});
+        index->compact();
+        REQUIRE(index->metadata_schema().size() == 2);
+    }
+    REQUIRE(base->metadata_schema().empty());
+}
+
 TEST_CASE("add_batch takes null flags", "[metadata]") {
     const size_t dim = 4;
     const auto data = md_random(3, dim, 13);
