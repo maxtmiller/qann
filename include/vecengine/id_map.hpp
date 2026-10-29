@@ -63,6 +63,10 @@ public:
     // ids are ignored.
     SlotFilter filter(span<const int64_t> ids) const;
 
+    // The slot of each id, in order. Throws std::invalid_argument on the first
+    // unknown, deleted or repeated id.
+    vector<uint32_t> slots_of(span<const int64_t> ids) const;
+
     // A filter from raw bits (one per slot, as MetadataStore::evaluate makes
     // them) with deleted slots cleared and the set bits counted.
     SlotFilter live(vector<uint64_t> words) const;

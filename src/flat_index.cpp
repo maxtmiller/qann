@@ -71,7 +71,10 @@ size_t FlatIndex::compact_as_base() { return compact_impl(false); }
 
 size_t FlatIndex::compact_impl(bool keep_ids) {
     auto remap = id_map_.compact(keep_ids);
-    if (remap.empty()) return 0;
+    if (remap.empty()) {
+        metadata_.drop_unused_strings();
+        return 0;
+    }
     compact_storage(remap);
     metadata_.compact(remap);
     return remap.size() - id_map_.slots();

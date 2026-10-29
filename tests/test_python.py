@@ -1053,6 +1053,78 @@ def test_metadata_unsigned_overflow_and_empty_adds(data):
     assert index.metadata_schema["tag"] == "str"
 
 
+def test_metadata_none_and_update(tmp_path, data):
+    f = qann.field
+    index = qann.FlatIndex(32, custom_ids=True)
+    ids = np.arange(100, 110)
+    index.add(data[:10], ids, metadata={"price": [1, 2, None, 4, 5, 6, 7, 8, 9, 10],
+                                         "color": ["red", None, "blue", "red", "blue", "red", "blue", "red", "blue", "red"]})
+    assert index.metadata_schema == {"price": "int", "color": "str"}
+    q = data[0]
+
+    def match(where):
+        return sorted(index.query(q, 10, where=where)[0].tolist())
+
+    assert match(f("price").is_null()) == [102]
+    assert match("color IS NULL") == [101]
+
+    # only the given ids and columns change; None sets a null
+    index.update_metadata([103, 100], {"price": [40, None]})
+    assert match(f("price") == 40) == [103]
+    assert match(f("price").is_null()) == [100, 102]
+    assert match(f("color") == "red") == [100, 103, 105, 107, 109]
+    index.update_metadata(np.array([101]), {"color": ["green"], "price": np.array([11])})
+    assert match("color = 'green' AND price = 11") == [101]
+
+    # bad calls raise and change nothing
+    before = index.query(q, 10, where=f("price") >= 0)[0].tolist()
+    with pytest.raises(ValueError, match="id 999 is not in the index"):
+        index.update_metadata([999], {"price": [1]})
+    with pytest.raises(ValueError, match="id 100 appears twice"):
+        index.update_metadata([100, 100], {"price": [1, 2]})
+    with pytest.raises(ValueError, match="one value per id"):
+        index.update_metadata([100, 101], {"price": [1]})
+    with pytest.raises(ValueError, match="holds int values; got string"):
+        index.update_metadata([100], {"price": ["x"]})
+    with pytest.raises(ValueError, match="no metadata column 'prcie'; pass create=True"):
+        index.update_metadata([100], {"prcie": [1]})
+    with pytest.raises(ValueError):    # the bad second column stops the first
+        index.update_metadata([104], {"price": [77], "color": [1]})
+    with pytest.raises(TypeError, match="mixes strings"):
+        index.update_metadata([104, 105], {"color": ["a", 1]})
+    assert index.query(q, 10, where=f("price") >= 0)[0].tolist() == before
+    index.remove([104])
+    with pytest.raises(ValueError, match="id 104 is not in the index"):
+        index.update_metadata([104], {"price": [1]})
+
+    # create adds a column, null for the rest; a new all-None column has no type
+    index.update_metadata([105, 106], {"year": [2024, 2025]}, create=True)
+    assert index.metadata_schema["year"] == "int"
+    assert match(f("year").is_null()) == [100, 101, 102, 103, 107, 108, 109]
+    with pytest.raises(ValueError, match="only nulls"):
+        index.update_metadata([105], {"tag": [None]}, create=True)
+    with pytest.raises(ValueError, match="only nulls"):
+        index.add(data[10:11], [200], metadata={"tag": [None]})
+    index.update_metadata([], {"never": []}, create=True)    # no ids: nothing happens
+    assert "never" not in index.metadata_schema
+
+    # survives save / load
+    path = tmp_path / "updated.qann"
+    index.save(path)
+    loaded = qann.load(path)
+    assert sorted(loaded.query(q, 10, where="year = 2025")[0].tolist()) == [106]
+    assert sorted(loaded.query(q, 10, where="color = 'green'")[0].tolist()) == [101]
+
+    # the base of a RefineIndex is updated through the RefineIndex
+    ivf = qann.FlatIndex(32)
+    refine = qann.RefineIndex(ivf, k_factor=2)
+    refine.add(data[:3], metadata={"color": ["a", "b", "c"]})
+    refine.update_metadata([1], {"color": ["a"]})
+    assert sorted(refine.query(q, 3, where=f("color") == "a")[0].tolist()) == [0, 1]
+    with pytest.raises(ValueError, match="through the RefineIndex"):
+        ivf.update_metadata([0], {"color": ["z"]})
+
+
 def test_concurrent_metadata_adds_and_filtered_queries(data):
     # adds with metadata (exclusive lock) interleaved with where= queries (shared):
     # every result must satisfy the filter as of some consistent state

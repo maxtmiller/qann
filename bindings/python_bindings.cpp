@@ -164,47 +164,74 @@ static std::optional<vecengine::Expr> to_expr(const std::optional<WhereArg>& whe
     return parse_sql(sql, params);
 }
 
-// Converts add()'s metadata argument, {name: values}, to columns of n values.
-// Values go through numpy.asarray: integer and bool arrays become Int64
-// columns, float arrays Float64, and str arrays (or object arrays of str)
-// String columns. Must run with the GIL held.
-static vecengine::Metadata as_metadata(nb::dict metadata, std::size_t n) {
+// Converts one metadata column of n values. Values go through numpy.asarray:
+// integer and bool arrays become Int64 columns, float arrays Float64, and str
+// arrays (or object arrays of str) String columns. None marks a null, and the
+// other values decide the type. `per` says what each value belongs to, for
+// errors. Must run with the GIL held.
+static vecengine::MetadataColumn as_column(const std::string& name, nb::handle value, std::size_t n, const char* per) {
     nb::module_ np = nb::module_::import_("numpy");
+    nb::object arr = np.attr("asarray")(value);
+    if (nb::cast<std::size_t>(arr.attr("ndim")) != 1)
+        throw nb::type_error(("metadata column '" + name + "' must be one-dimensional").c_str());
+    if (nb::cast<std::size_t>(arr.attr("shape")[nb::int_(0)]) != n)
+        throw std::invalid_argument("metadata column '" + name + "' must have one value per " + per);
+
+    const auto kind = nb::cast<std::string>(arr.attr("dtype").attr("kind"));
+    // numpy.asarray(["a", 1]) silently makes "1" a string, so check a list's own items
+    nb::object items = nb::hasattr(value, "dtype") ? arr.attr("tolist")() : nb::borrow(value);
+    if (kind == "O") {
+        std::vector<uint8_t> valid;
+        nb::list present;
+        for (nb::handle item : items) {
+            valid.push_back(!item.is_none());
+            if (!item.is_none()) present.append(item);
+        }
+        if (std::find(valid.begin(), valid.end(), 0) != valid.end()) {
+            const std::size_t m = nb::len(present);
+            vecengine::MetadataColumn col = m ? as_column(name, present, m, per)
+                                              : vecengine::MetadataColumn(name, std::vector<int64_t>{});
+            std::visit([&](auto& v) {  // spread the m values over the n rows; nulls keep a default
+                std::decay_t<decltype(v)> full(n);
+                for (std::size_t i = 0, j = 0; i < n; ++i)
+                    if (valid[i]) full[i] = std::move(v[j++]);
+                v = std::move(full);
+            }, col.values);
+            col.valid = std::move(valid);
+            return col;
+        }
+    }
+    if (kind == "u" && nb::cast<std::size_t>(arr.attr("size")) > 0 &&
+        nb::cast<uint64_t>(arr.attr("max")()) > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+        throw std::invalid_argument("metadata column '" + name + "' has values above the int64 maximum");
+    if (kind == "i" || kind == "u" || kind == "b") {
+        auto ints = nb::cast<IdVector>(np.attr("ascontiguousarray")(arr, nb::arg("dtype") = "int64"));
+        return {name, std::vector<int64_t>(ints.data(), ints.data() + ints.shape(0))};
+    }
+    if (kind == "f") {
+        auto floats = nb::cast<nb::ndarray<double, nb::ndim<1>, nb::c_contig, nb::device::cpu>>(
+            np.attr("ascontiguousarray")(arr, nb::arg("dtype") = "float64"));
+        return {name, std::vector<double>(floats.data(), floats.data() + floats.shape(0))};
+    }
+    if (kind == "U" || kind == "O") {
+        std::vector<std::string> strings;
+        strings.reserve(n);
+        for (nb::handle item : items) {
+            if (!nb::isinstance<nb::str>(item))
+                throw nb::type_error(("metadata column '" + name + "' mixes strings with other values").c_str());
+            strings.push_back(nb::cast<std::string>(item));
+        }
+        return {name, std::move(strings)};
+    }
+    throw nb::type_error(("metadata column '" + name + "' must hold ints, floats or strings").c_str());
+}
+
+// Converts a metadata argument, {name: values}, to columns of n values each.
+static vecengine::Metadata as_metadata(nb::dict metadata, std::size_t n, const char* per) {
     vecengine::Metadata out;
     for (auto [key, value] : metadata) {
         if (!nb::isinstance<nb::str>(key)) throw nb::type_error("metadata column names must be strings");
-        const std::string name = nb::cast<std::string>(key);
-        nb::object arr = np.attr("asarray")(value);
-        if (nb::cast<std::size_t>(arr.attr("ndim")) != 1)
-            throw nb::type_error(("metadata column '" + name + "' must be one-dimensional").c_str());
-        if (nb::cast<std::size_t>(arr.attr("shape")[nb::int_(0)]) != n)
-            throw std::invalid_argument("metadata column '" + name + "' must have one value per row of data");
-
-        const auto kind = nb::cast<std::string>(arr.attr("dtype").attr("kind"));
-        if (kind == "u" && nb::cast<std::size_t>(arr.attr("size")) > 0 &&
-            nb::cast<uint64_t>(arr.attr("max")()) > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
-            throw std::invalid_argument("metadata column '" + name + "' has values above the int64 maximum");
-        if (kind == "i" || kind == "u" || kind == "b") {
-            auto ints = nb::cast<IdVector>(np.attr("ascontiguousarray")(arr, nb::arg("dtype") = "int64"));
-            out.push_back({name, std::vector<int64_t>(ints.data(), ints.data() + ints.shape(0))});
-        } else if (kind == "f") {
-            auto floats = nb::cast<nb::ndarray<double, nb::ndim<1>, nb::c_contig, nb::device::cpu>>(
-                np.attr("ascontiguousarray")(arr, nb::arg("dtype") = "float64"));
-            out.push_back({name, std::vector<double>(floats.data(), floats.data() + floats.shape(0))});
-        } else if (kind == "U" || kind == "O") {
-            std::vector<std::string> strings;
-            strings.reserve(n);
-            // numpy.asarray(["a", 1]) silently makes "1" a string, so check a list's own items
-            nb::object items = nb::hasattr(value, "dtype") ? arr.attr("tolist")() : nb::borrow(value);
-            for (nb::handle item : items) {
-                if (!nb::isinstance<nb::str>(item))
-                    throw nb::type_error(("metadata column '" + name + "' mixes strings with other values").c_str());
-                strings.push_back(nb::cast<std::string>(item));
-            }
-            out.push_back({name, std::move(strings)});
-        } else {
-            throw nb::type_error(("metadata column '" + name + "' must hold ints, floats or strings").c_str());
-        }
+        out.push_back(as_column(nb::cast<std::string>(key), value, n, per));
     }
     return out;
 }
@@ -223,11 +250,21 @@ static void index_add(vecengine::Index &self, FloatMatrix data, std::optional<Id
             throw std::invalid_argument("ids must have one entry per row of data");
     }
 
-    const vecengine::Metadata md = metadata ? as_metadata(*metadata, data.shape(0)) : vecengine::Metadata{};
+    const vecengine::Metadata md = metadata ? as_metadata(*metadata, data.shape(0), "row of data") : vecengine::Metadata{};
     const int64_t* id_ptr = id_array ? id_array->data() : nullptr;
     write_locked(self, [&] {
         refuse_if_wrapped(self, "add");
         self.add_batch(std::span<const float>(data.data(), data.size()), data.shape(0), id_ptr, md);
+    });
+}
+
+// Overwrite metadata columns of the vectors with these ids.
+static void index_update_metadata(vecengine::Index& self, IdsArg ids, nb::dict metadata, bool create) {
+    IdVector id_array = as_ids(ids);
+    const vecengine::Metadata md = as_metadata(metadata, id_array.shape(0), "id");
+    write_locked(self, [&] {
+        refuse_if_wrapped(self, "update metadata");
+        self.update_metadata(std::span<const int64_t>(id_array.data(), id_array.shape(0)), md, create);
     });
 }
 
@@ -446,7 +483,14 @@ NB_MODULE(qann, m) {
              "Add an (n, dim) array of vectors. Pass ids (n int64 values >= 0) if the index was "
              "created with custom_ids=True; otherwise ids continue after the highest id ever assigned. "
              "metadata is {name: n values} (ints, floats or strings) to filter queries on with where=; a new "
-             "column is null for earlier vectors, and a column left out of an add is null for its vectors")
+             "column is null for earlier vectors, and a column left out of an add is null for its vectors. "
+             "None in a column's values is a null")
+        .def("update_metadata", &index_update_metadata, nb::arg("ids"), nb::arg("metadata"), nb::kw_only(),
+             nb::arg("create") = false,
+             "Overwrite metadata in place: metadata is {name: one value per id}, None sets a value to null, and "
+             "columns left out keep their values. A column the index doesn't have raises ValueError unless "
+             "create=True, which adds it (null for every other vector). Unknown, deleted or repeated ids raise "
+             "ValueError, and a failed call changes nothing")
         .def("remove", &index_remove, nb::arg("ids"),
              "Delete the vectors with these ids; unknown ids are skipped. Returns how many were deleted")
         .def("compact", &index_compact,

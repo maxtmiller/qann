@@ -44,6 +44,12 @@ void Index::add_batch(span<const float> vecs, size_t n, const int64_t* ids, cons
     metadata_.append(rows, n, metadata);
 }
 
+void Index::update_metadata(span<const int64_t> ids, const Metadata& metadata, bool create) {
+    const vector<uint32_t> slots = id_map().slots_of(ids);
+    metadata_.check_update(slots.size(), metadata, create);
+    metadata_.update(slots, this->slots(), metadata);
+}
+
 vector<Neighbor> Index::query(span<const float> vec, size_t k) const {
     assert(vec.size() == dim());
     return std::move(query_prepared(vec, 1, k, nullptr, false)[0]);

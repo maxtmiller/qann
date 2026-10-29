@@ -97,6 +97,13 @@ public:
     vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k,
                                          const Expr& where, span<const int64_t> allowed) const;
 
+    // Overwrites the given metadata columns of the vectors with these ids; other
+    // columns keep their values. A column the index doesn't have throws unless
+    // create is set, which adds it null for every other vector. Throws
+    // std::invalid_argument before changing anything on an unknown, deleted or
+    // repeated id, or on metadata add_batch() would reject.
+    void update_metadata(span<const int64_t> ids, const Metadata& metadata, bool create = false);
+
     // Each metadata column's name and type, in the order they were created.
     vector<std::pair<std::string, ColumnType>> metadata_schema() const { return metadata_.schema(); }
 

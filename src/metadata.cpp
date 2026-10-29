@@ -472,9 +472,58 @@ void MetadataStore::check(size_t n, const Metadata& md) const {
         if (length_of(c) != n)
             throw std::invalid_argument("metadata column '" + c.name + "' has " + std::to_string(length_of(c)) +
                                         " values for " + std::to_string(n) + " vectors");
-        if (const Column* existing = find(c.name); existing && existing->type != type_of(c))
+        if (!c.valid.empty() && c.valid.size() != n)
+            throw std::invalid_argument("metadata column '" + c.name + "' has " + std::to_string(c.valid.size()) +
+                                        " null flags for " + std::to_string(n) + " vectors");
+        // an all-null column carries no values, so its type doesn't matter, but a new one has none to take
+        const bool all_null = n > 0 && !c.valid.empty() && std::find(c.valid.begin(), c.valid.end(), 1) == c.valid.end();
+        const Column* existing = find(c.name);
+        if (existing && !all_null && existing->type != type_of(c))
             throw std::invalid_argument("metadata column '" + c.name + "' holds " + type_name(existing->type) +
                                         " values; got " + type_name(type_of(c)));
+        if (!existing && all_null)
+            throw std::invalid_argument("metadata column '" + c.name + "' is new and has only nulls, so it has no type");
+    }
+}
+
+void MetadataStore::check_update(size_t n, const Metadata& md, bool create) const {
+    if (!create)
+        for (const MetadataColumn& c : md)
+            if (!find(c.name))
+                throw std::invalid_argument("the index has no metadata column '" + c.name + "'; pass create=True to add it");
+    check(n, md);
+}
+
+void MetadataStore::write_row(Column& col, size_t to, const MetadataColumn& c, size_t i) {
+    const bool has = c.valid.empty() || c.valid[i];
+    col.valid[to] = has;
+    if (col.type == ColumnType::Int64) col.ints[to] = has ? std::get<vector<int64_t>>(c.values)[i] : 0;
+    else if (col.type == ColumnType::Float64) col.floats[to] = has ? std::get<vector<double>>(c.values)[i] : 0.0;
+    else if (!has) col.codes[to] = 0;
+    else {
+        const std::string& s = std::get<vector<std::string>>(c.values)[i];
+        auto [pos, added] = col.code_of.emplace(s, static_cast<uint32_t>(col.dict.size()));
+        if (added) col.dict.push_back(s);
+        col.codes[to] = pos->second;
+    }
+}
+
+void MetadataStore::update(const vector<uint32_t>& slots, size_t rows, const Metadata& md) {
+    if (slots.empty()) return;
+    for (const MetadataColumn& c : md) {
+        Column* col = nullptr;
+        for (Column& existing : columns_)
+            if (existing.name == c.name) col = &existing;
+        if (!col) {
+            Column fresh{c.name, type_of(c), vector<uint8_t>(rows, 0), {}, {}, {}, {}, {}};
+            if (fresh.type == ColumnType::Int64) fresh.ints.assign(rows, 0);
+            else if (fresh.type == ColumnType::Float64) fresh.floats.assign(rows, 0.0);
+            else fresh.codes.assign(rows, 0);
+            columns_.push_back(std::move(fresh));
+            col = &columns_.back();
+        }
+        assert(col->rows() == rows);
+        for (size_t i = 0; i < slots.size(); ++i) write_row(*col, slots[i], c, i);
     }
 }
 
@@ -502,20 +551,11 @@ void MetadataStore::append(size_t rows, size_t n, const Metadata& md) {
             else col.codes.insert(col.codes.end(), n, 0);
             continue;
         }
-        col.valid.insert(col.valid.end(), n, 1);
-        if (col.type == ColumnType::Int64) {
-            const auto& v = std::get<vector<int64_t>>(it->second->values);
-            col.ints.insert(col.ints.end(), v.begin(), v.end());
-        } else if (col.type == ColumnType::Float64) {
-            const auto& v = std::get<vector<double>>(it->second->values);
-            col.floats.insert(col.floats.end(), v.begin(), v.end());
-        } else {
-            for (const std::string& s : std::get<vector<std::string>>(it->second->values)) {
-                auto [pos, added] = col.code_of.emplace(s, static_cast<uint32_t>(col.dict.size()));
-                if (added) col.dict.push_back(s);
-                col.codes.push_back(pos->second);
-            }
-        }
+        col.valid.resize(rows + n);
+        col.ints.resize(col.type == ColumnType::Int64 ? rows + n : 0);
+        col.floats.resize(col.type == ColumnType::Float64 ? rows + n : 0);
+        col.codes.resize(col.type == ColumnType::String ? rows + n : 0);
+        for (size_t i = 0; i < n; ++i) write_row(col, rows + i, *it->second, i);
     }
 }
 
@@ -536,11 +576,17 @@ void MetadataStore::compact(const vector<uint32_t>& remap) {
         col.ints.resize(col.type == ColumnType::Int64 ? kept : 0);
         col.floats.resize(col.type == ColumnType::Float64 ? kept : 0);
         col.codes.resize(col.type == ColumnType::String ? kept : 0);
+    }
+    drop_unused_strings();
+}
+
+void MetadataStore::drop_unused_strings() {
+    for (Column& col : columns_) {
         if (col.type != ColumnType::String) continue;
-        // drop strings only removed rows used, renumbering in first-seen order
+        // renumber the strings rows still use, in first-seen order
         vector<uint32_t> renum(col.dict.size(), UINT32_MAX);
         vector<std::string> dict;
-        for (size_t i = 0; i < kept; ++i) {
+        for (size_t i = 0; i < col.rows(); ++i) {
             if (!col.valid[i]) {
                 col.codes[i] = 0;
                 continue;
