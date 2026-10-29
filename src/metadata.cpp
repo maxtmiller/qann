@@ -4,7 +4,10 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_set>
@@ -79,6 +82,253 @@ Expr operator|(const Expr& a, const Expr& b) {
 
 Expr operator~(const Expr& a) {
     return Expr(std::make_shared<const Expr::Node>(Expr::Node{Expr::Op::Not, {}, {}, {a}}));
+}
+
+namespace {
+
+// Recursive descent over a SQL WHERE clause (see Expr::parse). NOT is pushed
+// down to the leaves as it parses (neg), so the tree has SQL's meaning
+// without ~: negated comparisons flip their operator, negated IN / IS NULL /
+// BETWEEN exclude nulls explicitly, and AND / OR swap by De Morgan.
+class SqlParser {
+public:
+    SqlParser(std::string_view sql, const vector<Expr::Value>* list, const std::unordered_map<std::string, Expr::Value>* named)
+        : sql_(sql), list_(list), named_(named) {}
+
+    Expr parse() {
+        Expr e = or_expr(false);
+        skip_space();
+        if (pos_ < sql_.size()) fail("unexpected '" + peek_word() + "'");
+        if (list_ && used_ != list_->size())
+            throw std::invalid_argument("filter has " + std::to_string(used_) + " ? placeholders but " +
+                                        std::to_string(list_->size()) + " parameters were given");
+        return e;
+    }
+
+private:
+    [[noreturn]] void fail(const std::string& what) const {
+        throw std::invalid_argument(what + (pos_ < sql_.size() ? " at column " + std::to_string(pos_ + 1) : " at end of filter"));
+    }
+
+    void skip_space() {
+        while (pos_ < sql_.size() && std::isspace(static_cast<unsigned char>(sql_[pos_]))) ++pos_;
+    }
+
+    static bool word_char(char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '.'; }
+
+    std::string peek_word() {
+        skip_space();
+        size_t end = pos_;
+        while (end < sql_.size() && word_char(sql_[end])) ++end;
+        if (end == pos_ && pos_ < sql_.size()) end = pos_ + 1;
+        return std::string(sql_.substr(pos_, end - pos_));
+    }
+
+    // Consumes keyword kw (case-insensitive, whole word) if it comes next.
+    bool keyword(std::string_view kw) {
+        skip_space();
+        if (sql_.size() - pos_ < kw.size()) return false;
+        for (size_t i = 0; i < kw.size(); ++i)
+            if (std::toupper(static_cast<unsigned char>(sql_[pos_ + i])) != kw[i]) return false;
+        if (pos_ + kw.size() < sql_.size() && word_char(sql_[pos_ + kw.size()])) return false;
+        pos_ += kw.size();
+        return true;
+    }
+
+    bool symbol(std::string_view sym) {
+        skip_space();
+        if (sql_.substr(pos_, sym.size()) != sym) return false;
+        pos_ += sym.size();
+        return true;
+    }
+
+    static bool is_keyword(const std::string& w) {
+        std::string u = w;
+        for (char& c : u) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        return u == "AND" || u == "OR" || u == "NOT" || u == "IN" || u == "IS" || u == "NULL" || u == "BETWEEN";
+    }
+
+    Expr combine(Expr a, Expr b, bool use_and) { return use_and ? (a & b) : (a | b); }
+
+    Expr or_expr(bool neg) {
+        Expr e = and_expr(neg);
+        while (keyword("OR")) e = combine(e, and_expr(neg), neg);
+        return e;
+    }
+
+    Expr and_expr(bool neg) {
+        Expr e = not_expr(neg);
+        while (keyword("AND")) e = combine(e, not_expr(neg), !neg);
+        return e;
+    }
+
+    Expr not_expr(bool neg) {
+        if (keyword("NOT")) return not_expr(!neg);
+        if (symbol("(")) {
+            Expr e = or_expr(neg);
+            if (!symbol(")")) fail("expected ')'");
+            return e;
+        }
+        return predicate(neg);
+    }
+
+    // "..." with "" as a quote inside, or a bare word that isn't a keyword.
+    std::string name() {
+        skip_space();
+        if (pos_ < sql_.size() && sql_[pos_] == '"') return quoted('"');
+        const size_t start = pos_;
+        if (pos_ < sql_.size() && (std::isalpha(static_cast<unsigned char>(sql_[pos_])) || sql_[pos_] == '_'))
+            while (pos_ < sql_.size() && word_char(sql_[pos_])) ++pos_;
+        std::string w(sql_.substr(start, pos_ - start));
+        if (w.empty() || is_keyword(w)) {
+            pos_ = start;
+            fail("expected a column name");
+        }
+        return w;
+    }
+
+    std::string quoted(char q) {
+        const size_t start = pos_++;
+        std::string out;
+        while (true) {
+            if (pos_ >= sql_.size()) {
+                pos_ = start;
+                fail(q == '\'' ? "unterminated string" : "unterminated quoted name");
+            }
+            if (sql_[pos_] == q) {
+                if (pos_ + 1 < sql_.size() && sql_[pos_ + 1] == q) {
+                    out += q;
+                    pos_ += 2;
+                    continue;
+                }
+                ++pos_;
+                return out;
+            }
+            out += sql_[pos_++];
+        }
+    }
+
+    Expr::Value value() {
+        skip_space();
+        if (pos_ >= sql_.size()) fail("expected a value");
+        const char c = sql_[pos_];
+        if (c == '\'') return quoted('\'');
+        if (c == '?') {
+            if (!list_) fail(named_ ? "? placeholder, but parameters were given by name" : "? placeholder, but no parameters were given");
+            if (used_ >= list_->size()) fail("more ? placeholders than parameters");
+            ++pos_;
+            return (*list_)[used_++];
+        }
+        if (c == ':') {
+            const size_t start = pos_++;
+            while (pos_ < sql_.size() && word_char(sql_[pos_])) ++pos_;
+            const std::string key(sql_.substr(start + 1, pos_ - start - 1));
+            pos_ = start;
+            if (key.empty()) fail("expected a parameter name after ':'");
+            if (!named_) fail(list_ ? ":" + key + " placeholder, but parameters were given as a list" : ":" + key + " placeholder, but no parameters were given");
+            auto it = named_->find(key);
+            if (it == named_->end()) fail("no parameter named '" + key + "'");
+            pos_ += key.size() + 1;
+            return it->second;
+        }
+        // a number: optional sign, digits, optional fraction and exponent
+        const size_t start = pos_;
+        size_t i = pos_;
+        if (sql_[i] == '-' || sql_[i] == '+') ++i;
+        const size_t digits = i;
+        bool is_float = false;
+        while (i < sql_.size() && std::isdigit(static_cast<unsigned char>(sql_[i]))) ++i;
+        if (i < sql_.size() && sql_[i] == '.') {
+            is_float = true;
+            ++i;
+            while (i < sql_.size() && std::isdigit(static_cast<unsigned char>(sql_[i]))) ++i;
+        }
+        if (i == digits || (i == digits + 1 && is_float)) fail("expected a value");
+        if (i < sql_.size() && (sql_[i] == 'e' || sql_[i] == 'E')) {
+            size_t j = i + 1;
+            if (j < sql_.size() && (sql_[j] == '-' || sql_[j] == '+')) ++j;
+            if (j < sql_.size() && std::isdigit(static_cast<unsigned char>(sql_[j]))) {
+                is_float = true;
+                i = j;
+                while (i < sql_.size() && std::isdigit(static_cast<unsigned char>(sql_[i]))) ++i;
+            }
+        }
+        if (i < sql_.size() && word_char(sql_[i])) fail("expected a value");
+        const std::string text(sql_.substr(start, i - start));
+        pos_ = i;
+        if (is_float) return std::strtod(text.c_str(), nullptr);
+        errno = 0;
+        const long long v = std::strtoll(text.c_str(), nullptr, 10);
+        if (errno == ERANGE) {
+            pos_ = start;
+            fail("integer out of range");
+        }
+        return static_cast<int64_t>(v);
+    }
+
+    static Expr::Op negate(Expr::Op op) {
+        switch (op) {
+            case Expr::Op::Eq: return Expr::Op::Ne;
+            case Expr::Op::Ne: return Expr::Op::Eq;
+            case Expr::Op::Lt: return Expr::Op::Ge;
+            case Expr::Op::Le: return Expr::Op::Gt;
+            case Expr::Op::Gt: return Expr::Op::Le;
+            default: return Expr::Op::Lt;  // Ge
+        }
+    }
+
+    Expr predicate(bool neg) {
+        const std::string field = name();
+        if (keyword("IS")) {
+            const bool is_not = keyword("NOT");
+            if (!keyword("NULL")) fail("expected NULL");
+            const Expr e = Expr::is_null(field);
+            return neg != is_not ? ~e : e;
+        }
+        const bool not_kw = keyword("NOT");
+        if (not_kw) neg = !neg;
+        if (keyword("IN")) {
+            if (!symbol("(")) fail("expected '('");
+            vector<Expr::Value> values{value()};
+            while (symbol(",")) values.push_back(value());
+            if (!symbol(")")) fail("expected ',' or ')'");
+            const Expr e = Expr::isin(field, std::move(values));
+            return neg ? (~e & ~Expr::is_null(field)) : e;
+        }
+        if (keyword("BETWEEN")) {
+            Expr::Value lo = value();
+            if (!keyword("AND")) fail("expected AND");
+            Expr::Value hi = value();
+            if (neg) return Expr::compare(field, Expr::Op::Lt, std::move(lo)) | Expr::compare(field, Expr::Op::Gt, std::move(hi));
+            return Expr::compare(field, Expr::Op::Ge, std::move(lo)) & Expr::compare(field, Expr::Op::Le, std::move(hi));
+        }
+        if (not_kw) fail("expected IN or BETWEEN");
+        Expr::Op op;
+        if (symbol("<=")) op = Expr::Op::Le;
+        else if (symbol(">=")) op = Expr::Op::Ge;
+        else if (symbol("<>") || symbol("!=")) op = Expr::Op::Ne;
+        else if (symbol("==") || symbol("=")) op = Expr::Op::Eq;
+        else if (symbol("<")) op = Expr::Op::Lt;
+        else if (symbol(">")) op = Expr::Op::Gt;
+        else fail("expected a comparison, IN, BETWEEN or IS");
+        return Expr::compare(field, neg ? negate(op) : op, value());
+    }
+
+    std::string_view sql_;
+    size_t pos_ = 0;
+    const vector<Expr::Value>* list_;
+    const std::unordered_map<std::string, Expr::Value>* named_;
+    size_t used_ = 0;
+};
+
+} // namespace
+
+Expr Expr::parse(std::string_view sql, const vector<Value>& params) {
+    return SqlParser(sql, params.empty() ? nullptr : &params, nullptr).parse();
+}
+
+Expr Expr::parse(std::string_view sql, const std::unordered_map<std::string, Value>& params) {
+    return SqlParser(sql, nullptr, &params).parse();
 }
 
 std::string Expr::to_string() const {

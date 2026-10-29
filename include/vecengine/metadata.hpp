@@ -9,6 +9,7 @@
 #include <iosfwd>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <variant>
@@ -58,6 +59,18 @@ public:
 
     // field has no value.
     static Expr is_null(std::string field);
+
+    // A SQL WHERE clause (issue #46), e.g. "category = 'shoes' AND price < 50":
+    // comparisons (= != <> < <= > >=), [NOT] IN (...), IS [NOT] NULL,
+    // [NOT] BETWEEN x AND y, combined with AND, OR, NOT and parentheses, with
+    // SQL's precedence. Keywords are case-insensitive; strings are '...' ('' is
+    // a quote) and names that clash with keywords are "...". NOT keeps SQL's
+    // meaning: NOT (price < 50) excludes rows with no price, unlike ~.
+    // Placeholders take values from params, bound after parsing so they can't
+    // change the filter's structure: ? in order from the list, or :name from
+    // the map. Throws std::invalid_argument naming the column of an error.
+    static Expr parse(std::string_view sql, const vector<Value>& params = {});
+    static Expr parse(std::string_view sql, const std::unordered_map<std::string, Value>& params);
 
     // Both, either, and the negation of filters.
     friend Expr operator&(const Expr& a, const Expr& b);
