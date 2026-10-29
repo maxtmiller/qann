@@ -51,6 +51,12 @@ public:
     using Value = std::variant<int64_t, double, std::string>;
     enum class Op : uint8_t { Eq, Ne, Lt, Le, Gt, Ge, In, IsNull, And, Or, Not };
 
+    // The deepest filter allowed, in levels of nesting. Evaluation recurses
+    // per level, so deeper filters throw std::invalid_argument instead of
+    // risking the stack. And / Or chains are flattened, so their length
+    // doesn't count.
+    static constexpr size_t kMaxDepth = 256;
+
     // field <op> value, for op one of Eq, Ne, Lt, Le, Gt, Ge.
     static Expr compare(std::string field, Op op, Value value);
 
@@ -72,6 +78,10 @@ public:
     static Expr parse(std::string_view sql, const vector<Value>& params = {});
     static Expr parse(std::string_view sql, const std::unordered_map<std::string, Value>& params);
 
+    // All (op And) or any (op Or) of children, as one node: children that are
+    // themselves the same op are merged in, so a long chain stays one level.
+    static Expr join(Op op, vector<Expr> children);
+
     // Both, either, and the negation of filters.
     friend Expr operator&(const Expr& a, const Expr& b);
     friend Expr operator|(const Expr& a, const Expr& b);
@@ -80,7 +90,7 @@ public:
     Op op() const noexcept { return node_->op; }
     const std::string& field() const noexcept { return node_->field; }        // leaves only
     const vector<Value>& values() const noexcept { return node_->values; }    // one for comparisons, any number for In
-    const vector<Expr>& children() const noexcept { return node_->children; } // two for And / Or, one for Not
+    const vector<Expr>& children() const noexcept { return node_->children; } // two or more for And / Or, one for Not
 
     // A readable form, e.g. (price < 50) & ~is_null(category).
     std::string to_string() const;
@@ -91,6 +101,7 @@ private:
         std::string field;
         vector<Value> values;
         vector<Expr> children;
+        size_t depth = 1;  // levels in this subtree, at most kMaxDepth
     };
     explicit Expr(std::shared_ptr<const Node> node) : node_(std::move(node)) {}
 

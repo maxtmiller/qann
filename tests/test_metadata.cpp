@@ -751,3 +751,60 @@ TEST_CASE("Expr::parse matches SQL's three-valued logic on rows with nulls (fuzz
         REQUIRE(bits_to_ids(store.evaluate(Expr::parse(n.sql), kRows), kRows) == want);
     }
 }
+
+TEST_CASE("Expr: And / Or chains are flattened, and nesting is capped", "[metadata][parse]") {
+    const auto a = [](int64_t v) { return f("a", Op::Eq, v); };
+
+    SECTION("chains are one node, from either form") {
+        const Expr ops = (a(1) | a(2)) | (a(3) | a(4));
+        REQUIRE(ops.op() == Op::Or);
+        REQUIRE(ops.children().size() == 4);
+        REQUIRE(ops.to_string() == "((a == 1) | (a == 2) | (a == 3) | (a == 4))");
+        REQUIRE(Expr::parse("a = 1 OR a = 2 OR a = 3 OR a = 4").to_string() == ops.to_string());
+        // different ops still nest
+        REQUIRE((a(1) & (a(2) | a(3))).children().size() == 2);
+        // NOT (x AND y AND z) is one Or of three
+        REQUIRE(Expr::parse("NOT (a = 1 AND a = 2 AND a = 3)").children().size() == 3);
+    }
+
+    SECTION("a long chain evaluates and prints without deep recursion") {
+        MetadataStore store;
+        store.append(0, 10, {{"a", std::vector<int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}}});
+        std::string sql = "a = 100";
+        Expr built = a(100);
+        for (int64_t i = 0; i < 200000; ++i) {
+            sql += " OR a = " + std::to_string(i % 3 == 0 ? 100 + i : i % 10);
+            built = built | a(i % 3 == 0 ? 100 + i : i % 10);
+        }
+        const Expr parsed = Expr::parse(sql);
+        REQUIRE(parsed.children().size() == 200001);
+        REQUIRE(built.children().size() == 200001);
+        const auto all = std::vector<int64_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+        REQUIRE(bits_to_ids(store.evaluate(parsed, 10), 10) == all);
+        REQUIRE(bits_to_ids(store.evaluate(built, 10), 10) == all);
+        REQUIRE(parsed.to_string().size() > 200000);
+    }
+
+    SECTION("the parser rejects deep nesting with a column") {
+        const auto parens = [](size_t n) { return std::string(n, '(') + "a = 1" + std::string(n, ')'); };
+        REQUIRE(Expr::parse(parens(Expr::kMaxDepth - 1)).to_string() == "(a == 1)");
+        REQUIRE_THROWS_WITH(Expr::parse(parens(Expr::kMaxDepth)), "filter nested more than 256 levels deep at column 257");
+        REQUIRE_THROWS_WITH(Expr::parse(parens(100000)), "filter nested more than 256 levels deep at column 257");
+        std::string nots;
+        for (int i = 0; i < 100000; ++i) nots += "NOT ";
+        REQUIRE_THROWS_AS(Expr::parse(nots + "a = 1"), std::invalid_argument);
+    }
+
+    SECTION("building a filter deeper than the cap throws") {
+        Expr e = a(1);
+        for (size_t i = 1; i < Expr::kMaxDepth; ++i) e = ~e;   // depth kMaxDepth
+        REQUIRE_THROWS_WITH(~e, "filter nested more than 256 levels deep");
+        Expr alternating = a(0);
+        REQUIRE_THROWS_AS([&] {
+            for (int64_t i = 1; i < 1000; ++i) alternating = i % 2 ? (alternating & a(i)) : (alternating | a(i));
+        }(), std::invalid_argument);
+        REQUIRE_THROWS_AS(Expr::join(Op::Eq, {a(1), a(2)}), std::invalid_argument);
+        REQUIRE_THROWS_AS(Expr::join(Op::And, {}), std::invalid_argument);
+        REQUIRE(Expr::join(Op::And, {a(1)}).to_string() == "(a == 1)");
+    }
+}

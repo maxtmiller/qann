@@ -72,16 +72,38 @@ Expr Expr::is_null(std::string field) {
     return Expr(std::make_shared<const Node>(Node{Op::IsNull, std::move(field), {}, {}}));
 }
 
-Expr operator&(const Expr& a, const Expr& b) {
-    return Expr(std::make_shared<const Expr::Node>(Expr::Node{Expr::Op::And, {}, {}, {a, b}}));
+static void check_depth(size_t depth) {
+    if (depth > Expr::kMaxDepth)
+        throw std::invalid_argument("filter nested more than " + std::to_string(Expr::kMaxDepth) + " levels deep");
 }
 
-Expr operator|(const Expr& a, const Expr& b) {
-    return Expr(std::make_shared<const Expr::Node>(Expr::Node{Expr::Op::Or, {}, {}, {a, b}}));
+Expr Expr::join(Op op, vector<Expr> children) {
+    if (op != Op::And && op != Op::Or) throw std::invalid_argument("join needs And or Or");
+    if (children.empty()) throw std::invalid_argument("join needs at least one filter");
+    if (children.size() == 1) return std::move(children[0]);
+    vector<Expr> flat;
+    flat.reserve(children.size());
+    size_t below = 0;
+    for (Expr& c : children) {
+        if (c.op() == op) {
+            flat.insert(flat.end(), c.children().begin(), c.children().end());
+            below = std::max(below, c.node_->depth - 1);
+        } else {
+            below = std::max(below, c.node_->depth);
+            flat.push_back(std::move(c));
+        }
+    }
+    check_depth(below + 1);
+    return Expr(std::make_shared<const Node>(Node{op, {}, {}, std::move(flat), below + 1}));
 }
+
+Expr operator&(const Expr& a, const Expr& b) { return Expr::join(Expr::Op::And, {a, b}); }
+
+Expr operator|(const Expr& a, const Expr& b) { return Expr::join(Expr::Op::Or, {a, b}); }
 
 Expr operator~(const Expr& a) {
-    return Expr(std::make_shared<const Expr::Node>(Expr::Node{Expr::Op::Not, {}, {}, {a}}));
+    check_depth(a.node_->depth + 1);
+    return Expr(std::make_shared<const Expr::Node>(Expr::Node{Expr::Op::Not, {}, {}, {a}, a.node_->depth + 1}));
 }
 
 namespace {
@@ -148,21 +170,30 @@ private:
         return u == "AND" || u == "OR" || u == "NOT" || u == "IN" || u == "IS" || u == "NULL" || u == "BETWEEN";
     }
 
-    Expr combine(Expr a, Expr b, bool use_and) { return use_and ? (a & b) : (a | b); }
-
+    // A chain is collected and joined once, so its length costs O(n).
     Expr or_expr(bool neg) {
-        Expr e = and_expr(neg);
-        while (keyword("OR")) e = combine(e, and_expr(neg), neg);
-        return e;
+        vector<Expr> terms{and_expr(neg)};
+        while (keyword("OR")) terms.push_back(and_expr(neg));
+        return Expr::join(neg ? Expr::Op::And : Expr::Op::Or, std::move(terms));
     }
 
     Expr and_expr(bool neg) {
-        Expr e = not_expr(neg);
-        while (keyword("AND")) e = combine(e, not_expr(neg), !neg);
+        vector<Expr> terms{not_expr(neg)};
+        while (keyword("AND")) terms.push_back(not_expr(neg));
+        return Expr::join(neg ? Expr::Op::Or : Expr::Op::And, std::move(terms));
+    }
+
+    // Each NOT and parenthesis recurses, so nesting is counted here and
+    // deep input fails with a column instead of overflowing the stack.
+    Expr not_expr(bool neg) {
+        if (++depth_ > Expr::kMaxDepth)
+            fail("filter nested more than " + std::to_string(Expr::kMaxDepth) + " levels deep");
+        Expr e = unary(neg);
+        --depth_;
         return e;
     }
 
-    Expr not_expr(bool neg) {
+    Expr unary(bool neg) {
         if (keyword("NOT")) return not_expr(!neg);
         if (symbol("(")) {
             Expr e = or_expr(neg);
@@ -319,6 +350,7 @@ private:
     const vector<Expr::Value>* list_;
     const std::unordered_map<std::string, Expr::Value>* named_;
     size_t used_ = 0;
+    size_t depth_ = 0;
 };
 
 } // namespace
@@ -333,8 +365,12 @@ Expr Expr::parse(std::string_view sql, const std::unordered_map<std::string, Val
 
 std::string Expr::to_string() const {
     switch (op()) {
-        case Op::And: return "(" + children()[0].to_string() + " & " + children()[1].to_string() + ")";
-        case Op::Or: return "(" + children()[0].to_string() + " | " + children()[1].to_string() + ")";
+        case Op::And:
+        case Op::Or: {
+            std::string s = "(";
+            for (size_t i = 0; i < children().size(); ++i) s += (i ? (op() == Op::And ? " & " : " | ") : "") + children()[i].to_string();
+            return s + ")";
+        }
         case Op::Not: return "~" + children()[0].to_string();
         case Op::IsNull: return "is_null(" + field() + ")";
         case Op::In: {
@@ -491,8 +527,13 @@ vector<uint64_t> MetadataStore::evaluate(const Expr& where, size_t slots) const 
         case Expr::Op::And:
         case Expr::Op::Or: {
             vector<uint64_t> a = evaluate(where.children()[0], slots);
-            const vector<uint64_t> b = evaluate(where.children()[1], slots);
-            for (size_t w = 0; w < a.size(); ++w) a[w] = where.op() == Expr::Op::And ? a[w] & b[w] : a[w] | b[w];
+            for (size_t c = 1; c < where.children().size(); ++c) {
+                const vector<uint64_t> b = evaluate(where.children()[c], slots);
+                if (where.op() == Expr::Op::And)
+                    for (size_t w = 0; w < a.size(); ++w) a[w] &= b[w];
+                else
+                    for (size_t w = 0; w < a.size(); ++w) a[w] |= b[w];
+            }
             return a;
         }
         case Expr::Op::Not: {

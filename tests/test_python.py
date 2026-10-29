@@ -1011,6 +1011,18 @@ def test_metadata_sql_where(data):
     with pytest.raises(ValueError):    # unknown column, found when evaluated
         index.query(queries[0], 10, where="size = 1")
 
+    # deep nesting raises instead of overflowing the stack; long chains are fine
+    with pytest.raises(ValueError, match="nested more than 256 levels"):
+        index.query(queries[0], 10, where="(" * 100000 + "price = 1" + ")" * 100000)
+    with pytest.raises(ValueError, match="nested more than 256 levels"):
+        e = f("price") == 1
+        for _ in range(300):
+            e = ~e
+    chain = " OR ".join(f"price = {p}" for p in range(100000))
+    np.testing.assert_array_equal(index.batch_query(queries, 10, where=chain)[0],
+                                  index.batch_query(queries, 10, where="price IS NOT NULL")[0])
+    assert len(repr(qann.where(chain))) > 100000
+
 def test_metadata_unsigned_overflow_and_empty_adds(data):
     index = qann.FlatIndex(32)
     with pytest.raises(ValueError):    # would wrap to a negative int64
