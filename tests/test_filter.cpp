@@ -255,18 +255,16 @@ TEST_CASE("Filtered IVF probes past nprobe until it has k allowed vectors", "[fi
     IVFIndex ivf(dim, 100, 1);
     ivf.train(data, n, 25, 1);
     ivf.add_batch(data, n);
+    ivf.set_filter_probe_scaling(false);    // test the stop rule alone
 
-    // 2%: about two allowed vectors per list, so one probe finds at most a few
-    // (above nlist allowed, so the lists are probed rather than scored directly)
-    const auto allowed = every(n, 50, 11);
+    // 4%: about four allowed vectors per list, so one probe finds at most a few
+    // (above 3 * nlist allowed, so the lists are probed rather than scored directly)
+    const auto allowed = every(n, 25, 11);
     const auto got = ivf.query_batch(queries, nq, k, allowed);
     require_only_allowed(got, allowed);
+    // full rows need about three lists here, so the query probed past nprobe;
+    // its recall is what filter probe scaling raises (tested separately)
     for (const auto& row : got) REQUIRE(row.size() == k);
-
-    // lists are probed nearest first, so recall is at least what one probe gets without a filter
-    const double unfiltered = filter_recall(ivf.query_batch(queries, nq, k), filtered_truth(data, dim, queries, nq, k, every(n, 1)));
-    INFO("unfiltered recall " << unfiltered);
-    REQUIRE(filter_recall(got, filtered_truth(data, dim, queries, nq, k, allowed)) >= unfiltered);
 }
 
 TEST_CASE("RefineIndex over IVF scores a narrow filter's vectors directly, exactly", "[filter][ivf]") {
@@ -311,9 +309,9 @@ TEST_CASE("RefineIndex over IVF scores a narrow filter's vectors directly, exact
     const auto few = refine.query(std::span<const float>(queries.data(), dim), k, three);
     REQUIRE(few.size() == 3);
 
-    // 500 allowed, above the cutoff: the base path, still only allowed vectors
+    // 1000 allowed, above the 6 * nlist cutoff: the base path, still only allowed vectors
     std::vector<int64_t> wide;
-    for (int64_t r : every(n, 20, 3)) wide.push_back(ids[r]);
+    for (int64_t r : every(n, 10, 3)) wide.push_back(ids[r]);
     const auto got = refine.query_batch(queries, nq, k, wide);
     require_only_allowed(got, wide);
     for (const auto& row : got) REQUIRE(row.size() == k);
@@ -385,11 +383,38 @@ TEST_CASE("Bare IVF SQ8 under a narrow filter scores every allowed vector", "[fi
     // every allowed vector is scored, so only SQ's rounding can cost recall
     REQUIRE(filter_recall(got, filtered_truth(data, dim, queries, nq, k, allowed)) >= 0.95);
 
-    // just above nlist: the lists are probed as before
-    const auto wide = every(n, 99, 4);    // 102
+    // above 3 * nlist: the lists are probed instead
+    const auto wide = every(n, 25, 4);    // 400
     const auto probed = sq.query_batch(queries, nq, k, wide);
     require_only_allowed(probed, wide);
     for (const auto& row : probed) REQUIRE(row.size() == k);
+}
+
+TEST_CASE("Filtered IVF probes more lists as the filter narrows", "[filter][ivf]") {
+    const size_t n = 20000, dim = 16, nq = 50, k = 10;
+    const auto data = filter_random(n, dim, 14);
+    const auto queries = filter_random(nq, dim, 15);
+    IVFIndex ivf(dim, 100, 2);
+    ivf.train(data, n, 25, 1);
+    ivf.add_batch(data, n);
+    REQUIRE(ivf.filter_probe_scaling());
+
+    const double unfiltered = filter_recall(ivf.query_batch(queries, nq, k), filtered_truth(data, dim, queries, nq, k, every(n, 1)));
+    for (size_t step : {20, 50}) {    // 5% and 2% allowed, above 3 * nlist
+        const auto allowed = every(n, step, 3);
+        const auto truth = filtered_truth(data, dim, queries, nq, k, allowed);
+        const auto scaled = ivf.query_batch(queries, nq, k, allowed);
+        ivf.set_filter_probe_scaling(false);
+        const auto plain = ivf.query_batch(queries, nq, k, allowed);
+        ivf.set_filter_probe_scaling(true);
+        require_only_allowed(scaled, allowed);
+        require_only_allowed(plain, allowed);
+        for (const auto& row : plain) REQUIRE(row.size() == k);    // off still probes until it has k
+        const double on = filter_recall(scaled, truth), off = filter_recall(plain, truth);
+        INFO("allowed 1/" << step << ": unfiltered " << unfiltered << ", scaled " << on << ", off " << off);
+        REQUIRE(on > off);
+        REQUIRE(on >= unfiltered - 0.05);
+    }
 }
 
 TEST_CASE("Filtered cosine search reports cosine distances", "[filter][metric]") {

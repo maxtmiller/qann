@@ -641,7 +641,13 @@ NB_MODULE(qann, m) {
                      [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.precomputed_tables(); }); },
                      [](vecengine::IVFIndex& self, bool v) { write_locked(self, [&] { self.set_precomputed_tables(v); }); },
                      "Whether ADC queries use per-list tables precomputed at train time (on by default). "
-                     "True only once they exist: PQ enabled, trained, and within the 256 MB cap");
+                     "True only once they exist: PQ enabled, trained, and within the 256 MB cap")
+        .def_prop_rw("filter_probe_scaling",
+                     [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.filter_probe_scaling(); }); },
+                     [](vecengine::IVFIndex& self, bool v) { write_locked(self, [&] { self.set_filter_probe_scaling(v); }); },
+                     "Whether filtered queries probe more lists as the filter narrows, so recall stays near an "
+                     "unfiltered query's (on by default). Off is faster but loses recall under narrow filters. "
+                     "Not saved: a loaded index has it on");
 
     nb::class_<vecengine::HNSWIndex, vecengine::Index>(m, "HNSWIndex")
         .def(nb::init<std::size_t, std::size_t, std::size_t, bool, std::optional<uint32_t>, vecengine::Metric>(),

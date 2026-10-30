@@ -331,6 +331,31 @@ def test_bare_ivf_narrow_filter_is_exact():
             np.testing.assert_array_equal(got, ip.batch_query(queries, 10, allowed=allowed)[0])
 
 
+def test_ivf_filter_probe_scaling():
+    rng = np.random.default_rng(5)
+    data = rng.standard_normal((20000, 32), dtype=np.float32)
+    queries = rng.standard_normal((50, 32), dtype=np.float32)
+    flat = qann.FlatIndex(32)
+    flat.add(data)
+    ivf = qann.IVFIndex(32, nlist=100, nprobe=2)
+    ivf.train(data, seed=1)
+    ivf.add(data)
+    assert ivf.filter_probe_scaling is True
+    allowed = np.arange(3, 20000, 20)    # 5%, above 3 * nlist: probed
+    want, _ = flat.batch_query(queries, 10, allowed=allowed)
+
+    def recall(found):
+        return np.mean([len(set(a) & set(b)) / 10 for a, b in zip(found, want)])
+
+    on = recall(ivf.batch_query(queries, 10, allowed=allowed)[0])
+    ivf.filter_probe_scaling = False
+    off_ids, _ = ivf.batch_query(queries, 10, allowed=allowed)
+    assert np.isin(off_ids, allowed).all() and (off_ids >= 0).all()
+    assert on > recall(off_ids)
+    ivf.filter_probe_scaling = True
+    assert recall(ivf.batch_query(queries, 10, allowed=allowed)[0]) == on
+
+
 def test_ids_accept_any_integer_sequence(data):
     index = qann.FlatIndex(32, custom_ids=True)
     index.add(data[:4], ids=[10, 11, 12, 13])
@@ -1361,9 +1386,19 @@ def test_loads_metadata_saved_on_macos():
     assert index.metadata_schema == {"price": "int", "weight": "float", "color": "str", "tag": "str"}
     f = qann.field
     where = ((f("price") < 40) & (f("color") != "red")) | (f("tag") == "new")
-    ids, dists = index.batch_query(np.load(DATA / "v9_queries.npy"), 10, where=where)
-    np.testing.assert_array_equal(ids, np.load(DATA / "v9_refine_metadata_ids.npy"))
-    np.testing.assert_allclose(dists, np.load(DATA / "v9_refine_metadata_dists.npy"), rtol=1e-5, atol=1e-5)
+    queries = np.load(DATA / "v9_queries.npy")
+    ids, dists = index.batch_query(queries, 10, where=where)
+    saved_ids, saved_dists = np.load(DATA / "v9_refine_metadata_ids.npy"), np.load(DATA / "v9_refine_metadata_dists.npy")
+    # The filter allows 340 vectors, which a RefineIndex over IVF now scores
+    # directly and exactly (#72), so results can beat the probed ones recorded
+    # at save time but never lose to them. Every id matches the filter (metadata
+    # loaded), and ids in both rows score the same (raw vectors loaded).
+    matching = index.query(queries[0], index.size(), where=where)[0]
+    assert len(matching) == 340 and np.isin(ids, matching).all()
+    assert (dists <= saved_dists + 1e-5).all()
+    for row, saved_row, d, saved_d in zip(ids, saved_ids, dists, saved_dists):
+        for i, j in zip(*np.nonzero(row[:, None] == saved_row[None, :])):
+            np.testing.assert_allclose(d[i], saved_d[j], rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("name", ["flat", "hnsw_sq8", "refine_ivf_fs"])

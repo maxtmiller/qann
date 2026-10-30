@@ -88,6 +88,14 @@ public:
     bool precomputed_tables() const noexcept { return !precomputed_.empty(); }
     void set_precomputed_tables(bool enabled);
 
+    // Whether a filtered query probes more lists as its filter narrows, about
+    // 0.75 * nprobe * s^(-1/3) for a fraction s allowed, so its recall stays
+    // near an unfiltered query's. On by default; off, it probes nprobe lists
+    // and then only until it has k allowed vectors (faster, lower recall).
+    // Not saved: a loaded index has it on.
+    bool filter_probe_scaling() const noexcept { return filter_probe_scaling_; }
+    void set_filter_probe_scaling(bool enabled) noexcept { filter_probe_scaling_ = enabled; }
+
     // Index overrides; see Index for the contract of each. Adds throw
     // std::logic_error before train(). query_batch picks every query's nprobe
     // lists with one matrix multiply per block of queries (with BLAS), then
@@ -214,6 +222,7 @@ private:
     detail::SQ sq_; // SQ ranges, learned by train() when SQ is enabled
     PQDistance pq_distance_ = PQDistance::ADC; // type of quantization used
     bool use_precomputed_ = true; // set_precomputed_tables() setting
+    bool filter_probe_scaling_ = true; // set_filter_probe_scaling() setting
     vector<float> precomputed_; // term B: nlist * m * K floats, list-major; empty when not in use
     detail::IdMap id_map_;
     bool fast_scan_ = false;
