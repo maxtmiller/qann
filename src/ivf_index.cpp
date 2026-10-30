@@ -340,6 +340,12 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
         if (fast_scan_) detail::quantize_lut(table.data(), m, lut.data(), ip_scale, ip_offset);
     }
 
+    // A block of 32 is skipped only when none of it passes, (1 - s)^32 of blocks
+    // at selectivity s, while building its mask costs about 12% of the kernel's
+    // time (measured on SIFT1M), so below 1/16 allowed the skips win. Above it,
+    // push() tests the filter as for an unfiltered query's deleted vectors.
+    const bool block_filter = filter && filter->count * 16 < id_map_.slots();
+
     // scores one fast-scan list with lut (scale and offset as quantize_lut set
     // them, plus anything added to every distance in the list)
     auto scan_fast = [&](const InvertedList& list, size_t listSize, float scale, float offset, auto&& push) {
@@ -347,6 +353,15 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
         uint16_t sums[detail::kFsBlock];
 
         for (size_t start = 0; start < listSize; start += detail::kFsBlock) {
+            const size_t count = std::min(detail::kFsBlock, listSize - start);
+            // a selective filter skips blocks it rejects entirely, before the kernel
+            uint32_t allowed = count < detail::kFsBlock ? (1u << count) - 1 : ~0u;
+            if (block_filter) {
+                allowed = 0;
+                for (size_t v = 0; v < count; ++v) allowed |= uint32_t{filter->test(list.ids[start + v])} << v;
+                if (allowed == 0) continue;
+            }
+
             // the current k-th best distance in the table's integer scale, recomputed
             // per block as it shrinks; sums are whole, so sum < limit <=> sum < ceil(limit)
             const float limit = (top.threshold() - offset) * scale;
@@ -357,8 +372,7 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
             // bit v is set when vector v can beat the k-th best; padding bits are dropped
             uint32_t mask = detail::fast_scan_block_mask(
                 lut.data(), list.codes.data() + (start / detail::kFsBlock) * block_bytes, m, limit16, sums);
-            const size_t count = std::min(detail::kFsBlock, listSize - start);
-            if (count < detail::kFsBlock) mask &= (1u << count) - 1;
+            mask &= allowed;    // drops padding bits, and with a filter the vectors it rejects
 
             // visit only the set bits, lowest first
             while (mask != 0) {
@@ -389,20 +403,25 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
         dists.resize(listSize);
         VECENGINE_PROF_STOP(t_list, kProfListSetup);
 
-        // lamdba function for adding to heap
+        // adds vector j to the top k if it beats the k-th best and may be returned
         auto push = [&](float dist, size_t j) {
             const uint32_t slot = list.ids[j];
             if (dist < top.threshold() && (filter ? filter->test(slot) : !id_map_.is_deleted(slot)))
                 top.push(dist, id_map_.label(slot));
         };
+        // with a filter, whether vector j passes it, checked before scoring so a
+        // rejected vector costs no distance; unfiltered queries score every vector
+        auto passes = [&](size_t j) { return !filter || filter->test(list.ids[j]); };
 
         if (sq_bits_) {
             VECENGINE_PROF_START(t_raw);
             const size_t w = sq_code_bytes();
             if (metric_ == Metric::InnerProduct) {
-                for (size_t j = 0; j < listSize; ++j) push(-sq_.inner_product(vec.data(), list.codes.data() + j * w), j);
+                for (size_t j = 0; j < listSize; ++j)
+                    if (passes(j)) push(-sq_.inner_product(vec.data(), list.codes.data() + j * w), j);
             } else {
-                for (size_t j = 0; j < listSize; ++j) push(sq_.distance(vec.data(), list.codes.data() + j * w), j);
+                for (size_t j = 0; j < listSize; ++j)
+                    if (passes(j)) push(sq_.distance(vec.data(), list.codes.data() + j * w), j);
             }
             VECENGINE_PROF_STOP(t_raw, kProfRawScan);
             continue;
@@ -410,10 +429,8 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
 
         if (!pq_enabled()) {
             VECENGINE_PROF_START(t_raw);
-            for (size_t j = 0; j < listSize; ++j) {
-                const float* start = list.vecs.data() + j * dim_;
-                push(exact_score(vec.data(), start, dim_), j);
-            }
+            for (size_t j = 0; j < listSize; ++j)
+                if (passes(j)) push(exact_score(vec.data(), list.vecs.data() + j * dim_, dim_), j);
             VECENGINE_PROF_STOP(t_raw, kProfRawScan);
             continue;
         }
