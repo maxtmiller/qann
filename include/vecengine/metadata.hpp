@@ -296,14 +296,27 @@ private:
     // comparisons). Throws like evaluate_leaf on a value of the wrong kind.
     Estimate estimate(const Column& col, const vector<const Expr*>& leaves, size_t slots) const;
 
-    // Clears the bits of `words` whose rows fail leaf, testing only the rows
-    // set, for an And whose other parts left few. Throws like evaluate_leaf.
-    void narrow(const Expr& leaf, vector<uint64_t>& words) const;
+    // Drops the rows of `set` that fail leaf, testing only those rows, for an
+    // And whose other parts left few. set is a bitmap (vector<uint64_t>, one
+    // bit per slot) or a sorted row list (vector<uint32_t>), which stays
+    // sorted. Throws like evaluate_leaf.
+    template <class Set>
+    void narrow(const Expr& leaf, Set& set) const;
+
+    // Keeps the rows of `rows` (sorted, and few: see evaluate_tree) that match
+    // where, working only on them, so each step costs about the rows left
+    // rather than a pass over a bitmap of every slot. Leaves cheaper to
+    // evaluate over the column than to test row by row are evaluated and
+    // intersected. Throws like evaluate.
+    void evaluate_rows(const Expr& where, vector<uint32_t>& rows, size_t slots) const;
 
     // evaluate() without factoring, for the rows set in `within` only: the
     // result is where & within (where alone without within). Leaves test
     // just those rows when that is cheaper than evaluating over the column.
-    vector<uint64_t> evaluate_tree(const Expr& where, size_t slots, const vector<uint64_t>* within) const;
+    // inside is the number of rows set in within (unused without it), so the
+    // caller's count isn't redone. Once few rows are left, the rest works on
+    // a row list (evaluate_rows) instead of bitmaps.
+    vector<uint64_t> evaluate_tree(const Expr& where, size_t slots, const vector<uint64_t>* within, size_t inside = 0) const;
 
     // The Estimate for any filter: a leaf's from estimate(), an And's fewest
     // matches, an Or's summed matches, and their summed costs. Throws like
