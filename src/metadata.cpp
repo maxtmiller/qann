@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cassert>
 #include <cerrno>
 #include <cmath>
@@ -448,6 +449,13 @@ const std::string& as_string(const Expr::Value& v, const std::string& field) {
     throw std::invalid_argument("metadata field '" + field + "' holds strings; got " + value_string(v));
 }
 
+// Rows a pass over a column tests in the time it takes to set one listed
+// row's bit; evaluate_leaf uses it to pick between them. Measured on an M3 with
+// benchmarks/string_filter_sweep.cpp (1M rows): about 0.41 ns per scanned row,
+// 1.7-4.5x that per listed row (more as lists grow), and an OR'd bitmap word
+// costs less than a scanned row, so it counts as one.
+constexpr size_t kScatterCost = 4;
+
 // Sets bit i of words where row(i) holds, for i in [0, slots). Each word is
 // built in a register without branches: filters often match about half the
 // rows at random, where a branch would mispredict on most of them.
@@ -553,7 +561,91 @@ void MetadataStore::update(const vector<uint32_t>& slots, const Metadata& md) {
         for (Column& existing : columns_)
             if (existing.name == c.name) col = &existing;
         assert(col);
+        if (col->type != ColumnType::String) {
+            for (size_t i = 0; i < slots.size(); ++i) write_row(*col, slots[i], c, i);
+            continue;
+        }
+        vector<uint32_t> old_codes(slots.size()), touched;
+        for (size_t i = 0; i < slots.size(); ++i) {
+            old_codes[i] = col->codes[slots[i]];
+            if (col->valid[slots[i]]) touched.push_back(old_codes[i]);
+        }
+        col->unindex(slots, old_codes);
         for (size_t i = 0; i < slots.size(); ++i) write_row(*col, slots[i], c, i);
+        col->rows_of.resize(col->dict.size());
+        for (uint32_t s : slots) {
+            col->index_row(s);
+            if (col->valid[s]) touched.push_back(col->codes[s]);
+        }
+        col->rebalance(touched);
+    }
+}
+
+void MetadataStore::Column::index_rows(size_t first) {
+    rows_of.resize(dict.size());
+    vector<uint32_t> touched;
+    for (size_t s = first; s < rows(); ++s) {
+        index_row(s);
+        if (valid[s]) touched.push_back(codes[s]);
+    }
+    rebalance(touched);
+}
+
+void MetadataStore::Column::index_row(size_t s) {
+    if (!valid[s]) return;
+    CodeRows& r = rows_of[codes[s]];
+    if (r.bits.empty()) r.rows.push_back(static_cast<uint32_t>(s));
+    else {
+        if (r.bits.size() <= s / 64) r.bits.resize(s / 64 + 1, 0);
+        r.bits[s / 64] |= uint64_t{1} << (s % 64);
+    }
+    ++r.count;
+}
+
+void MetadataStore::Column::reindex() {
+    rows_of.clear();
+    balanced_rows = 0;
+    index_rows(0);
+}
+
+void MetadataStore::Column::unindex(const vector<uint32_t>& rows, const vector<uint32_t>& old_codes) {
+    std::unordered_map<uint32_t, std::unordered_set<uint32_t>> gone;  // code -> its listed rows to drop
+    for (size_t i = 0; i < rows.size(); ++i) {
+        if (!valid[rows[i]]) continue;
+        CodeRows& r = rows_of[old_codes[i]];
+        --r.count;
+        if (r.bits.empty()) gone[old_codes[i]].insert(rows[i]);
+        else r.bits[rows[i] / 64] &= ~(uint64_t{1} << (rows[i] % 64));
+    }
+    for (auto& [code, drop] : gone) {
+        vector<uint32_t>& list = rows_of[code].rows;
+        list.erase(std::remove_if(list.begin(), list.end(), [&](uint32_t s) { return drop.count(s); }), list.end());
+    }
+}
+
+void MetadataStore::Column::rebalance(const vector<uint32_t>& touched) {
+    // every code only each time the column grows by a quarter, so a small add
+    // into a column of many distinct strings costs its own rows, not the dictionary
+    if (rows() * 4 >= balanced_rows * 5) {
+        balanced_rows = rows();
+        for (CodeRows& r : rows_of) balance(r);
+    } else {
+        for (uint32_t c : touched) balance(rows_of[c]);
+    }
+}
+
+void MetadataStore::Column::balance(CodeRows& r) const {
+    const size_t n = rows();
+    if (r.bits.empty() && r.count >= 64 && r.count * 32 >= n) {
+        r.bits.assign((n + 63) / 64, 0);
+        for (uint32_t s : r.rows) r.bits[s / 64] |= uint64_t{1} << (s % 64);
+        vector<uint32_t>().swap(r.rows);
+    } else if (!r.bits.empty() && r.count * 64 < n) {
+        r.rows.reserve(r.count);
+        for (size_t w = 0; w < r.bits.size(); ++w)
+            for (uint64_t b = r.bits[w]; b; b &= b - 1)
+                r.rows.push_back(static_cast<uint32_t>(w * 64 + std::countr_zero(b)));
+        vector<uint64_t>().swap(r.bits);
     }
 }
 
@@ -574,6 +666,7 @@ void MetadataStore::add_column(std::string name, ColumnType type, size_t rows, c
             col.dict.push_back(std::get<std::string>(*value));
             col.code_of.emplace(col.dict[0], 0);
         }
+        col.reindex();
     }
     columns_.push_back(std::move(col));
 }
@@ -601,7 +694,10 @@ void MetadataStore::append(size_t rows, size_t n, const Metadata& md) {
             col.valid.insert(col.valid.end(), n, 0);
             if (col.type == ColumnType::Int64) col.ints.insert(col.ints.end(), n, 0);
             else if (col.type == ColumnType::Float64) col.floats.insert(col.floats.end(), n, 0.0);
-            else col.codes.insert(col.codes.end(), n, 0);
+            else {
+                col.codes.insert(col.codes.end(), n, 0);
+                col.rebalance({});
+            }
             continue;
         }
         col.valid.resize(rows + n);
@@ -609,6 +705,7 @@ void MetadataStore::append(size_t rows, size_t n, const Metadata& md) {
         col.floats.resize(col.type == ColumnType::Float64 ? rows + n : 0);
         col.codes.resize(col.type == ColumnType::String ? rows + n : 0);
         for (size_t i = 0; i < n; ++i) write_row(col, rows + i, *it->second, i);
+        if (col.type == ColumnType::String) col.index_rows(rows);
     }
 }
 
@@ -654,6 +751,7 @@ void MetadataStore::drop_unused_strings() {
         col.dict = std::move(dict);
         col.code_of.clear();
         for (uint32_t c = 0; c < col.dict.size(); ++c) col.code_of.emplace(col.dict[c], c);
+        col.reindex();
     }
 }
 
@@ -712,6 +810,19 @@ vector<uint64_t> MetadataStore::evaluate_leaf(const Expr& leaf, size_t slots) co
         } else {
             const std::string& value = as_string(leaf.values()[0], leaf.field());
             for (size_t c = 0; c < col->dict.size(); ++c) match[c] = compare(op, col->dict[c], value);
+        }
+        // a few matching strings: set their rows' bits instead of passing over every row
+        size_t cost = 0;
+        for (size_t c = 0; c < col->dict.size(); ++c)
+            if (match[c]) cost += col->rows_of[c].bits.empty() ? col->rows_of[c].count * kScatterCost : col->rows_of[c].bits.size();
+        if (cost < slots) {
+            for (size_t c = 0; c < col->dict.size(); ++c) {
+                if (!match[c]) continue;
+                const Column::CodeRows& r = col->rows_of[c];
+                for (size_t w = 0; w < r.bits.size(); ++w) words[w] |= r.bits[w];
+                for (uint32_t s : r.rows) words[s / 64] |= uint64_t{1} << (s % 64);
+            }
+            return words;
         }
         // a null row's code is 0, which may not be in an empty dictionary, so test valid first
         const uint32_t* codes = col->codes.data();
@@ -826,6 +937,7 @@ MetadataStore MetadataStore::load(std::istream& in, uint64_t slots) {
             }
             for (uint64_t i = 0; i < slots; ++i)
                 if (col.valid[i] && col.codes[i] >= col.dict.size()) throw corrupt("metadata string code out of range");
+            col.reindex();
         }
         store.columns_.push_back(std::move(col));
     }
