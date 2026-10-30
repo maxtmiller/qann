@@ -185,6 +185,17 @@ private:
     // min(k, filter->count) allowed vectors have been found.
     vector<Neighbor> scan(span<const float> vec, span<Probe> probes, size_t k, const detail::SlotFilter* filter) const;
 
+    // Whether a filtered query scores the allowed vectors directly instead of
+    // probing lists (see direct_scan).
+    bool use_direct(size_t k, const detail::SlotFilter* filter) const;
+
+    // Top k among the filter's slots, found through slot_list_ / slot_pos_.
+    vector<Neighbor> direct_scan(span<const float> vec, size_t k, const detail::SlotFilter& filter) const;
+
+    // Rebuilds slot_list_ and slot_pos_ from the lists (after compact or load);
+    // leaves them empty with PQ.
+    void rebuild_slot_lookup();
+
     static constexpr size_t kPrecomputedMaxBytes = size_t{256} << 20;
     // With Accelerate, a single query's coarse step uses one sgemv from this dimension up;
     // below it the call's fixed cost outweighs the gain (measured on #62).
@@ -209,6 +220,10 @@ private:
     bool rotate_ = false; // enable_pq(..., rotate) setting
     vector<float> rotation_; // dim_ x dim_, row-major (see src/rotation.hpp); empty until trained
     vector<float> rotation_panels_; // rotation_ in the layout detail::rotate reads
+    // list holding each slot and its position there, for direct_scan; plain and
+    // SQ only (empty with PQ), not saved but rebuilt on load and compact
+    vector<uint16_t> slot_list_;
+    vector<uint32_t> slot_pos_;
 };
 
 } // namespace vecengine

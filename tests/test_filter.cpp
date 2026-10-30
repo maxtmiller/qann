@@ -3,6 +3,7 @@
 #include "vecengine/distance.hpp"
 #include "vecengine/flat_index.hpp"
 #include "vecengine/hnsw_index.hpp"
+#include "vecengine/index_factory.hpp"
 #include "vecengine/ivf_index.hpp"
 #include "vecengine/refine_index.hpp"
 
@@ -12,6 +13,7 @@
 #include <memory>
 #include <random>
 #include <set>
+#include <sstream>
 #include <span>
 #include <string>
 #include <vector>
@@ -254,8 +256,9 @@ TEST_CASE("Filtered IVF probes past nprobe until it has k allowed vectors", "[fi
     ivf.train(data, n, 25, 1);
     ivf.add_batch(data, n);
 
-    // 0.5%: about half an allowed vector per list, so one probe finds at most a few
-    const auto allowed = every(n, 200, 11);
+    // 2%: about two allowed vectors per list, so one probe finds at most a few
+    // (above nlist allowed, so the lists are probed rather than scored directly)
+    const auto allowed = every(n, 50, 11);
     const auto got = ivf.query_batch(queries, nq, k, allowed);
     require_only_allowed(got, allowed);
     for (const auto& row : got) REQUIRE(row.size() == k);
@@ -314,6 +317,79 @@ TEST_CASE("RefineIndex over IVF scores a narrow filter's vectors directly, exact
     const auto got = refine.query_batch(queries, nq, k, wide);
     require_only_allowed(got, wide);
     for (const auto& row : got) REQUIRE(row.size() == k);
+}
+
+TEST_CASE("Bare IVF scores a narrow filter's vectors directly: exact for plain, through compact and load", "[filter][ivf]") {
+    const size_t n = 10000, dim = 16, nq = 30, k = 10;
+    const auto data = filter_random(n, dim, 9);
+    const auto queries = filter_random(nq, dim, 10);
+
+    // nlist 100, nprobe 1: probing would miss most allowed vectors
+    IVFIndex ivf(dim, 100, 1, true);
+    ivf.train(data, n, 25, 1);
+    std::vector<int64_t> ids(n);
+    for (size_t i = 0; i < n; ++i) ids[i] = static_cast<int64_t>(500 + 7 * i);
+    ivf.add_batch(data, n, ids.data());
+
+    // 80 allowed (under nlist), two of them deleted, then compacted
+    const std::vector<int64_t> rows = every(n, 125, 4);
+    std::vector<int64_t> allowed;
+    for (int64_t r : rows) allowed.push_back(ids[r]);
+    ivf.remove(std::vector<int64_t>{allowed[0], allowed[1], ids[1], ids[2]});
+    const std::vector<int64_t> live_rows(rows.begin() + 2, rows.end());
+    auto truth = filtered_truth(data, dim, queries, nq, k, live_rows);
+    for (auto& row : truth)
+        for (auto& nb : row) nb.index = static_cast<size_t>(ids[nb.index]);
+
+    auto require_exact = [&](const Index& index) {
+        const auto batch = index.query_batch(queries, nq, k, allowed);
+        for (size_t q = 0; q < nq; ++q) {
+            const auto one = index.query(std::span<const float>(queries.data() + q * dim, dim), k, allowed);
+            REQUIRE(batch[q].size() == k);
+            for (size_t i = 0; i < k; ++i) {
+                REQUIRE(batch[q][i].index == truth[q][i].index);
+                REQUIRE(batch[q][i].distance == truth[q][i].distance);
+                REQUIRE(one[i].index == truth[q][i].index);
+            }
+        }
+    };
+    require_exact(ivf);
+    ivf.compact();
+    require_exact(ivf);
+    std::stringstream buf;
+    ivf.save(buf);
+    require_exact(*load_index(buf));
+
+    // vectors added after compaction are found through the lookup too
+    const auto extra = filter_random(1, dim, 11);
+    const int64_t extra_id = 99;
+    ivf.add_batch(extra, 1, &extra_id);
+    std::vector<int64_t> with_extra = allowed;
+    with_extra.push_back(extra_id);
+    const auto self = ivf.query(std::span<const float>(extra.data(), dim), 1, with_extra);
+    REQUIRE(self[0].index == 99);
+    REQUIRE(self[0].distance == 0.0f);
+}
+
+TEST_CASE("Bare IVF SQ8 under a narrow filter scores every allowed vector", "[filter][ivf]") {
+    const size_t n = 10000, dim = 16, nq = 30, k = 10;
+    const auto data = filter_random(n, dim, 12);
+    const auto queries = filter_random(nq, dim, 13);
+    IVFIndex sq(dim, 100, 1);
+    sq.enable_sq(8);
+    sq.train(data, n, 25, 1);
+    sq.add_batch(data, n);
+    const auto allowed = every(n, 125, 4);    // 80, under nlist
+    const auto got = sq.query_batch(queries, nq, k, allowed);
+    require_only_allowed(got, allowed);
+    // every allowed vector is scored, so only SQ's rounding can cost recall
+    REQUIRE(filter_recall(got, filtered_truth(data, dim, queries, nq, k, allowed)) >= 0.95);
+
+    // just above nlist: the lists are probed as before
+    const auto wide = every(n, 99, 4);    // 102
+    const auto probed = sq.query_batch(queries, nq, k, wide);
+    require_only_allowed(probed, wide);
+    for (const auto& row : probed) REQUIRE(row.size() == k);
 }
 
 TEST_CASE("Filtered cosine search reports cosine distances", "[filter][metric]") {

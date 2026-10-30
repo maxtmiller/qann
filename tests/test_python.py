@@ -309,6 +309,28 @@ def test_refine_over_ivf_narrow_filter_is_exact():
     np.testing.assert_array_equal(refine.query(queries[0], 10, allowed=allowed)[0], want[0])
 
 
+def test_bare_ivf_narrow_filter_is_exact():
+    rng = np.random.default_rng(4)
+    data = rng.standard_normal((20000, 32), dtype=np.float32)
+    queries = rng.standard_normal((20, 32), dtype=np.float32)
+    flat = qann.FlatIndex(32)
+    flat.add(data)
+    allowed = np.arange(5, 20000, 250)    # 80 allowed, under nlist: scored directly
+    want, wd = flat.batch_query(queries, 10, allowed=allowed)
+    for metric in ("l2", "ip"):
+        ivf = qann.IVFIndex(32, nlist=100, nprobe=1, metric=qann.Metric.InnerProduct if metric == "ip" else qann.Metric.L2)
+        ivf.train(data, seed=1)
+        ivf.add(data)
+        got, gd = ivf.batch_query(queries, 10, allowed=allowed)
+        if metric == "l2":
+            np.testing.assert_array_equal(got, want)
+            np.testing.assert_allclose(gd, wd, rtol=1e-5)
+        else:
+            ip = qann.FlatIndex(32, metric=qann.Metric.InnerProduct)
+            ip.add(data)
+            np.testing.assert_array_equal(got, ip.batch_query(queries, 10, allowed=allowed)[0])
+
+
 def test_ids_accept_any_integer_sequence(data):
     index = qann.FlatIndex(32, custom_ids=True)
     index.add(data[:4], ids=[10, 11, 12, 13])
