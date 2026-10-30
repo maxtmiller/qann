@@ -451,10 +451,15 @@ const std::string& as_string(const Expr::Value& v, const std::string& field) {
 
 // Rows a pass over a column tests in the time it takes to set one listed
 // row's bit; evaluate_leaf uses it to pick between them. Measured on an M3 with
-// benchmarks/string_filter_sweep.cpp (1M rows): about 0.41 ns per scanned row,
+// benchmarks/filter_sweep.cpp (1M rows): about 0.41 ns per scanned row,
 // 1.7-4.5x that per listed row (more as lists grow), and an OR'd bitmap word
 // costs less than a scanned row, so it counts as one.
 constexpr size_t kScatterCost = 4;
+
+// The same for a numeric column's sorted rows, which come in random row order
+// and so don't stall on one word the way a string's ascending list does: about
+// 0.63 ns a row against 0.38 ns per scanned row on 1M rows.
+constexpr size_t kSortedScatterCost = 2;
 
 // Sets bit i of words where row(i) holds, for i in [0, slots). Each word is
 // built in a register without branches: filters often match about half the
@@ -563,6 +568,9 @@ void MetadataStore::update(const vector<uint32_t>& slots, const Metadata& md) {
         assert(col);
         if (col->type != ColumnType::String) {
             for (size_t i = 0; i < slots.size(); ++i) write_row(*col, slots[i], c, i);
+            for (uint32_t s : slots)
+                if (s < col->sorted_rows) col->stale.push_back(s);
+            col->maybe_sort();
             continue;
         }
         vector<uint32_t> old_codes(slots.size()), touched;
@@ -649,6 +657,28 @@ void MetadataStore::Column::balance(CodeRows& r) const {
     }
 }
 
+void MetadataStore::Column::sort_rows() {
+    const bool ints_col = type == ColumnType::Int64;
+    sorted.clear();
+    stale.clear();
+    for (size_t s = 0; s < rows(); ++s)
+        if (valid[s] && (ints_col || !std::isnan(floats[s]))) sorted.push_back(static_cast<uint32_t>(s));
+    sorted_ints.clear();
+    sorted_floats.clear();
+    if (ints_col) {
+        std::sort(sorted.begin(), sorted.end(), [&](uint32_t a, uint32_t b) { return ints[a] < ints[b]; });
+        for (uint32_t s : sorted) sorted_ints.push_back(ints[s]);
+    } else {
+        std::sort(sorted.begin(), sorted.end(), [&](uint32_t a, uint32_t b) { return floats[a] < floats[b]; });
+        for (uint32_t s : sorted) sorted_floats.push_back(floats[s]);
+    }
+    sorted_rows = rows();
+}
+
+void MetadataStore::Column::maybe_sort() {
+    if ((rows() - sorted_rows + stale.size()) * 8 > rows()) sort_rows();
+}
+
 void MetadataStore::add_column(std::string name, ColumnType type, size_t rows, const std::optional<Expr::Value>& value) {
     if (name.empty()) throw std::invalid_argument("metadata column names must not be empty");
     if (find(name)) throw std::invalid_argument("metadata column '" + name + "' already exists");
@@ -660,6 +690,9 @@ void MetadataStore::add_column(std::string name, ColumnType type, size_t rows, c
     } else if (type == ColumnType::Float64) {
         const auto* i = value ? std::get_if<int64_t>(&*value) : nullptr;
         col.floats.assign(rows, !value ? 0.0 : i ? static_cast<double>(*i) : std::get<double>(*value));
+    }
+    if (type != ColumnType::String) {
+        col.sort_rows();
     } else {
         col.codes.assign(rows, 0);
         if (value && rows > 0) {
@@ -694,6 +727,7 @@ void MetadataStore::append(size_t rows, size_t n, const Metadata& md) {
             col.valid.insert(col.valid.end(), n, 0);
             if (col.type == ColumnType::Int64) col.ints.insert(col.ints.end(), n, 0);
             else if (col.type == ColumnType::Float64) col.floats.insert(col.floats.end(), n, 0.0);
+            if (col.type != ColumnType::String) col.maybe_sort();
             else {
                 col.codes.insert(col.codes.end(), n, 0);
                 col.rebalance({});
@@ -706,6 +740,7 @@ void MetadataStore::append(size_t rows, size_t n, const Metadata& md) {
         col.codes.resize(col.type == ColumnType::String ? rows + n : 0);
         for (size_t i = 0; i < n; ++i) write_row(col, rows + i, *it->second, i);
         if (col.type == ColumnType::String) col.index_rows(rows);
+        else col.maybe_sort();
     }
 }
 
@@ -726,6 +761,7 @@ void MetadataStore::compact(const vector<uint32_t>& remap) {
         col.ints.resize(col.type == ColumnType::Int64 ? kept : 0);
         col.floats.resize(col.type == ColumnType::Float64 ? kept : 0);
         col.codes.resize(col.type == ColumnType::String ? kept : 0);
+        if (col.type != ColumnType::String) col.sort_rows();
     }
     drop_unused_strings();
 }
@@ -763,15 +799,41 @@ const MetadataStore::Column* MetadataStore::find(const std::string& name) const 
 
 vector<uint64_t> MetadataStore::evaluate(const Expr& where, size_t slots) const {
     switch (where.op()) {
-        case Expr::Op::And:
+        case Expr::Op::And: {
+            // comparisons on one numeric column are one run of its sorted rows
+            // together, as in a BETWEEN, though each alone may match too many
+            vector<uint64_t> a;
+            bool started = false;
+            auto combine = [&](vector<uint64_t> b) {
+                if (!started) a = std::move(b);
+                else
+                    for (size_t w = 0; w < a.size(); ++w) a[w] &= b[w];
+                started = true;
+            };
+            vector<std::pair<const Column*, vector<const Expr*>>> ranges;  // in first-seen order
+            for (const Expr& child : where.children()) {
+                const Column* col = is_comparison(child.op()) && child.op() != Expr::Op::Ne ? find(child.field()) : nullptr;
+                if (!col || col->type == ColumnType::String) {
+                    combine(evaluate(child, slots));
+                    continue;
+                }
+                auto it = std::find_if(ranges.begin(), ranges.end(), [&](const auto& r) { return r.first == col; });
+                if (it == ranges.end()) ranges.push_back({col, {&child}});
+                else it->second.push_back(&child);
+            }
+            for (const auto& [col, leaves] : ranges) {
+                vector<uint64_t> words((slots + 63) / 64, 0);
+                if (leaves.size() > 1 && sorted_leaves(*col, leaves, words, slots)) combine(std::move(words));
+                else
+                    for (const Expr* leaf : leaves) combine(evaluate(*leaf, slots));
+            }
+            return a;
+        }
         case Expr::Op::Or: {
             vector<uint64_t> a = evaluate(where.children()[0], slots);
             for (size_t c = 1; c < where.children().size(); ++c) {
                 const vector<uint64_t> b = evaluate(where.children()[c], slots);
-                if (where.op() == Expr::Op::And)
-                    for (size_t w = 0; w < a.size(); ++w) a[w] &= b[w];
-                else
-                    for (size_t w = 0; w < a.size(); ++w) a[w] |= b[w];
+                for (size_t w = 0; w < a.size(); ++w) a[w] |= b[w];
             }
             return a;
         }
@@ -784,6 +846,97 @@ vector<uint64_t> MetadataStore::evaluate(const Expr& where, size_t slots) const 
         default:
             return evaluate_leaf(where, slots);
     }
+}
+
+bool MetadataStore::sorted_leaves(const Column& col, const vector<const Expr*>& leaves, vector<uint64_t>& words,
+                                  size_t slots) {
+    // each value compares exactly (an int column against an int) or in double, as in the pass
+    const bool ints = col.type == ColumnType::Int64;
+    struct Bound {
+        bool exact;
+        int64_t i;
+        double d;
+    };
+    struct Cond {
+        Expr::Op op;  // In becomes Eq against each value
+        vector<Bound> bounds;
+    };
+    vector<Cond> conds;
+    for (const Expr* leaf : leaves) {
+        Cond c{leaf->op() == Expr::Op::In ? Expr::Op::Eq : leaf->op(), {}};
+        if (c.op == Expr::Op::Ne) return false;  // matches nearly every row (and NaN rows), so it scans
+        for (const auto& v : leaf->values()) {
+            const auto* i = std::get_if<int64_t>(&v);
+            if (ints && i) c.bounds.push_back({true, *i, 0.0});
+            else c.bounds.push_back({false, 0, as_double(v, leaf->field())});
+        }
+        conds.push_back(std::move(c));
+    }
+    auto holds = [&](int64_t i, double d, Expr::Op o, const Bound& b) {  // a value: i in an int column, else d
+        if (b.exact) return compare(o, i, b.i);
+        return compare(o, ints ? static_cast<double>(i) : d, b.d);
+    };
+    // the first of sorted's positions [from, n) whose value at sort time fails `o b`
+    const size_t n = col.sorted.size();
+    auto first_failing = [&](size_t from, Expr::Op o, const Bound& b) {
+        size_t lo = from, hi = n;
+        while (lo < hi) {
+            const size_t mid = lo + (hi - lo) / 2;
+            const bool ok = ints ? holds(col.sorted_ints[mid], 0.0, o, b) : holds(0, col.sorted_floats[mid], o, b);
+            if (ok) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    };
+
+    // each bound's matching rows are one run of sorted, so a leaf's are its
+    // bounds' runs, and an And's the overlaps of its leaves' runs
+    using Run = std::pair<size_t, size_t>;
+    auto runs_of = [&](const Cond& c) {
+        vector<Run> runs;
+        for (const Bound& b : c.bounds) {
+            if (!b.exact && std::isnan(b.d)) continue;  // compares false with every row
+            const size_t lo = first_failing(0, Expr::Op::Lt, b);
+            const size_t hi = first_failing(lo, Expr::Op::Le, b);
+            runs.push_back(c.op == Expr::Op::Lt   ? Run{0, lo}
+                           : c.op == Expr::Op::Le ? Run{0, hi}
+                           : c.op == Expr::Op::Gt ? Run{hi, n}
+                           : c.op == Expr::Op::Ge ? Run{lo, n}
+                                                  : Run{lo, hi});
+        }
+        return runs;
+    };
+    vector<Run> runs = runs_of(conds[0]);
+    for (size_t c = 1; c < conds.size(); ++c) {
+        vector<Run> both;
+        for (const Run& q : runs_of(conds[c]))
+            for (const Run& r : runs)
+                if (std::max(q.first, r.first) < std::min(q.second, r.second))
+                    both.push_back({std::max(q.first, r.first), std::min(q.second, r.second)});
+        runs = std::move(both);
+    }
+    size_t cost = col.rows() - col.sorted_rows + col.stale.size() * kScatterCost;
+    for (const Run& r : runs) cost += (r.second - r.first) * kSortedScatterCost;
+    if (cost >= slots) return false;
+
+    auto set = [&](size_t s) { words[s / 64] |= uint64_t{1} << (s % 64); };
+    for (auto [a, b] : runs)
+        for (size_t k = a; k < b; ++k) set(col.sorted[k]);
+    // rows sorted under an old value, and rows added since the sort, are tested directly
+    auto test = [&](size_t s) {
+        if (!col.valid[s]) return false;
+        const int64_t i = ints ? col.ints[s] : 0;
+        const double d = ints ? 0.0 : col.floats[s];
+        return std::all_of(conds.begin(), conds.end(), [&](const Cond& c) {
+            return std::any_of(c.bounds.begin(), c.bounds.end(), [&](const Bound& b) { return holds(i, d, c.op, b); });
+        });
+    };
+    for (uint32_t s : col.stale) words[s / 64] &= ~(uint64_t{1} << (s % 64));
+    for (uint32_t s : col.stale)
+        if (test(s)) set(s);
+    for (size_t s = col.sorted_rows; s < col.rows(); ++s)
+        if (test(s)) set(s);
+    return true;
 }
 
 vector<uint64_t> MetadataStore::evaluate_leaf(const Expr& leaf, size_t slots) const {
@@ -829,6 +982,8 @@ vector<uint64_t> MetadataStore::evaluate_leaf(const Expr& leaf, size_t slots) co
         fill_bits(words, slots, [&](size_t i) { return valid[i] && match[codes[i]]; });
         return words;
     }
+
+    if (sorted_leaves(*col, {&leaf}, words, slots)) return words;
 
     if (col->type == ColumnType::Int64) {
         const vector<int64_t>& x = col->ints;
@@ -924,6 +1079,9 @@ MetadataStore MetadataStore::load(std::istream& in, uint64_t slots) {
         } else if (col.type == ColumnType::Float64) {
             col.floats = read_vec<double>(in, slots);
             if (col.floats.size() != slots) throw corrupt("metadata column length mismatch");
+        }
+        if (col.type != ColumnType::String) {
+            col.sort_rows();
         } else {
             col.codes = read_vec<uint32_t>(in, slots);
             if (col.codes.size() != slots) throw corrupt("metadata column length mismatch");
