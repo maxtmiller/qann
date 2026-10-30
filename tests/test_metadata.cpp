@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -230,6 +231,146 @@ TEST_CASE("MetadataStore: string filters stay exact through adds, updates, compa
             ref = std::move(kept);
         } else if (op == 4) {
             store.drop_unused_strings();
+        } else {
+            std::stringstream file;
+            store.save(file);
+            store = MetadataStore::load(file, ref.size());
+        }
+        check(step);
+    }
+}
+
+TEST_CASE("MetadataStore: numeric filters stay exact through adds, updates, compaction and load (fuzz)", "[metadata]") {
+    // Few distinct values (many ties), nulls, NaN and +-0 in the float column,
+    // and ints past 2^53, so ranges through the sorted rows, the unsorted tail,
+    // overwritten rows and the pass all have to agree with a direct check.
+    std::mt19937 rng(41);
+    const int64_t big = (int64_t{1} << 53) + 1;
+    auto draw_int = [&]() -> std::optional<int64_t> {
+        const unsigned r = rng() % 100;
+        if (r < 5) return std::nullopt;
+        if (r < 8) return big + static_cast<int64_t>(rng() % 3);
+        return static_cast<int64_t>(rng() % 200) - 100;
+    };
+    auto draw_float = [&]() -> std::optional<double> {
+        const unsigned r = rng() % 100;
+        if (r < 5) return std::nullopt;
+        if (r < 8) return std::nan("");
+        if (r < 11) return r % 2 ? 0.0 : -0.0;
+        return static_cast<double>(rng() % 400) / 4.0 - 50.0;
+    };
+    using Row = std::pair<std::optional<int64_t>, std::optional<double>>;
+    auto columns = [](const std::vector<Row>& v) {
+        std::vector<int64_t> ints(v.size());
+        std::vector<double> floats(v.size());
+        std::vector<uint8_t> int_valid(v.size()), float_valid(v.size());
+        for (size_t i = 0; i < v.size(); ++i) {
+            int_valid[i] = v[i].first.has_value();
+            float_valid[i] = v[i].second.has_value();
+            if (v[i].first) ints[i] = *v[i].first;
+            if (v[i].second) floats[i] = *v[i].second;
+        }
+        return Metadata{{"n", ints, int_valid}, {"x", floats, float_valid}};
+    };
+    auto cmp = [](Op op, auto a, auto b) {
+        switch (op) {
+            case Op::Eq: return a == b;
+            case Op::Ne: return a != b;
+            case Op::Lt: return a < b;
+            case Op::Le: return a <= b;
+            case Op::Gt: return a > b;
+            default: return a >= b;
+        }
+    };
+
+    MetadataStore store;
+    std::vector<Row> ref;
+    auto check = [&](int step) {
+        CAPTURE(step, ref.size());
+        const Op ops[] = {Op::Eq, Op::Ne, Op::Lt, Op::Le, Op::Gt, Op::Ge};
+        for (int t = 0; t < 12; ++t) {
+            const Op op = ops[rng() % 6];
+            // an int column against an int (exact) or a float (in double); a float column against either
+            const std::vector<Expr::Value> int_values = {int64_t{static_cast<int64_t>(rng() % 220) - 110}, big,
+                                                         static_cast<double>(rng() % 80) / 4.0 - 10.0,
+                                                         static_cast<double>(big), std::nan("")};
+            const std::vector<Expr::Value> float_values = {static_cast<double>(rng() % 440) / 4.0 - 55.0, -0.0,
+                                                           int64_t{static_cast<int64_t>(rng() % 60) - 30}, std::nan("")};
+            const Expr::Value vi = int_values[rng() % int_values.size()];
+            const Expr::Value vf = float_values[rng() % float_values.size()];
+            auto int_match = [&](size_t i, Op o, const Expr::Value& v) {
+                if (!ref[i].first) return false;
+                if (auto* p = std::get_if<int64_t>(&v)) return cmp(o, *ref[i].first, *p);
+                return cmp(o, static_cast<double>(*ref[i].first), std::get<double>(v));
+            };
+            auto float_match = [&](size_t i, Op o, const Expr::Value& v) {
+                if (!ref[i].second) return false;
+                const double b = std::holds_alternative<int64_t>(v) ? static_cast<double>(std::get<int64_t>(v)) : std::get<double>(v);
+                return cmp(o, *ref[i].second, b);
+            };
+            CAPTURE(t, static_cast<int>(op));
+            REQUIRE(bits_to_ids(store.evaluate(Expr::compare("n", op, vi), ref.size()), ref.size()) ==
+                    ids_where(ref.size(), [&](size_t i) { return int_match(i, op, vi); }));
+            REQUIRE(bits_to_ids(store.evaluate(Expr::compare("x", op, vf), ref.size()), ref.size()) ==
+                    ids_where(ref.size(), [&](size_t i) { return float_match(i, op, vf); }));
+            const std::vector<Expr::Value> in_int = {vi, int_values[rng() % int_values.size()]};
+            const std::vector<Expr::Value> in_float = {vf, float_values[rng() % float_values.size()]};
+            REQUIRE(bits_to_ids(store.evaluate(Expr::isin("n", in_int), ref.size()), ref.size()) ==
+                    ids_where(ref.size(), [&](size_t i) { return int_match(i, Op::Eq, in_int[0]) || int_match(i, Op::Eq, in_int[1]); }));
+            REQUIRE(bits_to_ids(store.evaluate(Expr::isin("x", in_float), ref.size()), ref.size()) ==
+                    ids_where(ref.size(), [&](size_t i) { return float_match(i, Op::Eq, in_float[0]) || float_match(i, Op::Eq, in_float[1]); }));
+
+            // comparisons on one column in an And are evaluated together
+            const Expr::Value lo = int_values[rng() % int_values.size()], hi = int_values[rng() % int_values.size()];
+            const Op op2 = ops[2 + rng() % 4];
+            REQUIRE(bits_to_ids(store.evaluate(Expr::between("n", lo, hi) & Expr::compare("n", op2, vi), ref.size()), ref.size()) ==
+                    ids_where(ref.size(), [&](size_t i) {
+                        return int_match(i, Op::Ge, lo) && int_match(i, Op::Le, hi) && int_match(i, op2, vi);
+                    }));
+            const Expr::Value flo = float_values[rng() % float_values.size()];
+            REQUIRE(bits_to_ids(store.evaluate(Expr::compare("x", Op::Gt, flo) & Expr::compare("n", op, vi) &
+                                                   Expr::compare("x", op2, vf) & Expr::isin("x", in_float),
+                                               ref.size()),
+                                ref.size()) ==
+                    ids_where(ref.size(), [&](size_t i) {
+                        return float_match(i, Op::Gt, flo) && int_match(i, op, vi) && float_match(i, op2, vf) &&
+                               (float_match(i, Op::Eq, in_float[0]) || float_match(i, Op::Eq, in_float[1]));
+                    }));
+        }
+    };
+
+    for (int step = 0; step < 120; ++step) {
+        const unsigned op = ref.empty() ? 0 : rng() % 6;
+        if (op <= 1) {  // add a batch, sometimes leaving the columns out (all null)
+            const size_t n = 1 + rng() % (rng() % 4 == 0 ? 4000 : 300);
+            std::vector<Row> batch(n);
+            const bool left_out = !ref.empty() && rng() % 8 == 0;
+            for (auto& r : batch) r = left_out ? Row{} : Row{draw_int(), draw_float()};
+            store.append(ref.size(), n, left_out ? Metadata{} : columns(batch));
+            ref.insert(ref.end(), batch.begin(), batch.end());
+        } else if (op == 2) {  // overwrite distinct rows
+            std::vector<uint32_t> slots(ref.size());
+            std::iota(slots.begin(), slots.end(), 0u);
+            std::shuffle(slots.begin(), slots.end(), rng);
+            slots.resize(1 + rng() % std::min<size_t>(ref.size(), rng() % 2 ? 20 : 2000));
+            std::vector<Row> batch(slots.size());
+            for (auto& r : batch) r = {draw_int(), draw_float()};
+            store.update(slots, columns(batch));
+            for (size_t i = 0; i < slots.size(); ++i) ref[slots[i]] = batch[i];
+        } else if (op == 3) {  // drop about a tenth of the rows
+            std::vector<uint32_t> remap(ref.size());
+            std::vector<Row> kept;
+            for (size_t i = 0; i < ref.size(); ++i) {
+                if (rng() % 10 == 0) remap[i] = IdMap::kRemoved;
+                else {
+                    remap[i] = static_cast<uint32_t>(kept.size());
+                    kept.push_back(ref[i]);
+                }
+            }
+            store.compact(remap);
+            ref = std::move(kept);
+        } else if (op == 4) {
+            continue;  // several changes in a row before the next check
         } else {
             std::stringstream file;
             store.save(file);

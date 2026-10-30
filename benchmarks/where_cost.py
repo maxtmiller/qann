@@ -8,9 +8,10 @@ Gives every vector synthetic metadata (category: 10 strings, brand: 1000
 strings, price: float in [0, 100), year: int 2000-2024), then for each filter
 times, per single query on one thread:
   parse   qann.where(sql)
-  eval    the filter's evaluation over every slot: query(where=f AND price < 0)
-          minus query(where=price < 0). Nothing matches either, so the search
-          is skipped and only evaluation is left
+  eval    the filter's evaluation over every slot: query(where=f AND never = 1)
+          minus query(where=never = 1), where never is 0 on every vector.
+          Nothing matches either, so the search is skipped and only
+          evaluation is left
   search  query(where=f) per index, with the filter already parsed
 and prints eval as a share of each index's filtered query. Configs alternate in
 rounds and keep each one's best, so machine load hits all of them alike.
@@ -44,7 +45,7 @@ FILTERS = [
     "category = 'c3' AND price < 50 AND year >= 2015",
     "(category = 'c3' OR brand = 'b17') AND NOT (price >= 90)",
 ]
-NOTHING = "price < 0"
+NOTHING = "never = 1"  # a column of its own, so And never merges it with a filter's comparisons
 
 
 def metadata(n, rng):
@@ -53,6 +54,7 @@ def metadata(n, rng):
         "brand": [f"b{i}" for i in rng.integers(0, 1000, n)],
         "price": rng.uniform(0, 100, n),
         "year": rng.integers(2000, 2025, n),
+        "never": np.zeros(n, dtype=np.int64),
     }
 
 

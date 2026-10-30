@@ -1,8 +1,8 @@
-// Picks the thresholds string filters use to choose between a pass over the
-// column, a string's row list and its bitmap (#72 step 3, PR #90).
+// Picks the thresholds metadata filters use to choose between a pass over the
+// column and its per-string rows (lists, bitmaps) or sorted numeric rows (#72 step 3).
 //
-//   clang++ -O3 -std=c++20 -Iinclude benchmarks/string_filter_sweep.cpp build/libvecengine_core.a \
-//       -framework Accelerate -o build/string_filter_sweep && ./build/string_filter_sweep
+//   clang++ -O3 -std=c++20 -Iinclude benchmarks/filter_sweep.cpp build/libvecengine_core.a \
+//       -framework Accelerate -o build/filter_sweep && ./build/filter_sweep
 //
 // For a column of 1M rows where one string covers a fraction p at random rows,
 // times one evaluation of tag = 'x' by each path on its own: "scan" (the
@@ -109,5 +109,23 @@ int main() {
         const double ratio = rows.empty() ? 0 : (best[1] / rows.size()) / (best[0] / n);
         std::printf("%8.4f %9zu %9.1f %9.1f %9.1f %9.1f %9.1f   %.1f\n", p, rows.size(), best[0], best[1], best[2],
                     best[3], best[4], ratio);
+    }
+
+    // numeric columns: price < t through the real evaluate (sorted rows below
+    // the cutoff, the pass above it) against != t, which always takes the pass
+    std::printf("\nfloat column, price uniform in [0, 1), us per evaluation\n\n%8s %9s %9s\n", "p", "price<p", "pass(!=)");
+    vector<double> price(n);
+    std::uniform_real_distribution<double> uni(0.0, 1.0);
+    for (double& x : price) x = uni(rng);
+    detail::MetadataStore store;
+    store.append(0, n, {{"price", price}});
+    for (double p : fractions) {
+        const Expr lt = Expr::compare("price", Expr::Op::Lt, p), ne = Expr::compare("price", Expr::Op::Ne, p);
+        double best[2] = {1e30, 1e30};
+        for (int r = 0; r < rounds; ++r) {
+            best[0] = std::min(best[0], time_us([&] { consume(store.evaluate(lt, n)); }, 20));
+            best[1] = std::min(best[1], time_us([&] { consume(store.evaluate(ne, n)); }, 20));
+        }
+        std::printf("%8.4f %9.1f %9.1f\n", p, best[0], best[1]);
     }
 }

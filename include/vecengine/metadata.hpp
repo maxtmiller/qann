@@ -221,6 +221,16 @@ private:
         vector<CodeRows> rows_of;  // String: one per dict entry
         size_t balanced_rows = 0;  // String: rows() when every code was last rebalanced
 
+        // Int64 / Float64: the non-null rows below sorted_rows (but no NaN),
+        // ordered by value, so a range filter costs about its matching rows
+        // (#72). Later rows and overwritten ones are tested one by one until
+        // they reach rows() / 8, then everything is sorted again. Memory only.
+        vector<uint32_t> sorted;
+        vector<int64_t> sorted_ints;    // Int64: sorted's values when sorted (a stale row's may differ now)
+        vector<double> sorted_floats;   // Float64: the same
+        size_t sorted_rows = 0;  // rows [sorted_rows, rows()) are not in sorted yet
+        vector<uint32_t> stale;  // rows below sorted_rows overwritten since the sort; may repeat
+
         size_t rows() const noexcept { return valid.size(); }
 
         // Adds rows [first, rows()) to rows_of, then rebalances. String columns only.
@@ -243,6 +253,13 @@ private:
         // Switches r to a bitmap when it holds at least 1/32 of the rows (and
         // 64 rows), and back to a list below 1/64.
         void balance(CodeRows& r) const;
+
+        // Sorts every row into sorted and empties stale. Int64 / Float64 only.
+        void sort_rows();
+
+        // sort_rows() once the unsorted rows (after sorted_rows, or stale)
+        // exceed rows() / 8. Int64 / Float64 only.
+        void maybe_sort();
     };
 
     // The column with this name, or nullptr.
@@ -253,6 +270,12 @@ private:
 
     // Bits of the rows of one leaf (comparison, In or IsNull).
     vector<uint64_t> evaluate_leaf(const Expr& leaf, size_t slots) const;
+
+    // Sets the bits of the And of leaves (comparisons or In on numeric column
+    // col; more than one leaf only for comparisons) in words, all zero, from
+    // col.sorted when that costs less than a pass over the column, and
+    // returns whether it did. Throws like evaluate_leaf on a string value.
+    static bool sorted_leaves(const Column& col, const vector<const Expr*>& leaves, vector<uint64_t>& words, size_t slots);
 
     vector<Column> columns_;
 };
