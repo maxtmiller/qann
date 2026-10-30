@@ -290,6 +290,25 @@ def test_filtered_query(data, kind):
         index.query(data[0], 5, allowed=[1.5])
 
 
+def test_refine_over_ivf_narrow_filter_is_exact():
+    rng = np.random.default_rng(3)
+    data = rng.standard_normal((20000, 32), dtype=np.float32)
+    queries = rng.standard_normal((20, 32), dtype=np.float32)
+    ivf = qann.IVFIndex(32, nlist=100, nprobe=1)
+    ivf.enable_pq(8, fast_scan=True)
+    ivf.train(data, seed=1)
+    refine = qann.RefineIndex(ivf, k_factor=4)
+    refine.add(data)
+    flat = qann.FlatIndex(32)
+    flat.add(data)
+    allowed = np.arange(7, 20000, 150)    # 134 allowed, under 2 * nlist: scored directly
+    got, gd = refine.batch_query(queries, 10, allowed=allowed)
+    want, wd = flat.batch_query(queries, 10, allowed=allowed)
+    np.testing.assert_array_equal(got, want)
+    np.testing.assert_allclose(gd, wd, rtol=1e-5)
+    np.testing.assert_array_equal(refine.query(queries[0], 10, allowed=allowed)[0], want[0])
+
+
 def test_ids_accept_any_integer_sequence(data):
     index = qann.FlatIndex(32, custom_ids=True)
     index.add(data[:4], ids=[10, 11, 12, 13])

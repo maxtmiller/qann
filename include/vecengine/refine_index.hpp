@@ -92,6 +92,13 @@ private:
     // Exact top k of the base's candidates for vec (candidate ids are base slots).
     vector<Neighbor> rerank(span<const float> vec, const vector<Neighbor>& candidates, size_t k) const;
 
+    // Whether a filtered query skips the base and scores the allowed vectors
+    // directly (see direct_scan).
+    bool use_direct(const detail::SlotFilter* filter) const;
+
+    // Exact top k among the filter's slots, from the raw vectors stored here.
+    vector<Neighbor> direct_scan(span<const float> vec, size_t k, const detail::SlotFilter& filter) const;
+
     // Used by load_body(): takes ownership of an already filled base and skips
     // the public constructor's empty-base check.
     RefineIndex(std::unique_ptr<Index> base, size_t k_factor)
