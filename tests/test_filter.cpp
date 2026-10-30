@@ -417,6 +417,32 @@ TEST_CASE("Filtered IVF probes more lists as the filter narrows", "[filter][ivf]
     }
 }
 
+TEST_CASE("Filtered IVF-PQ at high dimension matches unfiltered when everything is allowed", "[filter][ivf]") {
+    // dim >= IVFIndex::kBlasCoarseMinDim, so with Accelerate the filtered coarse
+    // step ranks lists with sgemv; the scan must still use exact centroid
+    // distances, so results match the unfiltered path bit for bit
+    const size_t n = 4000, dim = 320, nq = 20, k = 10;
+    auto data = filter_random(n, dim, 16);
+    for (float& x : data) x += 10.0f;    // far from the origin: sgemv's ||c||^2 - 2 q.c cancels more
+    auto queries = filter_random(nq, dim, 17);
+    for (float& x : queries) x += 10.0f;
+
+    IVFIndex ivf(dim, 100, 4);
+    ivf.enable_pq(40, 256, false);
+    ivf.train(data, n, 25, 1);
+    ivf.add_batch(data, n);
+    REQUIRE(ivf.precomputed_tables());
+    const auto unfiltered = ivf.query_batch(queries, nq, k);
+    const auto all = ivf.query_batch(queries, nq, k, every(n, 1));
+    for (size_t q = 0; q < nq; ++q) {
+        REQUIRE(all[q].size() == k);
+        for (size_t i = 0; i < k; ++i) {
+            REQUIRE(all[q][i].index == unfiltered[q][i].index);
+            REQUIRE(all[q][i].distance == unfiltered[q][i].distance);
+        }
+    }
+}
+
 TEST_CASE("Filtered cosine search reports cosine distances", "[filter][metric]") {
     const size_t n = 2000, dim = 8, k = 5;
     const auto data = filter_random(n, dim, 7);
