@@ -948,8 +948,9 @@ TEST_CASE("Expr::parse reports where a filter is wrong", "[metadata][parse]") {
 }
 
 TEST_CASE("Expr::parse matches SQL's three-valued logic on rows with nulls (fuzz)", "[metadata][parse]") {
-    // Columns a (int), b (float), s (string). Batches leave columns out so
-    // every combination of nulls appears.
+    // Columns a (int), café (float) and "and" (string): one bare, one that needs
+    // quoting for its non-ASCII name, one for being a keyword. Batches leave
+    // columns out so every combination of nulls appears.
     constexpr size_t kRows = 40;
     std::vector<std::optional<int64_t>> A(kRows);
     std::vector<std::optional<double>> B(kRows);
@@ -969,7 +970,7 @@ TEST_CASE("Expr::parse matches SQL's three-valued logic on rows with nulls (fuzz
         }
         Metadata md;
         if (has_a) md.push_back({"a", a});
-        if (has_bs) md.push_back({"b", b}), md.push_back({"s", s});
+        if (has_bs) md.push_back({"café", b}), md.push_back({"and", s});
         store.check(10, md);
         store.append(batch * 10, 10, md);
     }
@@ -989,7 +990,6 @@ TEST_CASE("Expr::parse matches SQL's three-valued logic on rows with nulls (fuzz
         std::string sql;
         std::function<T(size_t)> eval;
     };
-    const char* names[] = {"a", "b", "s"};
     std::mt19937 rng(46);
     auto pick = [&](size_t n) { return static_cast<size_t>(rng() % n); };
     auto kw = [&](const char* w) {
@@ -997,19 +997,50 @@ TEST_CASE("Expr::parse matches SQL's three-valued logic on rows with nulls (fuzz
         if (pick(2)) for (char& c : out) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         return out;
     };
+    auto show = [](const Expr::Value& v) {
+        std::ostringstream o;
+        std::visit([&](const auto& x) { o << x; }, v);
+        return o.str();
+    };
+    // mode 0 writes every value inline; 1 and 2 also bind some as ? or :name
+    // parameters (one kind per filter, as parse() takes either a list or a map)
+    int mode = 0;
+    std::vector<Expr::Value> list;
+    std::unordered_map<std::string, Expr::Value> named;
+    auto render = [&](Expr::Value v, std::string inline_sql) -> std::string {
+        if (mode == 0 || pick(2)) return inline_sql;
+        if (mode == 1) {
+            list.push_back(std::move(v));
+            return "?";
+        }
+        const std::string key = "p" + std::to_string(named.size());
+        named.emplace(key, std::move(v));
+        return ":" + key;
+    };
+    auto col_sql = [&](size_t c) -> std::string {
+        if (c == 0) return pick(2) ? "a" : "\"a\"";
+        return c == 1 ? "\"café\"" : "\"and\"";
+    };
+    // both number columns get ints and halves, so comparisons cross types;
+    // strings include a quote and an injection attempt, escaped inline as ''
+    static const char* strs[] = {"w", "x", "y", "z", "it's", "x' OR 'a' = 'a"};
     auto lit = [&](size_t c) {
-        if (c == 0) {
-            const int64_t v = static_cast<int64_t>(pick(8));
-            return Lit{std::to_string(v), static_cast<double>(v), ""};
+        if (c != 2) {
+            Expr::Value v;
+            double num;
+            if (pick(2)) {
+                const int64_t i = static_cast<int64_t>(pick(8));
+                v = i, num = static_cast<double>(i);
+            } else {
+                num = static_cast<double>(pick(10)) * 0.5;
+                v = num;
+            }
+            return Lit{render(v, show(v)), num, ""};
         }
-        if (c == 1) {
-            const double v = static_cast<double>(pick(10)) * 0.5;
-            std::ostringstream o;
-            o << v;
-            return Lit{o.str(), v, ""};
-        }
-        const std::string v(1, static_cast<char>('w' + pick(4)));
-        return Lit{"'" + v + "'", 0, v};
+        const std::string v = strs[pick(6)];
+        std::string quoted = "'";
+        for (char ch : v) quoted += ch == '\'' ? std::string("''") : std::string(1, ch);
+        return Lit{render(v, quoted + "'"), 0, v};
     };
     // sign of row r's value against l, or nullopt when the row is null
     auto cmp = [&](size_t c, size_t r, const Lit& l) -> std::optional<int> {
@@ -1031,7 +1062,7 @@ TEST_CASE("Expr::parse matches SQL's three-valued logic on rows with nulls (fuzz
     std::function<Node(int)> gen = [&](int depth) -> Node {
         if (depth == 0 || pick(3) == 0) {
             const size_t c = pick(3);
-            const std::string col = names[c];
+            const std::string col = col_sql(c);
             switch (pick(6)) {
                 case 0: {
                     static const char* ops[] = {"=", "==", "!=", "<>", "<", "<=", ">", ">="};
@@ -1097,12 +1128,22 @@ TEST_CASE("Expr::parse matches SQL's three-valued logic on rows with nulls (fuzz
         }
     };
 
-    for (int iter = 0; iter < 2000; ++iter) {
+    size_t bound = 0;
+    for (int iter = 0; iter < 3000; ++iter) {
+        mode = iter % 3;
+        list.clear();
+        named.clear();
         const Node n = gen(4);
-        INFO(n.sql);
+        std::string params;
+        for (const auto& v : list) params += " " + show(v);
+        for (const auto& [k, v] : named) params += " :" + k + "=" + show(v);
+        INFO(n.sql << " | params:" << params);
+        bound += list.size() + named.size();
         const auto want = ids_where(kRows, [&](size_t r) { return n.eval(r) == T::Tr; });
-        REQUIRE(bits_to_ids(store.evaluate(Expr::parse(n.sql), kRows), kRows) == want);
+        const Expr e = mode == 1 ? Expr::parse(n.sql, list) : mode == 2 ? Expr::parse(n.sql, named) : Expr::parse(n.sql);
+        REQUIRE(bits_to_ids(store.evaluate(e, kRows), kRows) == want);
     }
+    REQUIRE(bound > 2000);    // the parameter paths really ran
 }
 
 TEST_CASE("Expr::parse caps the number of conditions", "[metadata][parse]") {
