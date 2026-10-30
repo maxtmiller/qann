@@ -890,6 +890,31 @@ size_t count_bits(const vector<uint64_t>& words) {
     return n;
 }
 
+// Whether `count` rows are few enough to work on as a row list: one is then
+// smaller than a bitmap of every slot (4 bytes a row against a bit a slot).
+bool few_rows(size_t count, size_t slots) { return count * 32 < slots; }
+
+vector<uint32_t> rows_of_bits(const vector<uint64_t>& words) {
+    vector<uint32_t> rows;
+    for (size_t w = 0; w < words.size(); ++w)
+        for (uint64_t b = words[w]; b; b &= b - 1) rows.push_back(static_cast<uint32_t>(w * 64 + std::countr_zero(b)));
+    return rows;
+}
+
+vector<uint64_t> bits_of_rows(const vector<uint32_t>& rows, size_t slots) {
+    vector<uint64_t> words((slots + 63) / 64, 0);
+    for (uint32_t s : rows) words[s / 64] |= uint64_t{1} << (s % 64);
+    return words;
+}
+
+// The rows of a (sorted) that aren't in b (sorted, a subset of a).
+vector<uint32_t> without(const vector<uint32_t>& a, const vector<uint32_t>& b) {
+    vector<uint32_t> out;
+    out.reserve(a.size() - b.size());
+    std::set_difference(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(out));
+    return out;
+}
+
 } // namespace
 
 vector<uint64_t> MetadataStore::evaluate(const Expr& where, size_t slots) const {
@@ -924,7 +949,13 @@ MetadataStore::Estimate MetadataStore::estimate_tree(const Expr& where, size_t s
     }
 }
 
-vector<uint64_t> MetadataStore::evaluate_tree(const Expr& where, size_t slots, const vector<uint64_t>* within) const {
+vector<uint64_t> MetadataStore::evaluate_tree(const Expr& where, size_t slots, const vector<uint64_t>* within,
+                                              size_t inside) const {
+    if (within && few_rows(inside, slots)) {
+        vector<uint32_t> rows = rows_of_bits(*within);
+        evaluate_rows(where, rows, slots);
+        return bits_of_rows(rows, slots);
+    }
     auto mask = [&](vector<uint64_t> words) {
         if (within)
             for (size_t w = 0; w < words.size(); ++w) words[w] &= (*within)[w];
@@ -979,14 +1010,30 @@ vector<uint64_t> MetadataStore::evaluate_tree(const Expr& where, size_t slots, c
             if (within) a = *within;
             else if (parts[0].other) a = evaluate_tree(*parts[i++].other, slots, nullptr);
             else a = run(parts[i++]);
+            size_t left = within ? inside : count_bits(a);
             for (; i < parts.size(); ++i) {
+                if (few_rows(left, slots)) {  // the rest on the rows left alone
+                    vector<uint32_t> rows = rows_of_bits(a);
+                    for (; i < parts.size(); ++i) {
+                        if (parts[i].other) evaluate_rows(*parts[i].other, rows, slots);
+                        else
+                            for (const Expr* leaf : parts[i].leaves) evaluate_rows(*leaf, rows, slots);
+                    }
+                    return bits_of_rows(rows, slots);
+                }
                 if (parts[i].other) {
-                    a = evaluate_tree(*parts[i].other, slots, &a);
-                } else if (count_bits(a) * kTestCost < parts[i].est.cost) {
+                    a = evaluate_tree(*parts[i].other, slots, &a, left);
+                    left = count_bits(a);
+                } else if (left * kTestCost < parts[i].est.cost) {
                     for (const Expr* leaf : parts[i].leaves) narrow(*leaf, a);
+                    left = count_bits(a);
                 } else {
                     const vector<uint64_t> b = run(parts[i]);
-                    for (size_t w = 0; w < a.size(); ++w) a[w] &= b[w];
+                    left = 0;
+                    for (size_t w = 0; w < a.size(); ++w) {
+                        a[w] &= b[w];
+                        left += static_cast<size_t>(std::popcount(a[w]));
+                    }
                 }
             }
             return a;
@@ -1002,17 +1049,20 @@ vector<uint64_t> MetadataStore::evaluate_tree(const Expr& where, size_t slots, c
             }
             // each branch only on the rows of within no earlier branch matched
             vector<uint64_t> left = *within, a(within->size(), 0);
+            size_t remaining = inside;
             for (const Expr& c : where.children()) {
-                const vector<uint64_t> b = evaluate_tree(c, slots, &left);
+                const vector<uint64_t> b = evaluate_tree(c, slots, &left, remaining);
+                remaining = 0;
                 for (size_t w = 0; w < a.size(); ++w) {
                     a[w] |= b[w];
                     left[w] &= ~b[w];
+                    remaining += static_cast<size_t>(std::popcount(left[w]));
                 }
             }
             return a;
         }
         case Expr::Op::Not: {
-            vector<uint64_t> a = evaluate_tree(where.children()[0], slots, within);
+            vector<uint64_t> a = evaluate_tree(where.children()[0], slots, within, inside);
             for (uint64_t& w : a) w = ~w;
             if (slots % 64) a.back() &= (uint64_t{1} << (slots % 64)) - 1;  // padding bits past the last slot
             return mask(std::move(a));
@@ -1021,7 +1071,7 @@ vector<uint64_t> MetadataStore::evaluate_tree(const Expr& where, size_t slots, c
             if (!within) return evaluate_leaf(where, slots);
             const Column* col = find(where.field());
             if (!col) throw std::invalid_argument("unknown metadata field '" + where.field() + "'");
-            if (count_bits(*within) * kTestCost < estimate(*col, {&where}, slots).cost) {
+            if (inside * kTestCost < estimate(*col, {&where}, slots).cost) {
                 vector<uint64_t> a = *within;
                 narrow(where, a);
                 return a;
@@ -1183,10 +1233,16 @@ void keep_if(vector<uint64_t>& words, Test&& test) {
     }
 }
 
+// Drops each row of a sorted row list that fails test(row), keeping the order.
+template <class Test>
+void keep_if(vector<uint32_t>& rows, Test&& test) {
+    rows.erase(std::remove_if(rows.begin(), rows.end(), [&](uint32_t s) { return !test(s); }), rows.end());
+}
+
 // keep_if for valid rows whose V(x[row]) <op> value, with op chosen outside the loop.
-template <class V, class T>
-void keep_compared(vector<uint64_t>& words, const vector<uint8_t>& valid, const T* x, Expr::Op op, V value) {
-    auto run = [&](auto pred) { keep_if(words, [&](size_t s) { return valid[s] && pred(static_cast<V>(x[s])); }); };
+template <class Set, class V, class T>
+void keep_compared(Set& set, const vector<uint8_t>& valid, const T* x, Expr::Op op, V value) {
+    auto run = [&](auto pred) { keep_if(set, [&](size_t s) { return valid[s] && pred(static_cast<V>(x[s])); }); };
     switch (op) {
         case Expr::Op::Eq: run([&](V a) { return a == value; }); break;
         case Expr::Op::Ne: run([&](V a) { return a != value; }); break;
@@ -1200,7 +1256,8 @@ void keep_compared(vector<uint64_t>& words, const vector<uint8_t>& valid, const 
 
 } // namespace
 
-void MetadataStore::narrow(const Expr& leaf, vector<uint64_t>& words) const {
+template <class Set>
+void MetadataStore::narrow(const Expr& leaf, Set& words) const {
     const Column* col = find(leaf.field());
     if (!col) throw std::invalid_argument("unknown metadata field '" + leaf.field() + "'");
     const Expr::Op op = leaf.op();
@@ -1237,6 +1294,47 @@ void MetadataStore::narrow(const Expr& leaf, vector<uint64_t>& words) const {
             keep_if(words, [&](size_t s) { return valid[s] && wanted.count(x[s]); });
         } else {
             keep_compared(words, valid, x, op, as_double(leaf.values()[0], leaf.field()));
+        }
+    }
+}
+
+void MetadataStore::evaluate_rows(const Expr& where, vector<uint32_t>& rows, size_t slots) const {
+    switch (where.op()) {
+        case Expr::Op::And: {
+            vector<std::pair<size_t, const Expr*>> kids;  // estimated matches, child: fewest first
+            for (const Expr& c : where.children()) kids.push_back({estimate_tree(c, slots).matches, &c});
+            std::stable_sort(kids.begin(), kids.end(), [](const auto& x, const auto& y) { return x.first < y.first; });
+            for (const auto& [matches, c] : kids) evaluate_rows(*c, rows, slots);
+            return;
+        }
+        case Expr::Op::Or: {
+            // each branch only on the rows no earlier branch matched
+            vector<uint32_t> left = rows, matched;
+            for (const Expr& c : where.children()) {
+                vector<uint32_t> got = left;
+                evaluate_rows(c, got, slots);
+                left = without(left, got);
+                matched.insert(matched.end(), got.begin(), got.end());
+            }
+            std::sort(matched.begin(), matched.end());
+            rows = std::move(matched);
+            return;
+        }
+        case Expr::Op::Not: {
+            vector<uint32_t> got = rows;
+            evaluate_rows(where.children()[0], got, slots);
+            rows = without(rows, got);
+            return;
+        }
+        default: {
+            const Column* col = find(where.field());
+            if (!col) throw std::invalid_argument("unknown metadata field '" + where.field() + "'");
+            if (estimate(*col, {&where}, slots).cost < rows.size() * kTestCost) {
+                const vector<uint64_t> words = evaluate_leaf(where, slots);
+                keep_if(rows, [&](size_t s) { return (words[s / 64] >> (s % 64)) & 1; });
+            } else {
+                narrow(where, rows);
+            }
         }
     }
 }
