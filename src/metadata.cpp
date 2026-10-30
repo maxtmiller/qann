@@ -801,14 +801,143 @@ const MetadataStore::Column* MetadataStore::find(const std::string& name) const 
     return nullptr;
 }
 
+namespace {
+
+// Whether a and b are the same filter, node for node (values compared with ==,
+// so a NaN value matches nothing).
+bool same(const Expr& a, const Expr& b) {
+    if (a.op() != b.op() || a.field() != b.field() || a.values() != b.values() ||
+        a.children().size() != b.children().size())
+        return false;
+    for (size_t i = 0; i < a.children().size(); ++i)
+        if (!same(a.children()[i], b.children()[i])) return false;
+    return true;
+}
+
+// An And's children, or the filter itself: the terms an Or branch is the And of.
+vector<Expr> terms_of(const Expr& e) {
+    if (e.op() == Expr::Op::And) return e.children();
+    return {e};
+}
+
+// e with each condition that two or more branches of an Or share pulled out
+// in front: (a & x) | (a & y) | z becomes (a & (x | y)) | z, so a is
+// evaluated once and x | y only on a's rows. A branch that is only a (a | (a
+// & x)) absorbs the rest of its group. The rows matched never change: the
+// filter logic is two-valued (nulls fail, ~ is a complement), where & and |
+// distribute exactly.
+Expr factor(const Expr& e) {
+    const Expr::Op op = e.op();
+    if (op == Expr::Op::Not) return ~factor(e.children()[0]);
+    if (op != Expr::Op::And && op != Expr::Op::Or) return e;
+    vector<Expr> kids;
+    kids.reserve(e.children().size());
+    for (const Expr& c : e.children()) kids.push_back(factor(c));
+    if (op == Expr::Op::And) return Expr::join(op, std::move(kids));
+
+    while (kids.size() > 1 && std::any_of(kids.begin(), kids.end(), [](const Expr& k) { return k.op() == Expr::Op::And; })) {
+        // the term in the most branches, keyed by to_string and checked with same()
+        std::unordered_map<std::string, vector<size_t>> branches;  // term -> branches holding it
+        vector<vector<Expr>> terms(kids.size());
+        for (size_t k = 0; k < kids.size(); ++k) {
+            terms[k] = terms_of(kids[k]);
+            for (const Expr& t : terms[k]) {
+                vector<size_t>& with = branches[t.to_string()];
+                if (with.empty() || with.back() != k) with.push_back(k);
+            }
+        }
+        const Expr* shared = nullptr;
+        vector<size_t> group;
+        std::string shared_key;  // ties go to the smallest key, so the result doesn't depend on hashing
+        for (const auto& [key, with] : branches) {
+            if (with.size() < 2 || with.size() < group.size()) continue;
+            const Expr* t = nullptr;
+            for (const Expr& x : terms[with[0]])
+                if (x.to_string() == key) t = &x;
+            vector<size_t> holding;
+            for (size_t k : with)
+                if (std::any_of(terms[k].begin(), terms[k].end(), [&](const Expr& x) { return same(x, *t); })) holding.push_back(k);
+            if (holding.size() >= 2 && (holding.size() > group.size() || (holding.size() == group.size() && key < shared_key))) {
+                shared = t;
+                group = std::move(holding);
+                shared_key = key;
+            }
+        }
+        if (!shared) break;
+
+        const Expr t = *shared;
+        vector<Expr> rests;
+        bool absorbed = false;  // a branch is just t, so the group is t
+        for (size_t k : group) {
+            vector<Expr> rest;
+            for (const Expr& x : terms[k])
+                if (!same(x, t)) rest.push_back(x);
+            if (rest.empty()) absorbed = true;
+            else rests.push_back(Expr::join(Expr::Op::And, std::move(rest)));
+        }
+        vector<Expr> next;
+        next.push_back(absorbed ? t : t & factor(Expr::join(Expr::Op::Or, std::move(rests))));
+        for (size_t k = 0; k < kids.size(); ++k)
+            if (std::find(group.begin(), group.end(), k) == group.end()) next.push_back(std::move(kids[k]));
+        kids = std::move(next);
+    }
+    return Expr::join(Expr::Op::Or, std::move(kids));
+}
+
+size_t count_bits(const vector<uint64_t>& words) {
+    size_t n = 0;
+    for (uint64_t w : words) n += static_cast<size_t>(std::popcount(w));
+    return n;
+}
+
+} // namespace
+
 vector<uint64_t> MetadataStore::evaluate(const Expr& where, size_t slots) const {
+    // factoring can nest one level deeper per group; past Expr::kMaxDepth, evaluate as given
+    std::optional<Expr> factored;
+    try {
+        factored = factor(where);
+    } catch (const std::invalid_argument&) {
+    }
+    return evaluate_tree(factored ? *factored : where, slots, nullptr);
+}
+
+MetadataStore::Estimate MetadataStore::estimate_tree(const Expr& where, size_t slots) const {
+    switch (where.op()) {
+        case Expr::Op::And:
+        case Expr::Op::Or: {
+            const bool all = where.op() == Expr::Op::And;
+            Estimate est{all ? slots : 0, 0};
+            for (const Expr& c : where.children()) {
+                const Estimate e = estimate_tree(c, slots);
+                est.matches = all ? std::min(est.matches, e.matches) : std::min(slots, est.matches + e.matches);
+                est.cost += e.cost;
+            }
+            return est;
+        }
+        case Expr::Op::Not: return {slots, estimate_tree(where.children()[0], slots).cost};
+        default: {
+            const Column* col = find(where.field());
+            if (!col) throw std::invalid_argument("unknown metadata field '" + where.field() + "'");
+            return estimate(*col, {&where}, slots);
+        }
+    }
+}
+
+vector<uint64_t> MetadataStore::evaluate_tree(const Expr& where, size_t slots, const vector<uint64_t>* within) const {
+    auto mask = [&](vector<uint64_t> words) {
+        if (within)
+            for (size_t w = 0; w < words.size(); ++w) words[w] &= (*within)[w];
+        return words;
+    };
     switch (where.op()) {
         case Expr::Op::And: {
             // Parts: each child, except that comparisons on one numeric column
             // form one part, a single run of its sorted rows (as in a BETWEEN,
             // though each alone may match too many). The part estimated to
-            // match fewest rows runs first; each later leaf part then tests only
-            // the rows still set, when that is cheaper than its own evaluation.
+            // match fewest rows runs first; each later part then works only on
+            // the rows still set: a leaf part tests just those rows when that is
+            // cheaper than its own evaluation, and a nested part passes them down.
             struct Part {
                 const Column* col;          // leaf parts
                 vector<const Expr*> leaves;
@@ -819,7 +948,7 @@ vector<uint64_t> MetadataStore::evaluate(const Expr& where, size_t slots) const 
             for (const Expr& child : where.children()) {
                 const Expr::Op op = child.op();
                 if (op == Expr::Op::And || op == Expr::Op::Or || op == Expr::Op::Not) {
-                    parts.push_back({nullptr, {}, &child, {slots, slots}});
+                    parts.push_back({nullptr, {}, &child, estimate_tree(child, slots)});
                     continue;
                 }
                 const Column* col = find(child.field());
@@ -836,7 +965,6 @@ vector<uint64_t> MetadataStore::evaluate(const Expr& where, size_t slots) const 
             std::stable_sort(parts.begin(), parts.end(), [](const Part& x, const Part& y) { return x.est.matches < y.est.matches; });
 
             auto run = [&](const Part& p) {
-                if (p.other) return evaluate(*p.other, slots);
                 vector<uint64_t> words((slots + 63) / 64, 0);
                 if (p.leaves.size() > 1 && sorted_leaves(*p.col, p.leaves, words, slots)) return words;
                 words = evaluate_leaf(*p.leaves[0], slots);
@@ -846,35 +974,60 @@ vector<uint64_t> MetadataStore::evaluate(const Expr& where, size_t slots) const 
                 }
                 return words;
             };
-            vector<uint64_t> a = run(parts[0]);
-            for (size_t i = 1; i < parts.size(); ++i) {
-                size_t left = 0;
-                for (uint64_t w : a) left += static_cast<size_t>(std::popcount(w));
-                if (!parts[i].other && left * kTestCost < parts[i].est.cost) {
+            vector<uint64_t> a;
+            size_t i = 0;
+            if (within) a = *within;
+            else if (parts[0].other) a = evaluate_tree(*parts[i++].other, slots, nullptr);
+            else a = run(parts[i++]);
+            for (; i < parts.size(); ++i) {
+                if (parts[i].other) {
+                    a = evaluate_tree(*parts[i].other, slots, &a);
+                } else if (count_bits(a) * kTestCost < parts[i].est.cost) {
                     for (const Expr* leaf : parts[i].leaves) narrow(*leaf, a);
-                    continue;
+                } else {
+                    const vector<uint64_t> b = run(parts[i]);
+                    for (size_t w = 0; w < a.size(); ++w) a[w] &= b[w];
                 }
-                const vector<uint64_t> b = run(parts[i]);
-                for (size_t w = 0; w < a.size(); ++w) a[w] &= b[w];
             }
             return a;
         }
         case Expr::Op::Or: {
-            vector<uint64_t> a = evaluate(where.children()[0], slots);
-            for (size_t c = 1; c < where.children().size(); ++c) {
-                const vector<uint64_t> b = evaluate(where.children()[c], slots);
-                for (size_t w = 0; w < a.size(); ++w) a[w] |= b[w];
+            if (!within) {
+                vector<uint64_t> a = evaluate_tree(where.children()[0], slots, nullptr);
+                for (size_t c = 1; c < where.children().size(); ++c) {
+                    const vector<uint64_t> b = evaluate_tree(where.children()[c], slots, nullptr);
+                    for (size_t w = 0; w < a.size(); ++w) a[w] |= b[w];
+                }
+                return a;
+            }
+            // each branch only on the rows of within no earlier branch matched
+            vector<uint64_t> left = *within, a(within->size(), 0);
+            for (const Expr& c : where.children()) {
+                const vector<uint64_t> b = evaluate_tree(c, slots, &left);
+                for (size_t w = 0; w < a.size(); ++w) {
+                    a[w] |= b[w];
+                    left[w] &= ~b[w];
+                }
             }
             return a;
         }
         case Expr::Op::Not: {
-            vector<uint64_t> a = evaluate(where.children()[0], slots);
+            vector<uint64_t> a = evaluate_tree(where.children()[0], slots, within);
             for (uint64_t& w : a) w = ~w;
             if (slots % 64) a.back() &= (uint64_t{1} << (slots % 64)) - 1;  // padding bits past the last slot
-            return a;
+            return mask(std::move(a));
         }
-        default:
-            return evaluate_leaf(where, slots);
+        default: {
+            if (!within) return evaluate_leaf(where, slots);
+            const Column* col = find(where.field());
+            if (!col) throw std::invalid_argument("unknown metadata field '" + where.field() + "'");
+            if (count_bits(*within) * kTestCost < estimate(*col, {&where}, slots).cost) {
+                vector<uint64_t> a = *within;
+                narrow(where, a);
+                return a;
+            }
+            return mask(evaluate_leaf(where, slots));
+        }
     }
 }
 

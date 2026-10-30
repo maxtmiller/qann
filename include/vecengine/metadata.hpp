@@ -182,6 +182,7 @@ public:
     // One bit per slot (slots bits, 64 per word), set where the row matches
     // `where`. Deleted slots are not cleared here. Throws
     // std::invalid_argument on an unknown column or a value of the wrong kind.
+    // Conditions shared by Or branches are factored out first (see factor()).
     vector<uint64_t> evaluate(const Expr& where, size_t slots) const;
 
     // Each column's name and type, in creation order.
@@ -298,6 +299,16 @@ private:
     // Clears the bits of `words` whose rows fail leaf, testing only the rows
     // set, for an And whose other parts left few. Throws like evaluate_leaf.
     void narrow(const Expr& leaf, vector<uint64_t>& words) const;
+
+    // evaluate() without factoring, for the rows set in `within` only: the
+    // result is where & within (where alone without within). Leaves test
+    // just those rows when that is cheaper than evaluating over the column.
+    vector<uint64_t> evaluate_tree(const Expr& where, size_t slots, const vector<uint64_t>* within) const;
+
+    // The Estimate for any filter: a leaf's from estimate(), an And's fewest
+    // matches, an Or's summed matches, and their summed costs. Throws like
+    // evaluate on an unknown column or a value of the wrong kind.
+    Estimate estimate_tree(const Expr& where, size_t slots) const;
 
     vector<Column> columns_;
 };

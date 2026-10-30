@@ -44,6 +44,7 @@ FILTERS = [
     "category = 'c3' AND price < 50",
     "category = 'c3' AND price < 50 AND year >= 2015",
     "(category = 'c3' OR brand = 'b17') AND NOT (price >= 90)",
+    "(category = 'c3' AND price < 50) OR (category = 'c3' AND year >= 2015)",
 ]
 # matches no vector. On a column of its own, so And never merges it with a
 # filter's comparisons, and wrapped in ~~ so And treats it as a nested part,
