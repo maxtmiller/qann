@@ -356,6 +356,27 @@ def test_ivf_filter_probe_scaling():
     assert recall(ivf.batch_query(queries, 10, allowed=allowed)[0]) == on
 
 
+def test_hnsw_filter_ef_scaling(tmp_path):
+    rng = np.random.default_rng(6)
+    data = rng.standard_normal((20000, 32), dtype=np.float32)
+    queries = rng.standard_normal((50, 32), dtype=np.float32)
+    hnsw = qann.HNSWIndex(32, M=8, ef_construction=64, seed=1)
+    hnsw.add(data)
+    hnsw.ef_search = 100
+    assert hnsw.filter_ef_scaling is True
+    allowed = np.arange(5, 20000, 5)    # 20%, above the direct-scoring cutoff: a graph search
+    on_ids, _ = hnsw.batch_query(queries, 10, allowed=allowed)
+    assert np.isin(on_ids, allowed).all()
+    # the same graph search as the full beam scaled by sqrt(0.2): round(100 * 0.447) = 45
+    hnsw.filter_ef_scaling = False
+    hnsw.ef_search = 45
+    np.testing.assert_array_equal(hnsw.batch_query(queries, 10, allowed=allowed)[0], on_ids)
+
+    hnsw.filter_ef_scaling = False
+    hnsw.save(str(tmp_path / "h.qann"))
+    assert qann.load(str(tmp_path / "h.qann")).filter_ef_scaling is True  # not saved
+
+
 def test_ids_accept_any_integer_sequence(data):
     index = qann.FlatIndex(32, custom_ids=True)
     index.add(data[:4], ids=[10, 11, 12, 13])
