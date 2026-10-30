@@ -29,7 +29,7 @@ void Index::add(span<const float> vec) {
     add_batch(vec, 1, nullptr);
 }
 
-void Index::add_batch(span<const float> vecs, size_t n, const int64_t* ids, const Metadata& metadata) {
+vector<int64_t> Index::add_batch(span<const float> vecs, size_t n, const int64_t* ids, const Metadata& metadata) {
     assert(vecs.size() == n * dim());
     // validate metadata first and append it only once the vectors are in, so a
     // throw anywhere leaves both unchanged
@@ -42,6 +42,9 @@ void Index::add_batch(span<const float> vecs, size_t n, const int64_t* ids, cons
         add_batch_impl(unit, n, ids);
     }
     metadata_.append(rows, n, metadata);
+    vector<int64_t> added(n);
+    for (size_t i = 0; i < n; ++i) added[i] = id_map().label(static_cast<uint32_t>(rows + i));
+    return added;
 }
 
 void Index::update_metadata(span<const int64_t> ids, const Metadata& metadata) {

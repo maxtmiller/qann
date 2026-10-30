@@ -65,8 +65,9 @@ public:
     // detail::MetadataStore: new columns start with earlier rows null, left-out
     // columns get null). On a bad id or bad metadata nothing is added. With
     // Metric::Cosine, a zero vector throws std::invalid_argument (it has no
-    // direction) and nothing is added.
-    void add_batch(span<const float> vecs, size_t n, const int64_t* ids = nullptr, const Metadata& metadata = {});
+    // direction) and nothing is added. Returns the n vectors' ids, in order:
+    // the given ones, or the auto ids they were assigned.
+    vector<int64_t> add_batch(span<const float> vecs, size_t n, const int64_t* ids = nullptr, const Metadata& metadata = {});
 
     // Up to k nearest live vectors to vec, nearest first. Returns fewer than k
     // only when fewer are reachable (too few live vectors, or for IVF too few

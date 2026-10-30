@@ -237,9 +237,9 @@ static vecengine::Metadata as_metadata(nb::dict metadata, std::size_t n, const c
 }
 
 // Add all rows of a (N x dim) matrix to the index, with one id per row when
-// the index uses custom ids, and optional metadata columns.
-static void index_add(vecengine::Index &self, FloatMatrix data, std::optional<IdsArg> ids,
-                      std::optional<nb::dict> metadata) {
+// the index uses custom ids, and optional metadata columns. Returns the ids.
+static NumpyArray<int64_t> index_add(vecengine::Index &self, FloatMatrix data, std::optional<IdsArg> ids,
+                                     std::optional<nb::dict> metadata) {
     if (data.shape(1) != self.dim())
         throw std::invalid_argument("vector dimension does not match index dimension");
 
@@ -252,10 +252,12 @@ static void index_add(vecengine::Index &self, FloatMatrix data, std::optional<Id
 
     const vecengine::Metadata md = metadata ? as_metadata(*metadata, data.shape(0), "row of data") : vecengine::Metadata{};
     const int64_t* id_ptr = id_array ? id_array->data() : nullptr;
-    write_locked(self, [&] {
+    std::vector<int64_t> added = write_locked(self, [&] {
         refuse_if_wrapped(self, "add");
-        self.add_batch(std::span<const float>(data.data(), data.size()), data.shape(0), id_ptr, md);
+        return self.add_batch(std::span<const float>(data.data(), data.size()), data.shape(0), id_ptr, md);
     });
+    const std::size_t n = added.size();
+    return to_numpy(std::move(added), {n});
 }
 
 // Overwrite metadata columns of the vectors with these ids.
@@ -501,6 +503,19 @@ NB_MODULE(qann, m) {
           "with no price, unlike ~. Combines with qann.field filters through & | ~; raises ValueError "
           "naming the column of a syntax error");
 
+    m.def("any_of", [](std::vector<vecengine::Expr> filters) {
+              if (filters.empty()) throw std::invalid_argument("any_of needs at least one filter");
+              return vecengine::Expr::join(vecengine::Expr::Op::Or, std::move(filters));
+          },
+          nb::arg("filters"),
+          "Matches rows matching any of filters: f1 | f2 | ..., built in one step, so a long chain costs "
+          "O(n) where adding terms one | at a time costs O(n^2)");
+    m.def("all_of", [](std::vector<vecengine::Expr> filters) {
+              if (filters.empty()) throw std::invalid_argument("all_of needs at least one filter");
+              return vecengine::Expr::join(vecengine::Expr::Op::And, std::move(filters));
+          },
+          nb::arg("filters"), "Matches rows matching all of filters: f1 & f2 & ..., built in one step, like any_of");
+
     m.def("get_max_filter_conditions", &vecengine::Expr::max_conditions,
           "The most conditions a SQL where= string may have (default 1024); see set_max_filter_conditions");
     m.def("set_max_filter_conditions", &vecengine::Expr::set_max_conditions, nb::arg("n"),
@@ -519,7 +534,8 @@ NB_MODULE(qann, m) {
              "created with custom_ids=True; otherwise ids continue after the highest id ever assigned. "
              "metadata is {name: n values} (ints, floats or strings) to filter queries on with where=; a new "
              "column is null for earlier vectors, and a column left out of an add is null for its vectors. "
-             "None in a column's values is a null")
+             "None in a column's values is a null. Returns the vectors' ids (int64), the given ones or the "
+             "assigned ones")
         .def("update_metadata", &index_update_metadata, nb::arg("ids"), nb::arg("metadata"),
              "Overwrite metadata in place: metadata is {name: one value per id}, None sets a value to null, and "
              "columns left out keep their values. Unknown, deleted or repeated ids, and columns the index "

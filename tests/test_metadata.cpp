@@ -725,6 +725,38 @@ TEST_CASE("update_metadata and string cleanup on compact work on every index", "
     REQUIRE(base->metadata_schema().empty());
 }
 
+TEST_CASE("add_batch returns the vectors' ids", "[metadata]") {
+    const size_t dim = 4;
+    const auto data = md_random(4, dim, 16);
+    using Ids = std::vector<int64_t>;
+
+    // auto ids continue after the highest ever assigned, not after size()
+    FlatIndex flat(dim);
+    REQUIRE(flat.add_batch(std::span<const float>(data.data(), 3 * dim), 3) == Ids{0, 1, 2});
+    flat.remove(Ids{1, 2});
+    flat.compact();
+    REQUIRE(flat.size() == 1);
+    REQUIRE(flat.add_batch(std::span<const float>(data.data(), dim), 1) == Ids{3});
+    REQUIRE(flat.add_batch(std::span<const float>(), 0).empty());
+
+    // custom ids come back as given
+    FlatIndex custom(dim, 16, true);
+    const Ids given = {42, 7};
+    REQUIRE(custom.add_batch(std::span<const float>(data.data(), 2 * dim), 2, given.data()) == given);
+
+    // a RefineIndex reports its own ids
+    FlatIndex base(dim);
+    RefineIndex refine(base, 2, true);
+    const Ids rids = {500, 600};
+    REQUIRE(refine.add_batch(std::span<const float>(data.data(), 2 * dim), 2, rids.data()) == rids);
+    FlatIndex auto_base(dim);
+    RefineIndex auto_refine(auto_base, 2);
+    auto_refine.add_batch(std::span<const float>(data.data(), 2 * dim), 2);
+    auto_refine.remove(Ids{0});
+    auto_refine.compact();
+    REQUIRE(auto_refine.add_batch(std::span<const float>(data.data(), dim), 1) == Ids{2});
+}
+
 TEST_CASE("add_batch takes null flags", "[metadata]") {
     const size_t dim = 4;
     const auto data = md_random(3, dim, 13);
