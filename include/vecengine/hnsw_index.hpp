@@ -70,6 +70,15 @@ public:
     size_t ef_search() const noexcept { return ef_search_; }
     void set_ef_search(size_t ef);
 
+    // Whether a filtered query narrows its beam as the filter narrows, to
+    // max(k, ef * sqrt(s)) for a fraction s allowed: a filtered beam of ef
+    // finds more of its true neighbors than an unfiltered one, so this keeps
+    // recall near an unfiltered query's at a fraction of the cost. On by
+    // default; off, filtered queries use the full ef (slower, higher recall).
+    // Not saved: a loaded index has it on.
+    bool filter_ef_scaling() const noexcept { return filter_ef_scaling_; }
+    void set_filter_ef_scaling(bool enabled) noexcept { filter_ef_scaling_ = enabled; }
+
     size_t M() const noexcept { return M_; }
     size_t ef_construction() const noexcept { return ef_construction_; }
 
@@ -225,6 +234,7 @@ private:
     size_t M_, M0_;            // neighbors per node on upper levels / level 0
     size_t ef_construction_;
     size_t ef_search_ = 64;
+    bool filter_ef_scaling_ = true;  // set_filter_ef_scaling() setting
     double level_mult_;        // 1 / ln(M)
 
     // Level draws come from splitmix64, whose whole state is this one number,

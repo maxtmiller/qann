@@ -120,14 +120,28 @@ vector<Neighbor> HNSWIndex::query_impl(span<const float> vec, size_t k, const de
     assert(vec.size() == dim_);
     if (max_level_ < 0 || k == 0) return {};
 
+    // A filtered beam of ef keeps only allowed nodes, so it ends up nearer the
+    // true neighbors than an unfiltered one: on SIFT1M at ef 64, recall 0.998
+    // with 10% allowed against 0.953 unfiltered, at 6x the cost. Scaling the
+    // beam by sqrt(s) for a fraction s allowed brings recall back to about the
+    // unfiltered level (SIFT1M 0.964-0.972 for 4-50% allowed, GloVe-100 within
+    // 0.01 of unfiltered) at 1.3-4x less time; s^0.7 fell below it.
+    size_t ef = std::max(ef_search_, k);
+    const bool scaled = filter && filter_ef_scaling_ && slots() > 0;
+    if (scaled) ef = std::max(k, static_cast<size_t>(std::lround(double(ef) * std::sqrt(double(filter->count) / double(slots())))));
+
     // With a fraction s of the vectors allowed, the beam passes about 1/s nodes
     // per result it keeps, so a search costs about D / s distances (D: the
     // unfiltered cost, ~ef * M), while scoring the allowed vectors directly
     // costs s * slots. The two meet at count^2 = D * slots; below that, score
-    // the allowed vectors directly, which is also exact. On SIFT1M (ef 64,
-    // M 16) the measured crossover was 3-5% allowed; this rule puts it at 3.2%.
-    const size_t ef = std::max(ef_search_, k);
-    if (filter && double(filter->count) * double(filter->count) <= double(ef) * double(M_) * double(slots())) {
+    // the allowed vectors directly, which is also exact. Unscaled, the measured
+    // crossover on SIFT1M (ef 64, M 16) was 3-5% and the rule puts it at 3.2%.
+    // With the beam scaled as above, a filtered search costs about twice this
+    // model at small s (the beam can't shrink below k), so the cutoff doubles
+    // D: the measured crossovers were ~1.8% at ef 32, ~2% at ef 64 and ~2.5% at
+    // ef 128, where count^2 <= 2 * D * slots puts them at 1.8%, 1.8% and 2.5%.
+    const double graph_cost = (scaled ? 2.0 : 1.0) * double(ef) * double(M_);
+    if (filter && double(filter->count) * double(filter->count) <= graph_cost * double(slots())) {
         detail::TopK top(k);
         filter->for_each([&](uint32_t slot) {
             const float dist = distance(vec.data(), slot);
