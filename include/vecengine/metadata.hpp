@@ -219,6 +219,7 @@ private:
             size_t count = 0;
         };
         vector<CodeRows> rows_of;  // String: one per dict entry
+        size_t balanced_rows = 0;  // String: rows() when every code was last rebalanced
 
         size_t rows() const noexcept { return valid.size(); }
 
@@ -232,12 +233,16 @@ private:
         void reindex();
 
         // Removes each valid row in `rows` from rows_of under its code before
-        // an overwrite; old_codes[i] is rows[i]'s code. Leaves counts to rebalance().
+        // an overwrite; old_codes[i] is rows[i]'s code. Leaves the switch to rebalance().
         void unindex(const vector<uint32_t>& rows, const vector<uint32_t>& old_codes);
 
-        // Switches each code to a bitmap when it holds at least 1/32 of the
-        // rows and back to a list below 1/64, so rows_of stays near 4 bytes a row.
-        void rebalance();
+        // balance() on the touched codes, or on every code once rows() has
+        // grown by a quarter since the last time (also the first time).
+        void rebalance(const vector<uint32_t>& touched);
+
+        // Switches r to a bitmap when it holds at least 1/32 of the rows (and
+        // 64 rows), and back to a list below 1/64.
+        void balance(CodeRows& r) const;
     };
 
     // The column with this name, or nullptr.

@@ -906,6 +906,45 @@ TEST_CASE("Metadata filters at 100k rows match a reference evaluation", "[metada
     }
 }
 
+TEST_CASE("String filters through per-string rows skip removed vectors, before and after compaction", "[metadata]") {
+    // tag: 40% "common" (a bitmap), the rest spread over 1000 rare strings (lists)
+    const size_t n = 20000, dim = 4, nq = 4, k = 50;
+    const auto data = md_random(n + 500, dim, 31);
+    const auto queries = md_random(nq, dim, 32);
+    std::mt19937 rng(33);
+    std::vector<std::string> tag(n + 500);
+    for (auto& t : tag) t = rng() % 10 < 4 ? "common" : "r" + std::to_string(rng() % 1000);
+
+    FlatIndex flat(dim);
+    flat.add_batch(std::span<const float>(data.data(), n * dim), n, nullptr,
+                   {{"tag", std::vector<std::string>(tag.begin(), tag.begin() + n)}});
+    std::vector<uint8_t> removed(n + 500, 0);
+    std::vector<int64_t> drop;
+    for (size_t i = 0; i < n; ++i)
+        if (rng() % 10 == 0 || tag[i] == "r5") drop.push_back(static_cast<int64_t>(i));
+    for (int64_t id : drop) removed[id] = 1;
+    flat.remove(drop);
+
+    auto check = [&](size_t rows) {
+        const std::vector<std::pair<Expr, std::set<std::string>>> cases = {
+            {f("tag", Op::Eq, std::string("common")), {"common"}},
+            {Expr::isin("tag", {std::string("r1"), std::string("r2")}), {"r1", "r2"}},
+            {f("tag", Op::Eq, std::string("r5")), {"r5"}},
+        };
+        for (size_t c = 0; c < cases.size(); ++c) {
+            CAPTURE(c, rows);
+            const auto ids = ids_where(rows, [&](size_t i) { return !removed[i] && cases[c].second.count(tag[i]); });
+            md_require_identical(flat.query_batch(queries, nq, k, cases[c].first), flat.query_batch(queries, nq, k, ids));
+        }
+    };
+    check(n);
+    flat.compact();
+    check(n);
+    flat.add_batch(std::span<const float>(data.data() + n * dim, 500 * dim), 500, nullptr,
+                   {{"tag", std::vector<std::string>(tag.begin() + n, tag.end())}});
+    check(n + 500);
+}
+
 TEST_CASE("Expr::parse builds the same tree as the operator form", "[metadata][parse]") {
     auto same = [](const std::string& sql, const Expr& e) {
         INFO(sql);
