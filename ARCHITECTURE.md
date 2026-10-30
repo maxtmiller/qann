@@ -593,7 +593,7 @@ pip install .               # builds the Python module into a wheel (no C++ test
 - Link-time optimization was tried and left off: no query speedup, and k-means training got ~35% slower.
 - `CMAKE_EXPORT_COMPILE_COMMANDS=ON` writes `build/compile_commands.json` for clangd.
 - Targets: `vecengine_core` (static lib), `test_vecengine`, `bench_vecengine`, `vecengine_py` (Python module), `qann_stub` (`qann.pyi`).
-- CI (`.github/workflows/ci.yml`, on pushes to `main` and on PRs): builds and runs `ctest` on `ubuntu-24.04` (with OpenBLAS) and `macos-14`, then runs the siftsmall recall gate on macOS only, since the baseline was recorded with Accelerate. siftsmall is cached between runs.
+- CI (`.github/workflows/ci.yml`, on pushes to `main` and on PRs): builds and runs `ctest` on `ubuntu-24.04` (with OpenBLAS) and `macos-15`, then runs the siftsmall recall gate on macOS only, since the baseline was recorded with Accelerate. siftsmall is cached between runs.
 
 ---
 
