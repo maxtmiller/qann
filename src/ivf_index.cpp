@@ -183,15 +183,15 @@ vector<Neighbor> IVFIndex::query_impl(span<const float> vec, size_t k, const det
 }
 
 bool IVFIndex::use_direct(size_t k, const detail::SlotFilter* filter) const {
-    // A filtered query stops probing once it has k allowed vectors, so under a
-    // narrow filter it misses most of the true top k (SIFT1M, nlist 1000,
-    // nprobe 16: recall 0.5 at 0.1% allowed). Scoring every allowed vector is
-    // exact for plain IVF; measured on SIFT1M it was faster below about 0.8 *
-    // nlist allowed and 0.88x (plain) / 0.65x (SQ8) at nlist, so this switches
-    // at nlist, trading a little speed at the edge for full recall. PQ isn't
-    // switched: each allowed vector needs its own list's table there, which
-    // made it 2-50x slower; a RefineIndex over PQ makes this switch instead.
-    return filter && k > 0 && !pq_enabled() && filter->count <= nlist_;
+    // Scoring every allowed vector is exact for plain IVF, and while few are
+    // allowed it is faster than probing enough lists to find them: on SIFT1M
+    // (nlist 1000, nprobe 16) it ran at 98k QPS against 44k for the scaled
+    // probing in scan() at 2,000 allowed, 33k against 49k at 5,000, a
+    // crossover near 4,000; SQ's direct scoring is somewhat slower, so this
+    // switches at 3 * nlist. PQ isn't switched: each allowed vector needs its
+    // own list's table there, which made it 2-50x slower; a RefineIndex over PQ
+    // makes this switch instead.
+    return filter && k > 0 && !pq_enabled() && filter->count <= 3 * nlist_;
 }
 
 void IVFIndex::rebuild_slot_lookup() {
@@ -439,10 +439,22 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
     // a filtered query keeps probing past nprobe lists until it has this many results
     const size_t wanted = filter ? std::min(k, filter->count) : 0;
 
+    // With a fraction s of vectors allowed, the filtered top k sit about as deep
+    // as the unfiltered top k / s, so nprobe lists hold fewer of them. Probing
+    // 0.75 * nprobe * s^(-1/3) lists kept recall@10 at 0.92-0.96 from 0.2% to
+    // 20% allowed on SIFT1M (nprobe 16: unfiltered 0.93), where stopping at
+    // the first k allowed vectors gave 0.60-0.88. nprobe / s overshot: recall
+    // 1.0 at many times the cost.
+    size_t min_probes = nprobe_;
+    if (filter && filter_probe_scaling_ && filter->count > 0) {
+        const double want = std::ceil(0.75 * double(nprobe_) * std::cbrt(double(id_map_.live()) / double(filter->count)));
+        min_probes = std::clamp<size_t>(static_cast<size_t>(std::min(want, double(nlist_))), nprobe_, nlist_);
+    }
+
     // find top-k vectors from the inverted lists associated with the nprobe closest coarse centroids
     for (size_t p = 0; p < probes.size(); ++p) {
         if (p >= nprobe_) {
-            if (top.size() >= wanted) break;
+            if (p >= min_probes && top.size() >= wanted) break;
             if (p == nprobe_) std::sort(probes.begin() + p, probes.end());
         }
         const Probe& probe = probes[p];

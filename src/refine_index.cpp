@@ -52,16 +52,15 @@ size_t RefineIndex::candidates(size_t k, const detail::SlotFilter* filter) const
 }
 
 bool RefineIndex::use_direct(const detail::SlotFilter* filter) const {
-    // An IVF base stops probing once it has found enough allowed candidates,
-    // so under a narrow filter it misses allowed vectors in lists it never
-    // reached (SIFT1M, nprobe 16: recall 0.75 at 0.1% allowed). Scoring every
-    // allowed vector from the raw copies here is exact, and while few are
-    // allowed it is also faster: on SIFT1M fast-scan (nlist 1000) the two
-    // crossed at about 2,300 allowed vectors, so this switches below 2 * nlist.
+    // Scoring every allowed vector from the raw copies here is exact, and while
+    // few are allowed it is faster than the IVF base's filtered probing: on
+    // SIFT1M fast-scan + re-rank 4 (nlist 1000, nprobe 16) it ran at 110k QPS
+    // against 36k at 2,000 allowed, 49k against 37k at 5,000 and 23k against
+    // 36k at 10,000, a crossover near 6,400, so this switches at 6 * nlist.
     // HNSW bases make the same switch themselves.
     if (!filter) return false;
     const auto* ivf = dynamic_cast<const IVFIndex*>(&base_);
-    return ivf && filter->count <= 2 * ivf->nlist();
+    return ivf && filter->count <= 6 * ivf->nlist();
 }
 
 vector<Neighbor> RefineIndex::direct_scan(span<const float> vec, size_t k, const detail::SlotFilter& filter) const {
