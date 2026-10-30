@@ -210,7 +210,34 @@ private:
         vector<std::string> dict; // String: distinct values, in first-seen order
         std::unordered_map<std::string, uint32_t> code_of;  // String: dict lookup
 
+        // String: the rows holding one code, so a filter on a few strings
+        // costs about their rows instead of a pass over the column (#72).
+        // Null rows are in none. Kept in memory only; load() rebuilds it.
+        struct CodeRows {
+            vector<uint32_t> rows;  // the rows in no order, while the code is rare
+            vector<uint64_t> bits;  // a bit per row once it is common (rows is then empty); may end before the last row
+            size_t count = 0;
+        };
+        vector<CodeRows> rows_of;  // String: one per dict entry
+
         size_t rows() const noexcept { return valid.size(); }
+
+        // Adds rows [first, rows()) to rows_of, then rebalances. String columns only.
+        void index_rows(size_t first);
+
+        // Adds row s under its code, if it isn't null; rows_of must cover dict.
+        void index_row(size_t s);
+
+        // Rebuilds rows_of from scratch, for after codes are renumbered or rows move.
+        void reindex();
+
+        // Removes each valid row in `rows` from rows_of under its code before
+        // an overwrite; old_codes[i] is rows[i]'s code. Leaves counts to rebalance().
+        void unindex(const vector<uint32_t>& rows, const vector<uint32_t>& old_codes);
+
+        // Switches each code to a bitmap when it holds at least 1/32 of the
+        // rows and back to a list below 1/64, so rows_of stays near 4 bytes a row.
+        void rebalance();
     };
 
     // The column with this name, or nullptr.

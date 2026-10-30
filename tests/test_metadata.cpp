@@ -9,11 +9,13 @@
 #include "vecengine/refine_index.hpp"
 #include "serialize.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <random>
 #include <set>
@@ -145,6 +147,96 @@ TEST_CASE("MetadataStore: compact frees strings only removed rows used", "[metad
     loaded.append(3, 2, {{"tag", std::vector<std::string>{"lost", "kept"}}});
     REQUIRE(bits_to_ids(loaded.evaluate(tag("lost"), 5), 5) == std::vector<int64_t>{3});
     REQUIRE(bits_to_ids(loaded.evaluate(tag("kept"), 5), 5) == std::vector<int64_t>{0, 1, 4});
+}
+
+TEST_CASE("MetadataStore: string filters stay exact through adds, updates, compaction and load (fuzz)", "[metadata]") {
+    // A few common strings and many rare ones, so filters take both the row
+    // pass and the per-string rows, and strings move between lists and bitmaps.
+    std::mt19937 rng(21);
+    auto draw = [&]() -> std::optional<std::string> {
+        const unsigned r = rng() % 100;
+        if (r < 5) return std::nullopt;
+        if (r < 45) return std::string("s0");
+        if (r < 60) return std::string("s1");
+        if (r < 68) return std::string("s2");
+        return "s" + std::to_string(3 + rng() % 400);
+    };
+    auto column = [](const std::vector<std::optional<std::string>>& v) {
+        std::vector<std::string> values(v.size());
+        std::vector<uint8_t> valid(v.size());
+        for (size_t i = 0; i < v.size(); ++i) {
+            valid[i] = v[i].has_value();
+            if (v[i]) values[i] = *v[i];
+        }
+        return Metadata{{"tag", values, valid}};
+    };
+
+    MetadataStore store;
+    std::vector<std::optional<std::string>> ref;
+    auto check = [&](int step) {
+        CAPTURE(step, ref.size());
+        const std::vector<std::string> probes = {"s0", "s1", "s2", "s" + std::to_string(3 + rng() % 400),
+                                                 "s" + std::to_string(3 + rng() % 400), "zz"};
+        const std::string& a = probes[rng() % probes.size()];
+        const std::string& b = probes[rng() % probes.size()];
+        struct Case {
+            Expr where;
+            std::function<bool(const std::optional<std::string>&)> match;
+        };
+        const std::vector<Case> cases = {
+            {f("tag", Op::Eq, a), [&](const auto& v) { return v && *v == a; }},
+            {f("tag", Op::Ne, a), [&](const auto& v) { return v && *v != a; }},
+            {f("tag", Op::Lt, b), [&](const auto& v) { return v && *v < b; }},
+            {Expr::isin("tag", {a, b, std::string("zz")}), [&](const auto& v) { return v && (*v == a || *v == b); }},
+            {Expr::is_null("tag"), [&](const auto& v) { return !v; }},
+        };
+        for (size_t c = 0; c < cases.size(); ++c) {
+            CAPTURE(c, a, b);
+            REQUIRE(bits_to_ids(store.evaluate(cases[c].where, ref.size()), ref.size()) ==
+                    ids_where(ref.size(), [&](size_t i) { return cases[c].match(ref[i]); }));
+        }
+    };
+
+    for (int step = 0; step < 120; ++step) {
+        const unsigned op = ref.empty() ? 0 : rng() % 6;
+        if (op <= 1) {  // add a batch, sometimes leaving the column out (all null)
+            const size_t n = 1 + rng() % (rng() % 4 == 0 ? 4000 : 300);
+            std::vector<std::optional<std::string>> batch(n);
+            const bool left_out = !ref.empty() && rng() % 8 == 0;
+            for (auto& v : batch) v = left_out ? std::nullopt : draw();
+            store.append(ref.size(), n, left_out ? Metadata{} : column(batch));
+            ref.insert(ref.end(), batch.begin(), batch.end());
+        } else if (op == 2) {  // overwrite distinct rows, sometimes all to one string
+            std::vector<uint32_t> slots(ref.size());
+            std::iota(slots.begin(), slots.end(), 0u);
+            std::shuffle(slots.begin(), slots.end(), rng);
+            slots.resize(1 + rng() % std::min<size_t>(ref.size(), 2000));
+            const auto same = draw();
+            std::vector<std::optional<std::string>> batch(slots.size());
+            for (auto& v : batch) v = rng() % 2 ? same : draw();
+            store.update(slots, column(batch));
+            for (size_t i = 0; i < slots.size(); ++i) ref[slots[i]] = batch[i];
+        } else if (op == 3) {  // drop about a tenth of the rows
+            std::vector<uint32_t> remap(ref.size());
+            std::vector<std::optional<std::string>> kept;
+            for (size_t i = 0; i < ref.size(); ++i) {
+                if (rng() % 10 == 0) remap[i] = IdMap::kRemoved;
+                else {
+                    remap[i] = static_cast<uint32_t>(kept.size());
+                    kept.push_back(ref[i]);
+                }
+            }
+            store.compact(remap);
+            ref = std::move(kept);
+        } else if (op == 4) {
+            store.drop_unused_strings();
+        } else {
+            std::stringstream file;
+            store.save(file);
+            store = MetadataStore::load(file, ref.size());
+        }
+        check(step);
+    }
 }
 
 TEST_CASE("MetadataStore: every operator matches a hand-computed mask", "[metadata]") {
