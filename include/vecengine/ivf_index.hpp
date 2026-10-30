@@ -65,6 +65,7 @@ public:
     // Clusters scanned per query. set_nprobe throws std::invalid_argument
     // unless 1 <= nprobe <= nlist; it can change at any time.
     size_t nprobe() const noexcept { return nprobe_; }
+    size_t nlist() const noexcept { return nlist_; }
     void set_nprobe(size_t nprobe);
 
     // How PQ codes are scored: ADC (default, more accurate) or SDC. Has no

@@ -5,6 +5,7 @@
 #include "vecengine/hnsw_index.hpp"
 #include "parallel.hpp"
 #include "profile.hpp"
+#include "topk.hpp"
 #include "serialize.hpp"
 
 #include <cstddef>
@@ -50,9 +51,36 @@ size_t RefineIndex::candidates(size_t k, const detail::SlotFilter* filter) const
     return std::min(k * k_factor_, filter ? filter->count : id_map_.live());
 }
 
+bool RefineIndex::use_direct(const detail::SlotFilter* filter) const {
+    // An IVF base stops probing once it has found enough allowed candidates,
+    // so under a narrow filter it misses allowed vectors in lists it never
+    // reached (SIFT1M, nprobe 16: recall 0.75 at 0.1% allowed). Scoring every
+    // allowed vector from the raw copies here is exact, and while few are
+    // allowed it is also faster: on SIFT1M fast-scan (nlist 1000) the two
+    // crossed at about 2,300 allowed vectors, so this switches below 2 * nlist.
+    // HNSW bases make the same switch themselves.
+    if (!filter) return false;
+    const auto* ivf = dynamic_cast<const IVFIndex*>(&base_);
+    return ivf && filter->count <= 2 * ivf->nlist();
+}
+
+vector<Neighbor> RefineIndex::direct_scan(span<const float> vec, size_t k, const detail::SlotFilter& filter) const {
+    VECENGINE_PROF_START(t_rerank);
+    detail::TopK top(k);
+    const size_t d = dim();
+    filter.for_each([&](uint32_t slot) {
+        const float dist = exact_score(vec.data(), data_.data() + size_t{slot} * d, d);
+        if (dist < top.threshold()) top.push(dist, id_map_.label(slot));
+    });
+    vector<Neighbor> results = top.take_sorted();
+    VECENGINE_PROF_STOP(t_rerank, kProfRerank);
+    return results;
+}
+
 vector<Neighbor> RefineIndex::query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const {
     assert(vec.size() == dim());
-    if (id_map_.live() == 0) return {};
+    if (id_map_.live() == 0 || k == 0) return {};
+    if (use_direct(filter)) return direct_scan(vec, k, *filter);
 
     return rerank(vec, base_.query_impl(vec, candidates(k, filter), filter), k);
 }
@@ -60,7 +88,14 @@ vector<Neighbor> RefineIndex::query_impl(span<const float> vec, size_t k, const 
 vector<vector<Neighbor>> RefineIndex::query_batch_impl(span<const float> queries, size_t num_queries, size_t k,
                                                        const detail::SlotFilter* filter) const {
     assert(queries.size() == num_queries * dim());
-    if (id_map_.live() == 0) return vector<vector<Neighbor>>(num_queries);
+    if (id_map_.live() == 0 || k == 0) return vector<vector<Neighbor>>(num_queries);
+    if (use_direct(filter)) {
+        vector<vector<Neighbor>> results(num_queries);
+        detail::parallel_for(num_queries, [&](size_t i) {
+            results[i] = direct_scan({queries.data() + i * dim(), dim()}, k, *filter);
+        });
+        return results;
+    }
 
     auto fetched = base_.query_batch_impl(queries, num_queries, candidates(k, filter), filter);
     vector<vector<Neighbor>> results(num_queries);

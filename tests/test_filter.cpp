@@ -266,6 +266,56 @@ TEST_CASE("Filtered IVF probes past nprobe until it has k allowed vectors", "[fi
     REQUIRE(filter_recall(got, filtered_truth(data, dim, queries, nq, k, allowed)) >= unfiltered);
 }
 
+TEST_CASE("RefineIndex over IVF scores a narrow filter's vectors directly, exactly", "[filter][ivf]") {
+    const size_t n = 10000, dim = 16, nq = 30, k = 10;
+    const auto data = filter_random(n, dim, 7);
+    const auto queries = filter_random(nq, dim, 8);
+
+    // nlist 100, nprobe 1: the base path would miss most allowed vectors
+    IVFIndex pq(dim, 100, 1);
+    pq.enable_pq(8, 16, true);
+    pq.train(data, n, 25, 1);
+    std::vector<int64_t> ids(n);
+    for (size_t i = 0; i < n; ++i) ids[i] = static_cast<int64_t>(1000 + 3 * i);
+    RefineIndex refine(pq, 4, true);
+    refine.add_batch(data, n, ids.data());
+
+    // 100 allowed (rows 5, 105, ...), under the 2 * nlist cutoff; two of them deleted
+    std::vector<int64_t> rows = every(n, 100, 5), allowed;
+    for (int64_t r : rows) allowed.push_back(ids[r]);
+    refine.remove(std::vector<int64_t>{ids[rows[0]], ids[rows[1]]});
+    const std::vector<int64_t> live_rows(rows.begin() + 2, rows.end());
+
+    auto truth = filtered_truth(data, dim, queries, nq, k, live_rows);
+    for (auto& row : truth)
+        for (auto& nb : row) nb.index = static_cast<size_t>(ids[nb.index]);
+    const auto batch = refine.query_batch(queries, nq, k, allowed);
+    REQUIRE(batch.size() == nq);
+    for (size_t q = 0; q < nq; ++q) {
+        const auto one = refine.query(std::span<const float>(queries.data() + q * dim, dim), k, allowed);
+        REQUIRE(batch[q].size() == k);
+        REQUIRE(one.size() == k);
+        for (size_t i = 0; i < k; ++i) {
+            REQUIRE(batch[q][i].index == truth[q][i].index);
+            REQUIRE(batch[q][i].distance == truth[q][i].distance);
+            REQUIRE(one[i].index == truth[q][i].index);
+            REQUIRE(one[i].distance == truth[q][i].distance);
+        }
+    }
+
+    // fewer allowed than k: every one comes back
+    const std::vector<int64_t> three = {ids[7], ids[8], ids[9]};
+    const auto few = refine.query(std::span<const float>(queries.data(), dim), k, three);
+    REQUIRE(few.size() == 3);
+
+    // 500 allowed, above the cutoff: the base path, still only allowed vectors
+    std::vector<int64_t> wide;
+    for (int64_t r : every(n, 20, 3)) wide.push_back(ids[r]);
+    const auto got = refine.query_batch(queries, nq, k, wide);
+    require_only_allowed(got, wide);
+    for (const auto& row : got) REQUIRE(row.size() == k);
+}
+
 TEST_CASE("Filtered cosine search reports cosine distances", "[filter][metric]") {
     const size_t n = 2000, dim = 8, k = 5;
     const auto data = filter_random(n, dim, 7);
