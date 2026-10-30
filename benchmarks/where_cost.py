@@ -8,8 +8,8 @@ Gives every vector synthetic metadata (category: 10 strings, brand: 1000
 strings, price: float in [0, 100), year: int 2000-2024), then for each filter
 times, per single query on one thread:
   parse   qann.where(sql)
-  eval    the filter's evaluation over every slot: query(where=f AND never = 1)
-          minus query(where=never = 1), where never is 0 on every vector.
+  eval    the filter's evaluation over every slot: query(where=f & ~~(never = 1))
+          minus query(where=~~(never = 1)), where never is 0 on every vector.
           Nothing matches either, so the search is skipped and only
           evaluation is left
   search  query(where=f) per index, with the filter already parsed
@@ -45,7 +45,10 @@ FILTERS = [
     "category = 'c3' AND price < 50 AND year >= 2015",
     "(category = 'c3' OR brand = 'b17') AND NOT (price >= 90)",
 ]
-NOTHING = "never = 1"  # a column of its own, so And never merges it with a filter's comparisons
+# matches no vector. On a column of its own, so And never merges it with a
+# filter's comparisons, and wrapped in ~~ so And treats it as a nested part,
+# which runs last and in full: the filter itself is evaluated as usual first
+NOTHING = ~~qann.where("never = 1")
 
 
 def metadata(n, rng):
@@ -108,11 +111,12 @@ def main():
     qann.set_num_threads(1)
 
     probe = next(iter(indexes.values()))
-    nothing = qann.where(NOTHING)
+    nothing = NOTHING
     configs = {"unfiltered": {name: (lambda q, i=index: i.query(q, K)) for name, index in indexes.items()}}
     configs["nothing"] = {"eval": lambda q: probe.query(q, K, where=nothing)}
     for sql in FILTERS:
-        expr, empty = qann.where(sql), qann.where(f"({sql}) AND {NOTHING}")
+        expr = qann.where(sql)
+        empty = expr & NOTHING
         configs[sql] = {"parse": lambda q, s=sql: qann.where(s),
                         "eval": lambda q, e=empty: probe.query(q, K, where=e)}
         for name, index in indexes.items():

@@ -461,6 +461,10 @@ constexpr size_t kScatterCost = 4;
 // 0.63 ns a row against 0.38 ns per scanned row on 1M rows.
 constexpr size_t kSortedScatterCost = 2;
 
+// The same for testing one row picked from a set of bits (MetadataStore::narrow):
+// its values are read out of order, so each costs more than a scanned row.
+constexpr size_t kTestCost = 8;
+
 // Sets bit i of words where row(i) holds, for i in [0, slots). Each word is
 // built in a register without branches: filters often match about half the
 // rows at random, where a branch would mispredict on most of them.
@@ -800,32 +804,58 @@ const MetadataStore::Column* MetadataStore::find(const std::string& name) const 
 vector<uint64_t> MetadataStore::evaluate(const Expr& where, size_t slots) const {
     switch (where.op()) {
         case Expr::Op::And: {
-            // comparisons on one numeric column are one run of its sorted rows
-            // together, as in a BETWEEN, though each alone may match too many
-            vector<uint64_t> a;
-            bool started = false;
-            auto combine = [&](vector<uint64_t> b) {
-                if (!started) a = std::move(b);
-                else
-                    for (size_t w = 0; w < a.size(); ++w) a[w] &= b[w];
-                started = true;
+            // Parts: each child, except that comparisons on one numeric column
+            // form one part, a single run of its sorted rows (as in a BETWEEN,
+            // though each alone may match too many). The part estimated to
+            // match fewest rows runs first; each later leaf part then tests only
+            // the rows still set, when that is cheaper than its own evaluation.
+            struct Part {
+                const Column* col;          // leaf parts
+                vector<const Expr*> leaves;
+                const Expr* other;          // And / Or / Not children
+                Estimate est;
             };
-            vector<std::pair<const Column*, vector<const Expr*>>> ranges;  // in first-seen order
+            vector<Part> parts;
             for (const Expr& child : where.children()) {
-                const Column* col = is_comparison(child.op()) && child.op() != Expr::Op::Ne ? find(child.field()) : nullptr;
-                if (!col || col->type == ColumnType::String) {
-                    combine(evaluate(child, slots));
+                const Expr::Op op = child.op();
+                if (op == Expr::Op::And || op == Expr::Op::Or || op == Expr::Op::Not) {
+                    parts.push_back({nullptr, {}, &child, {slots, slots}});
                     continue;
                 }
-                auto it = std::find_if(ranges.begin(), ranges.end(), [&](const auto& r) { return r.first == col; });
-                if (it == ranges.end()) ranges.push_back({col, {&child}});
-                else it->second.push_back(&child);
+                const Column* col = find(child.field());
+                if (!col) throw std::invalid_argument("unknown metadata field '" + child.field() + "'");
+                const bool range = is_comparison(op) && op != Expr::Op::Ne && col->type != ColumnType::String;
+                auto it = !range ? parts.end() : std::find_if(parts.begin(), parts.end(), [&](const Part& p) {
+                    return p.col == col && is_comparison(p.leaves[0]->op()) && p.leaves[0]->op() != Expr::Op::Ne;
+                });
+                if (it == parts.end()) parts.push_back({col, {&child}, nullptr, {}});
+                else it->leaves.push_back(&child);
             }
-            for (const auto& [col, leaves] : ranges) {
+            for (Part& p : parts)
+                if (p.col) p.est = estimate(*p.col, p.leaves, slots);
+            std::stable_sort(parts.begin(), parts.end(), [](const Part& x, const Part& y) { return x.est.matches < y.est.matches; });
+
+            auto run = [&](const Part& p) {
+                if (p.other) return evaluate(*p.other, slots);
                 vector<uint64_t> words((slots + 63) / 64, 0);
-                if (leaves.size() > 1 && sorted_leaves(*col, leaves, words, slots)) combine(std::move(words));
-                else
-                    for (const Expr* leaf : leaves) combine(evaluate(*leaf, slots));
+                if (p.leaves.size() > 1 && sorted_leaves(*p.col, p.leaves, words, slots)) return words;
+                words = evaluate_leaf(*p.leaves[0], slots);
+                for (size_t l = 1; l < p.leaves.size(); ++l) {
+                    const vector<uint64_t> b = evaluate_leaf(*p.leaves[l], slots);
+                    for (size_t w = 0; w < words.size(); ++w) words[w] &= b[w];
+                }
+                return words;
+            };
+            vector<uint64_t> a = run(parts[0]);
+            for (size_t i = 1; i < parts.size(); ++i) {
+                size_t left = 0;
+                for (uint64_t w : a) left += static_cast<size_t>(std::popcount(w));
+                if (!parts[i].other && left * kTestCost < parts[i].est.cost) {
+                    for (const Expr* leaf : parts[i].leaves) narrow(*leaf, a);
+                    continue;
+                }
+                const vector<uint64_t> b = run(parts[i]);
+                for (size_t w = 0; w < a.size(); ++w) a[w] &= b[w];
             }
             return a;
         }
@@ -849,7 +879,7 @@ vector<uint64_t> MetadataStore::evaluate(const Expr& where, size_t slots) const 
 }
 
 bool MetadataStore::sorted_leaves(const Column& col, const vector<const Expr*>& leaves, vector<uint64_t>& words,
-                                  size_t slots) {
+                                  size_t slots, Estimate* estimate) {
     // each value compares exactly (an int column against an int) or in double, as in the pass
     const bool ints = col.type == ColumnType::Int64;
     struct Bound {
@@ -864,7 +894,10 @@ bool MetadataStore::sorted_leaves(const Column& col, const vector<const Expr*>& 
     vector<Cond> conds;
     for (const Expr* leaf : leaves) {
         Cond c{leaf->op() == Expr::Op::In ? Expr::Op::Eq : leaf->op(), {}};
-        if (c.op == Expr::Op::Ne) return false;  // matches nearly every row (and NaN rows), so it scans
+        if (c.op == Expr::Op::Ne) {  // matches nearly every row (and NaN rows), so it scans
+            if (estimate) *estimate = {slots, slots};
+            return false;
+        }
         for (const auto& v : leaf->values()) {
             const auto* i = std::get_if<int64_t>(&v);
             if (ints && i) c.bounds.push_back({true, *i, 0.0});
@@ -916,7 +949,15 @@ bool MetadataStore::sorted_leaves(const Column& col, const vector<const Expr*>& 
         runs = std::move(both);
     }
     size_t cost = col.rows() - col.sorted_rows + col.stale.size() * kScatterCost;
-    for (const Run& r : runs) cost += (r.second - r.first) * kSortedScatterCost;
+    size_t matches = col.rows() - col.sorted_rows + col.stale.size();  // at most, among the unsorted rows
+    for (const Run& r : runs) {
+        cost += (r.second - r.first) * kSortedScatterCost;
+        matches += r.second - r.first;
+    }
+    if (estimate) {
+        *estimate = {matches, std::min(cost, slots)};
+        return false;
+    }
     if (cost >= slots) return false;
 
     auto set = [&](size_t s) { words[s / 64] |= uint64_t{1} << (s % 64); };
@@ -939,6 +980,114 @@ bool MetadataStore::sorted_leaves(const Column& col, const vector<const Expr*>& 
     return true;
 }
 
+vector<uint8_t> MetadataStore::string_match(const Column& col, const Expr& leaf) {
+    // decide each distinct string once, so rows can be looked up by code
+    vector<uint8_t> match(col.dict.size(), 0);
+    if (leaf.op() == Expr::Op::In || leaf.op() == Expr::Op::Eq) {
+        for (const auto& v : leaf.values()) {
+            auto it = col.code_of.find(as_string(v, leaf.field()));
+            if (it != col.code_of.end()) match[it->second] = 1;
+        }
+    } else {
+        const std::string& value = as_string(leaf.values()[0], leaf.field());
+        for (size_t c = 0; c < col.dict.size(); ++c) match[c] = compare(leaf.op(), col.dict[c], value);
+    }
+    return match;
+}
+
+MetadataStore::Estimate MetadataStore::estimate(const Column& col, const vector<const Expr*>& leaves, size_t slots) const {
+    const Expr& leaf = *leaves[0];
+    if (leaf.op() == Expr::Op::IsNull) return {slots, slots};
+    if (col.type == ColumnType::String) {
+        const vector<uint8_t> match = string_match(col, leaf);
+        size_t matches = 0, cost = 0;
+        for (size_t c = 0; c < col.dict.size(); ++c) {
+            if (!match[c]) continue;
+            const Column::CodeRows& r = col.rows_of[c];
+            matches += r.count;
+            cost += r.bits.empty() ? r.count * kScatterCost : r.bits.size();
+        }
+        return {matches, std::min(cost, slots)};
+    }
+    Estimate est;
+    vector<uint64_t> unused;
+    sorted_leaves(col, leaves, unused, slots, &est);
+    return est;
+}
+
+namespace {
+
+// Clears each set bit of words whose row fails test(row).
+template <class Test>
+void keep_if(vector<uint64_t>& words, Test&& test) {
+    for (size_t w = 0; w < words.size(); ++w) {
+        uint64_t kept = words[w];
+        for (uint64_t b = words[w]; b; b &= b - 1) {
+            const int bit = std::countr_zero(b);
+            if (!test(w * 64 + bit)) kept &= ~(uint64_t{1} << bit);
+        }
+        words[w] = kept;
+    }
+}
+
+// keep_if for valid rows whose V(x[row]) <op> value, with op chosen outside the loop.
+template <class V, class T>
+void keep_compared(vector<uint64_t>& words, const vector<uint8_t>& valid, const T* x, Expr::Op op, V value) {
+    auto run = [&](auto pred) { keep_if(words, [&](size_t s) { return valid[s] && pred(static_cast<V>(x[s])); }); };
+    switch (op) {
+        case Expr::Op::Eq: run([&](V a) { return a == value; }); break;
+        case Expr::Op::Ne: run([&](V a) { return a != value; }); break;
+        case Expr::Op::Lt: run([&](V a) { return a < value; }); break;
+        case Expr::Op::Le: run([&](V a) { return a <= value; }); break;
+        case Expr::Op::Gt: run([&](V a) { return a > value; }); break;
+        case Expr::Op::Ge: run([&](V a) { return a >= value; }); break;
+        default: break;
+    }
+}
+
+} // namespace
+
+void MetadataStore::narrow(const Expr& leaf, vector<uint64_t>& words) const {
+    const Column* col = find(leaf.field());
+    if (!col) throw std::invalid_argument("unknown metadata field '" + leaf.field() + "'");
+    const Expr::Op op = leaf.op();
+    const vector<uint8_t>& valid = col->valid;
+
+    if (op == Expr::Op::IsNull) {
+        keep_if(words, [&](size_t s) { return !valid[s]; });
+    } else if (col->type == ColumnType::String) {
+        const vector<uint8_t> match = string_match(*col, leaf);
+        const uint32_t* codes = col->codes.data();
+        keep_if(words, [&](size_t s) { return valid[s] && match[codes[s]]; });
+    } else if (col->type == ColumnType::Int64) {
+        const int64_t* x = col->ints.data();
+        if (op == Expr::Op::In) {
+            std::unordered_set<int64_t> ints;
+            std::unordered_set<double> floats;
+            for (const auto& v : leaf.values()) {
+                if (auto* i = std::get_if<int64_t>(&v)) ints.insert(*i);
+                else floats.insert(as_double(v, leaf.field()));
+            }
+            keep_if(words, [&](size_t s) {
+                return valid[s] && (ints.count(x[s]) || (!floats.empty() && floats.count(static_cast<double>(x[s]))));
+            });
+        } else if (auto* value = std::get_if<int64_t>(&leaf.values()[0])) {
+            keep_compared(words, valid, x, op, *value);
+        } else {
+            keep_compared(words, valid, x, op, as_double(leaf.values()[0], leaf.field()));
+        }
+    } else {
+        const double* x = col->floats.data();
+        if (op == Expr::Op::In) {
+            std::unordered_set<double> wanted;
+            for (const auto& v : leaf.values()) wanted.insert(as_double(v, leaf.field()));
+            keep_if(words, [&](size_t s) { return valid[s] && wanted.count(x[s]); });
+        } else {
+            keep_compared(words, valid, x, op, as_double(leaf.values()[0], leaf.field()));
+        }
+    }
+}
+
 vector<uint64_t> MetadataStore::evaluate_leaf(const Expr& leaf, size_t slots) const {
     const Column* col = find(leaf.field());
     if (!col) throw std::invalid_argument("unknown metadata field '" + leaf.field() + "'");
@@ -954,16 +1103,7 @@ vector<uint64_t> MetadataStore::evaluate_leaf(const Expr& leaf, size_t slots) co
     }
 
     if (col->type == ColumnType::String) {
-        // decide each distinct string once, then look rows up by code
-        vector<uint8_t> match(col->dict.size(), 0);
-        if (op == Expr::Op::In) {
-            std::unordered_set<std::string> wanted;
-            for (const auto& v : leaf.values()) wanted.insert(as_string(v, leaf.field()));
-            for (size_t c = 0; c < col->dict.size(); ++c) match[c] = wanted.count(col->dict[c]);
-        } else {
-            const std::string& value = as_string(leaf.values()[0], leaf.field());
-            for (size_t c = 0; c < col->dict.size(); ++c) match[c] = compare(op, col->dict[c], value);
-        }
+        const vector<uint8_t> match = string_match(*col, leaf);
         // a few matching strings: set their rows' bits instead of passing over every row
         size_t cost = 0;
         for (size_t c = 0; c < col->dict.size(); ++c)

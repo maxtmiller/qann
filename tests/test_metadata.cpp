@@ -23,6 +23,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace vecengine;
@@ -377,6 +378,113 @@ TEST_CASE("MetadataStore: numeric filters stay exact through adds, updates, comp
             store = MetadataStore::load(file, ref.size());
         }
         check(step);
+    }
+}
+
+TEST_CASE("MetadataStore: And/Or trees over every column type match a row-by-row reference (fuzz)", "[metadata]") {
+    // Big enough that And parts get reordered and later ones test only the
+    // rows left, with an unsorted tail and overwritten rows in the numeric columns.
+    std::mt19937 rng(51);
+    const size_t n = 30000, extra = 700;
+    using Row = std::tuple<std::optional<std::string>, std::optional<int64_t>, std::optional<double>>;
+    auto draw = [&]() -> Row {
+        std::optional<std::string> t;
+        if (rng() % 20) t = rng() % 10 < 4 ? std::string("s0") : "s" + std::to_string(1 + rng() % 300);
+        std::optional<int64_t> k;
+        if (rng() % 20) k = static_cast<int64_t>(rng() % 1000);
+        std::optional<double> x;
+        if (rng() % 20) x = rng() % 50 ? static_cast<double>(rng() % 4000) / 40.0 : std::nan("");
+        return {t, k, x};
+    };
+    auto columns = [](const std::vector<Row>& v) {
+        std::vector<std::string> t(v.size());
+        std::vector<int64_t> k(v.size());
+        std::vector<double> x(v.size());
+        std::vector<uint8_t> tv(v.size()), kv(v.size()), xv(v.size());
+        for (size_t i = 0; i < v.size(); ++i) {
+            if (auto& a = std::get<0>(v[i])) t[i] = *a, tv[i] = 1;
+            if (auto& b = std::get<1>(v[i])) k[i] = *b, kv[i] = 1;
+            if (auto& c = std::get<2>(v[i])) x[i] = *c, xv[i] = 1;
+        }
+        return Metadata{{"tag", t, tv}, {"k", k, kv}, {"x", x, xv}};
+    };
+    std::vector<Row> ref(n);
+    for (auto& r : ref) r = draw();
+    MetadataStore store;
+    store.append(0, n, columns(ref));
+    std::vector<Row> more(extra);  // after the sort, so an unsorted tail
+    for (auto& r : more) r = draw();
+    store.append(n, extra, columns(more));
+    ref.insert(ref.end(), more.begin(), more.end());
+    std::vector<uint32_t> slots;  // overwritten rows
+    for (int i = 0; i < 500; ++i) slots.push_back(static_cast<uint32_t>(i * 37));
+    std::vector<Row> changed(slots.size());
+    for (auto& r : changed) r = draw();
+    store.update(slots, columns(changed));
+    for (size_t i = 0; i < slots.size(); ++i) ref[slots[i]] = changed[i];
+
+    // the reference: SQL comparisons on one row, nulls fail, NaN compares false
+    std::function<bool(const Expr&, size_t)> holds = [&](const Expr& e, size_t i) -> bool {
+        switch (e.op()) {
+            case Op::And: return std::all_of(e.children().begin(), e.children().end(), [&](const Expr& c) { return holds(c, i); });
+            case Op::Or: return std::any_of(e.children().begin(), e.children().end(), [&](const Expr& c) { return holds(c, i); });
+            case Op::Not: return !holds(e.children()[0], i);
+            default: break;
+        }
+        const Row& r = ref[i];
+        if (e.op() == Op::IsNull)
+            return e.field() == "tag" ? !std::get<0>(r) : e.field() == "k" ? !std::get<1>(r) : !std::get<2>(r);
+        auto one = [&](Op op, const Expr::Value& v) -> bool {
+            auto cmp = [op](auto a, auto b) {
+                switch (op) {
+                    case Op::Eq: return a == b;
+                    case Op::Ne: return a != b;
+                    case Op::Lt: return a < b;
+                    case Op::Le: return a <= b;
+                    case Op::Gt: return a > b;
+                    default: return a >= b;
+                }
+            };
+            if (e.field() == "tag") return std::get<0>(r) && cmp(*std::get<0>(r), std::get<std::string>(v));
+            if (e.field() == "k") {
+                if (!std::get<1>(r)) return false;
+                if (auto* p = std::get_if<int64_t>(&v)) return cmp(*std::get<1>(r), *p);
+                return cmp(static_cast<double>(*std::get<1>(r)), std::get<double>(v));
+            }
+            if (!std::get<2>(r)) return false;
+            return cmp(*std::get<2>(r), std::holds_alternative<int64_t>(v) ? static_cast<double>(std::get<int64_t>(v)) : std::get<double>(v));
+        };
+        if (e.op() == Op::In)
+            return std::any_of(e.values().begin(), e.values().end(), [&](const Expr::Value& v) { return one(Op::Eq, v); });
+        return one(e.op(), e.values()[0]);
+    };
+
+    const Op ops[] = {Op::Eq, Op::Ne, Op::Lt, Op::Le, Op::Gt, Op::Ge};
+    auto leaf = [&]() -> Expr {
+        const unsigned c = rng() % 3, kind = rng() % 10;
+        const std::string field = c == 0 ? "tag" : c == 1 ? "k" : "x";
+        if (kind == 0) return Expr::is_null(field);
+        auto value = [&]() -> Expr::Value {
+            if (c == 0) return rng() % 3 ? std::string("s0") : "s" + std::to_string(1 + rng() % 320);
+            if (c == 1) return rng() % 4 ? Expr::Value{static_cast<int64_t>(rng() % 1100)} : Expr::Value{static_cast<double>(rng() % 4400) / 4.0};
+            return rng() % 4 ? Expr::Value{static_cast<double>(rng() % 4400) / 40.0} : Expr::Value{static_cast<int64_t>(rng() % 110)};
+        };
+        if (kind == 1) return Expr::isin(field, {value(), value(), value()});
+        return Expr::compare(field, ops[rng() % 6], value());
+    };
+    std::function<Expr(int)> tree = [&](int depth) -> Expr {
+        if (depth == 0 || rng() % 3 == 0) return leaf();
+        std::vector<Expr> kids;
+        for (size_t i = 0, m = 2 + rng() % 3; i < m; ++i) kids.push_back(tree(depth - 1));
+        const unsigned kind = rng() % 5;
+        if (kind == 0) return ~Expr::join(Op::And, kids);
+        return Expr::join(kind <= 2 ? Op::And : Op::Or, kids);
+    };
+    for (int t = 0; t < 300; ++t) {
+        const Expr e = tree(3);
+        CAPTURE(t, e.to_string());
+        REQUIRE(bits_to_ids(store.evaluate(e, ref.size()), ref.size()) ==
+                ids_where(ref.size(), [&](size_t i) { return holds(e, i); }));
     }
 }
 

@@ -128,4 +128,34 @@ int main() {
         }
         std::printf("%8.4f %9.1f %9.1f\n", p, best[0], best[1]);
     }
+
+    // And narrowing: tag = 'x' (fraction q) AND price < 0.5. Once tag leaves
+    // few rows, price is tested on those alone instead of evaluated over the
+    // column; the last column is that per-row test's cost in scanned rows
+    // (price < 0.5 alone takes the pass, so its time gives a scanned row's)
+    std::printf("\nAnd: tag = 'x' (fraction q) AND price < 0.5, us per evaluation\n\n%8s %9s %9s %9s %9s   %s\n", "q",
+                "tag", "price", "sum", "And", "per tested row vs per scanned row");
+    for (double q : fractions) {
+        std::bernoulli_distribution pick(q);
+        vector<std::string> tag(n);
+        size_t picked = 0;
+        for (auto& t : tag) {
+            const bool x = pick(rng);
+            t = x ? "x" : "y";
+            picked += x;
+        }
+        detail::MetadataStore both;
+        both.append(0, n, {{"tag", tag}, {"price", price}});
+        const Expr t = Expr::compare("tag", Expr::Op::Eq, std::string("x"));
+        const Expr pr = Expr::compare("price", Expr::Op::Lt, 0.5);
+        const Expr a = t & pr;
+        double best[3] = {1e30, 1e30, 1e30};
+        for (int r = 0; r < rounds; ++r) {
+            best[0] = std::min(best[0], time_us([&] { consume(both.evaluate(t, n)); }, 20));
+            best[1] = std::min(best[1], time_us([&] { consume(both.evaluate(pr, n)); }, 20));
+            best[2] = std::min(best[2], time_us([&] { consume(both.evaluate(a, n)); }, 20));
+        }
+        const double per_row = picked ? ((best[2] - best[0]) / picked) / (best[1] / n) : 0;
+        std::printf("%8.4f %9.1f %9.1f %9.1f %9.1f   %.1f\n", q, best[0], best[1], best[0] + best[1], best[2], per_row);
+    }
 }
