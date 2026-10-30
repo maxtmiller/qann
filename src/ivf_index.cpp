@@ -107,6 +107,11 @@ void IVFIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* i
 
     const uint32_t first_slot = static_cast<uint32_t>(id_map_.slots());
     id_map_.add(n, ids);
+    const bool lookup = !pq_enabled();
+    if (lookup) {
+        slot_list_.resize(first_slot + n);
+        slot_pos_.resize(first_slot + n);
+    }
 
     vector<uint32_t> assign(n);
     detail::assign_nearest(vecs.data(), n, dim_, coarse_centroids_.data(), nlist_, dim_, assign.data());
@@ -135,6 +140,10 @@ void IVFIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* i
     for (size_t i = 0; i < n; ++i) {
         InvertedList& list = data_[static_cast<uint16_t>(assign[i])];
         list.ids.push_back(first_slot + static_cast<uint32_t>(i));
+        if (lookup) {
+            slot_list_[first_slot + i] = static_cast<uint16_t>(assign[i]);
+            slot_pos_[first_slot + i] = static_cast<uint32_t>(list.ids.size() - 1);
+        }
 
         if (sq_bits_) {
             const size_t w = sq_code_bytes();
@@ -164,11 +173,55 @@ vector<Neighbor> IVFIndex::query_impl(span<const float> vec, size_t k, const det
         vec = rot;
     }
 
+    if (use_direct(k, filter)) return direct_scan(vec, k, *filter);
+
     VECENGINE_PROF_START(t_coarse);
     vector<Probe> probes = filter ? coarse_all(vec) : coarse(vec);
     VECENGINE_PROF_STOP(t_coarse, kProfCoarse);
 
     return scan(vec, probes, k, filter);
+}
+
+bool IVFIndex::use_direct(size_t k, const detail::SlotFilter* filter) const {
+    // A filtered query stops probing once it has k allowed vectors, so under a
+    // narrow filter it misses most of the true top k (SIFT1M, nlist 1000,
+    // nprobe 16: recall 0.5 at 0.1% allowed). Scoring every allowed vector is
+    // exact for plain IVF; measured on SIFT1M it was faster below about 0.8 *
+    // nlist allowed and 0.88x (plain) / 0.65x (SQ8) at nlist, so this switches
+    // at nlist, trading a little speed at the edge for full recall. PQ isn't
+    // switched: each allowed vector needs its own list's table there, which
+    // made it 2-50x slower; a RefineIndex over PQ makes this switch instead.
+    return filter && k > 0 && !pq_enabled() && filter->count <= nlist_;
+}
+
+void IVFIndex::rebuild_slot_lookup() {
+    slot_list_.clear();
+    slot_pos_.clear();
+    if (pq_enabled()) return;
+    slot_list_.resize(id_map_.slots());
+    slot_pos_.resize(id_map_.slots());
+    for (const auto& [l, list] : data_)
+        for (size_t j = 0; j < list.ids.size(); ++j) {
+            slot_list_[list.ids[j]] = l;
+            slot_pos_[list.ids[j]] = static_cast<uint32_t>(j);
+        }
+}
+
+vector<Neighbor> IVFIndex::direct_scan(span<const float> vec, size_t k, const detail::SlotFilter& filter) const {
+    detail::TopK top(k);
+    filter.for_each([&](uint32_t slot) {
+        const InvertedList& list = data_.at(slot_list_[slot]);
+        const size_t j = slot_pos_[slot];
+        float dist;
+        if (sq_bits_) {
+            const uint8_t* code = list.codes.data() + j * sq_code_bytes();
+            dist = metric_ == Metric::InnerProduct ? -sq_.inner_product(vec.data(), code) : sq_.distance(vec.data(), code);
+        } else {
+            dist = exact_score(vec.data(), list.vecs.data() + j * dim_, dim_);
+        }
+        if (dist < top.threshold()) top.push(dist, id_map_.label(slot));
+    });
+    return top.take_sorted();
 }
 
 vector<vector<Neighbor>> IVFIndex::query_batch_impl(span<const float> queries, size_t num_queries, size_t k,
@@ -509,6 +562,7 @@ size_t IVFIndex::compact_impl(bool keep_ids) {
         return 0;
     }
     compact_storage(remap);
+    rebuild_slot_lookup();
     metadata_.compact(remap);
     return remap.size() - id_map_.slots();
 }
@@ -756,6 +810,7 @@ std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version
     if (version >= 5) index->metric_ = read_metric(in);
     if (version >= 9) index->metadata_ = MetadataStore::load(in, n_total);
     index->build_precomputed();
+    index->rebuild_slot_lookup();
 
     return index;
 }
