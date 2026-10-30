@@ -486,6 +486,42 @@ TEST_CASE("MetadataStore: And/Or trees over every column type match a row-by-row
         REQUIRE(bits_to_ids(store.evaluate(e, ref.size()), ref.size()) ==
                 ids_where(ref.size(), [&](size_t i) { return holds(e, i); }));
     }
+
+    // Or branches built from a small pool, so they often share conditions and
+    // get factored, including a branch that is only the shared term (absorption)
+    for (int t = 0; t < 300; ++t) {
+        std::vector<Expr> pool;
+        for (int p = 0; p < 4; ++p) pool.push_back(rng() % 4 ? leaf() : tree(1));
+        auto branch = [&]() {
+            std::vector<Expr> terms;
+            for (size_t i = 0, m = 1 + rng() % 3; i < m; ++i) terms.push_back(pool[rng() % pool.size()]);
+            return Expr::join(Op::And, terms);
+        };
+        std::vector<Expr> branches;
+        for (size_t i = 0, m = 2 + rng() % 4; i < m; ++i) branches.push_back(rng() % 6 ? branch() : leaf());
+        Expr e = Expr::join(Op::Or, branches);
+        if (rng() % 3 == 0) e = branch() & e;
+        if (rng() % 5 == 0) e = ~e;
+        CAPTURE(t, e.to_string());
+        REQUIRE(bits_to_ids(store.evaluate(e, ref.size()), ref.size()) ==
+                ids_where(ref.size(), [&](size_t i) { return holds(e, i); }));
+    }
+
+    // (a & c & ~deep) | (a & d & b) factors to a & ((c & ~deep) | (d & b)), one
+    // level deeper per group, so near Expr::kMaxDepth factoring can't build the
+    // result and the filter is evaluated as given
+    const Expr a = Expr::compare("k", Op::Lt, int64_t{500}), b = Expr::compare("tag", Op::Eq, std::string("s0"));
+    const Expr c = Expr::compare("k", Op::Gt, int64_t{100}), d = Expr::compare("x", Op::Lt, 50.0);
+    Expr deep = Expr::compare("x", Op::Gt, 10.0);
+    for (;;) {
+        try {
+            deep = Expr::join(Op::Or, {Expr::join(Op::And, {a, c, ~deep}), Expr::join(Op::And, {a, d, b})});
+        } catch (const std::invalid_argument&) {
+            break;
+        }
+    }
+    REQUIRE(bits_to_ids(store.evaluate(deep, ref.size()), ref.size()) ==
+            ids_where(ref.size(), [&](size_t i) { return holds(deep, i); }));
 }
 
 TEST_CASE("MetadataStore: every operator matches a hand-computed mask", "[metadata]") {
