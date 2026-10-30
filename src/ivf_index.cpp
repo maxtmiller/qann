@@ -320,8 +320,31 @@ vector<IVFIndex::Probe> IVFIndex::coarse(span<const float> vec) const {
     return probes;
 }
 
+bool IVFIndex::coarse_all_approx() const noexcept {
+#if defined(VECENGINE_USE_BLAS) && defined(__APPLE__)
+    return dim_ >= kBlasCoarseMinDim;
+#else
+    return false;
+#endif
+}
+
 vector<IVFIndex::Probe> IVFIndex::coarse_all(span<const float> vec) const {
     vector<Probe> probes(nlist_);
+#if defined(VECENGINE_USE_BLAS) && defined(__APPLE__)
+    if (coarse_all_approx()) {
+        // as in coarse(): ||c||^2 - 2 q.c (-q.c for InnerProduct) from one sgemv; adding
+        // ||q||^2 keeps the ranking and puts dist on the exact scale, which scan()
+        // restores precisely for the lists it probes
+        const bool ip = metric_ == Metric::InnerProduct;
+        vector<float> score = ip ? vector<float>(nlist_, 0.0f) : centroid_sqnorms_;
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, static_cast<int>(nlist_), static_cast<int>(dim_), ip ? -1.0f : -2.0f,
+                    coarse_centroids_.data(), static_cast<int>(dim_), vec.data(), 1, 1.0f, score.data(), 1);
+        const float qq = ip ? 0.0f : cblas_sdot(static_cast<int>(dim_), vec.data(), 1, vec.data(), 1);
+        for (size_t i = 0; i < nlist_; ++i) probes[i] = {score[i] + qq, static_cast<uint16_t>(i)};
+        std::partial_sort(probes.begin(), probes.begin() + nprobe_, probes.end());
+        return probes;
+    }
+#endif
     for (size_t i = 0; i < nlist_; ++i)
         probes[i] = {exact_score(vec.data(), coarse_centroids_.data() + i * dim_, dim_), static_cast<uint16_t>(i)};
     std::partial_sort(probes.begin(), probes.begin() + nprobe_, probes.end());
@@ -459,7 +482,10 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
         }
         const Probe& probe = probes[p];
         VECENGINE_PROF_START(t_list);
-        const float A = probe.dist;
+        // a filtered query's probes may hold coarse_all()'s approximate distances
+        const float A = filter && coarse_all_approx()
+                            ? exact_score(vec.data(), coarse_centroids_.data() + size_t{probe.list} * dim_, dim_)
+                            : probe.dist;
         auto it = data_.find(probe.list);
         if (it == data_.end()) continue;
 

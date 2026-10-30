@@ -180,8 +180,12 @@ private:
 
     // Every list, for a filtered query: the nprobe nearest to vec first,
     // nearest first, then the rest in any order (scan() sorts them if it
-    // needs them).
+    // needs them). With coarse_all_approx(), dist is ranked from one sgemv and
+    // is only approximate; scan() recomputes it exactly for the lists it probes.
     vector<Probe> coarse_all(span<const float> vec) const;
+
+    // Whether coarse_all() ranks with sgemv (Accelerate, dim >= kBlasCoarseMinDim).
+    bool coarse_all_approx() const noexcept;
 
     // Coarse step for n queries (query i at queries + i * dim_): writes each
     // query's nprobe probes to out + i * nprobe_, in any order.
