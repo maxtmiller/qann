@@ -271,11 +271,33 @@ private:
     // Bits of the rows of one leaf (comparison, In or IsNull).
     vector<uint64_t> evaluate_leaf(const Expr& leaf, size_t slots) const;
 
+    // What evaluating part of an And would match and cost, in rows a pass
+    // tests in the same time (a pass over the column costs slots).
+    struct Estimate {
+        size_t matches;
+        size_t cost;
+    };
+
     // Sets the bits of the And of leaves (comparisons or In on numeric column
     // col; more than one leaf only for comparisons) in words, all zero, from
     // col.sorted when that costs less than a pass over the column, and
-    // returns whether it did. Throws like evaluate_leaf on a string value.
-    static bool sorted_leaves(const Column& col, const vector<const Expr*>& leaves, vector<uint64_t>& words, size_t slots);
+    // returns whether it did. With estimate, only fills it in (a pass's
+    // figures when sorted rows can't help) and returns false. Throws like
+    // evaluate_leaf on a string value.
+    static bool sorted_leaves(const Column& col, const vector<const Expr*>& leaves, vector<uint64_t>& words, size_t slots,
+                              Estimate* estimate = nullptr);
+
+    // For a string column: 1 for each dictionary code that leaf (a
+    // comparison or In) matches. Throws on a value that isn't a string.
+    static vector<uint8_t> string_match(const Column& col, const Expr& leaf);
+
+    // The Estimate for the And of leaves on col (several only for numeric
+    // comparisons). Throws like evaluate_leaf on a value of the wrong kind.
+    Estimate estimate(const Column& col, const vector<const Expr*>& leaves, size_t slots) const;
+
+    // Clears the bits of `words` whose rows fail leaf, testing only the rows
+    // set, for an And whose other parts left few. Throws like evaluate_leaf.
+    void narrow(const Expr& leaf, vector<uint64_t>& words) const;
 
     vector<Column> columns_;
 };
