@@ -1,14 +1,15 @@
-"""SparseIndex on the big-ann-benchmarks (NeurIPS'23) sparse track (issue #59).
+"""Sparse indexes on the big-ann-benchmarks (NeurIPS'23) sparse track (issue #59).
 
 SPLADE vectors of MS MARCO passages (about 127 nonzeros per passage over
 ~30k terms) and 6,980 dev queries (about 49 nonzeros), with exact top-10
-ground truth by dot product. Reports recall@10 and QPS with MaxScore pruning
-off and on, on one thread and on all of them, and checks that both modes give
-the same distances. With --approx, the index keeps a forward index (twice the
-memory) and each query_terms:list_depth:k_factor setting is run as well.
+ground truth by dot product. Reports recall@10 and QPS on one thread and on
+all of them: InvertedIndex with MaxScore pruning off and on (checking both
+give the same distances), then, with --approx, a SparseApproxIndex at each
+query_terms:list_depth:k_factor setting.
 
 Sizes: small (100k passages, 67 MB download), 1M (667 MB), full (8.8M,
-5.9 GB; needs about 20 GB of RAM). Files go in benchmarks/data/sparse/.
+5.9 GB; needs about 20 GB of RAM, about 30 GB with --approx). Files go in
+benchmarks/data/sparse/.
 
     python benchmarks/sparse_bigann.py --size 1M --download
     python benchmarks/sparse_bigann.py --size 1M --approx 10:2000:50 10:10000:10 10:10000:50
@@ -77,16 +78,16 @@ def main():
     queries = read_csr(fetch("queries.dev.csr", args.download))
     truth = read_gt(fetch(BASE[args.size] + ".dev.gt", args.download))
 
-    index = qann.SparseIndex(forward_index=bool(approx))
-    start = time.perf_counter()
-    for first in range(0, base.shape[0], 500_000):  # in parts, so the copy qann makes stays small
-        index.add(base[first:first + 500_000])
-    built = time.perf_counter() - start
-    del base
-    print(f"{args.size}: {index.size():,} passages, {index.terms:,} terms, {index.postings:,} postings, "
-          f"added in {built:.1f}s; {queries.shape[0]:,} queries, k=10; {os.cpu_count()} CPUs")
+    def build(index):
+        start = time.perf_counter()
+        for first in range(0, base.shape[0], 500_000):  # in parts, so the copy qann makes stays small
+            index.add(base[first:first + 500_000])
+        print(f"{type(index).__name__}, {args.size}: {index.size():,} passages, {index.terms:,} terms, "
+              f"{index.postings:,} postings, added in {time.perf_counter() - start:.1f}s; "
+              f"{queries.shape[0]:,} queries, k=10; {os.cpu_count()} CPUs", flush=True)
+        return index
 
-    def run(label):
+    def run(index, label):
         index.batch_query(queries[:200], 10)
         best = float("inf")
         for _ in range(args.rounds):
@@ -98,20 +99,27 @@ def main():
               f"recall@10 {recall:.4f}", flush=True)
         return dists
 
+    exact_index = build(qann.InvertedIndex())
     same = True
     for threads in (1, 0):
         qann.set_num_threads(threads)
-        name = "1 thread" if threads else "all threads"
-        index.query_terms, index.list_depth = 0, 0
         exact = {}
         for pruning in (False, True):
-            index.pruning = pruning
-            exact[pruning] = run(f"{name}, exact, pruning {'on' if pruning else 'off'}")
+            exact_index.pruning = pruning
+            exact[pruning] = run(exact_index, f"{'1 thread' if threads else 'all threads'}, pruning {'on' if pruning else 'off'}")
         same &= np.array_equal(exact[True], exact[False])
-        for terms, depth, factor in approx:
-            index.query_terms, index.list_depth, index.k_factor = terms, depth, factor
-            run(f"{name}, query_terms {terms} list_depth {depth} k_factor {factor}")
     print(f"  same distances with pruning on and off: {same}")
+    del exact_index
+    if not approx:
+        return
+
+    approx_index = build(qann.SparseApproxIndex())
+    for threads in (1, 0):
+        qann.set_num_threads(threads)
+        for terms, depth, factor in approx:
+            approx_index.query_terms, approx_index.list_depth, approx_index.k_factor = terms, depth, factor
+            run(approx_index, f"{'1 thread' if threads else 'all threads'}, query_terms {terms} list_depth {depth} "
+                              f"k_factor {factor}")
 
 
 if __name__ == "__main__":

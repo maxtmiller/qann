@@ -16,7 +16,8 @@ enum class IndexType {
     Flat,
     IVF,
     HNSW,
-    Inverted,  // sparse
+    Inverted,      // sparse, exact
+    SparseApprox,  // sparse, approximate
 };
 
 // Per-type construction options. Only the fields relevant to `type` are read.
@@ -33,12 +34,15 @@ struct IndexOptions {
     size_t ef_search = 64;         // HNSWIndex: beam width per query
     int hnsw_sq_bits = 0;          // HNSWIndex: 4 or 8 stores codes of that many bits (call train() before adding); 0 = floats
     bool pruning = true;           // InvertedIndex: skip vectors that can't reach the top k
+    size_t query_terms = 10;       // SparseApproxIndex: query terms used (0 = all)
+    size_t list_depth = 10000;     // SparseApproxIndex: heaviest entries read per list (0 = all)
+    size_t k_factor = 10;          // SparseApproxIndex: k * k_factor candidates re-scored
     bool custom_ids = false;   // all: add_batch() takes user ids
     Metric metric = Metric::L2; // dense: how vectors are compared
 };
 
 // Constructs the requested index type: a DenseIndex of dim floats per vector,
-// or a SparseIndex (dim is then unused). dynamic_cast the result to reach
+// or a SparseIndex (InvertedIndex or SparseApproxIndex; dim is then unused). dynamic_cast the result to reach
 // type-specific calls such as IVFIndex::train().
 std::unique_ptr<IndexBase> make_index(IndexType type, size_t dim, const IndexOptions& opts = {});
 

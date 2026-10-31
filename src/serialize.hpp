@@ -32,6 +32,7 @@ enum class IndexKind : uint8_t {
     Refine = 3,
     HNSW = 4,
     Inverted = 5,  // format 9+
+    SparseApprox = 6,  // format 9+
 };
 
 // Writes a trivially copyable value as raw bytes.
@@ -126,6 +127,8 @@ inline Header read_header(std::istream& in) {
             return {IndexKind::HNSW, version};
         case static_cast<uint8_t>(IndexKind::Inverted):
             return {IndexKind::Inverted, version};
+        case static_cast<uint8_t>(IndexKind::SparseApprox):
+            return {IndexKind::SparseApprox, version};
         default:
             throw std::runtime_error("unknown index kind");
     }
