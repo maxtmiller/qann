@@ -821,9 +821,14 @@ NB_MODULE(qann, m) {
     nb::class_<vecengine::SparseIndex, vecengine::IndexBase>(
         m, "SparseIndex",
         "Exact inverted index over sparse vectors (BM25, SPLADE): scores by dot product, distance -(q . d)")
-        .def("__init__", [](vecengine::SparseIndex* self, bool custom_ids) { new (self) vecengine::SparseIndex(custom_ids); },
-             nb::kw_only(), nb::arg("custom_ids") = false,
-             "An empty SparseIndex. custom_ids=True makes add() take ids, as for the dense indexes")
+        .def("__init__",
+             [](vecengine::SparseIndex* self, bool custom_ids, bool forward_index) {
+                 new (self) vecengine::SparseIndex(custom_ids, forward_index);
+             },
+             nb::kw_only(), nb::arg("custom_ids") = false, nb::arg("forward_index") = false,
+             "An empty SparseIndex. custom_ids=True makes add() take ids, as for the dense indexes. "
+             "forward_index=True also keeps each vector's own terms, which approximate search (query_terms, "
+             "list_depth) needs; it doubles the memory")
         .def("add", &sparse_add, nb::arg("data"), nb::arg("ids").none() = nb::none(), nb::kw_only(),
              nb::arg("metadata").none() = nb::none(),
              "Add the rows of a scipy.sparse matrix (CSR, or converted with tocsr()); a column is a term id in "
@@ -856,6 +861,24 @@ NB_MODULE(qann, m) {
                      [](vecengine::SparseIndex& self, bool on) { write_locked(self, [&] { self.set_pruning(on); }); },
                      "Whether queries skip vectors that can't reach the top k (MaxScore; default True). Results are "
                      "the same either way, up to which of several vectors tied at the k-th distance is kept. Not saved")
+        .def_prop_ro("forward_index",
+                     [](const vecengine::SparseIndex& self) { return self.forward_index(); },
+                     "Whether the index keeps a forward index (fixed at construction)")
+        .def_prop_rw("query_terms",
+                     [](const vecengine::SparseIndex& self) { return read_locked(self, [&] { return self.query_terms(); }); },
+                     [](vecengine::SparseIndex& self, std::size_t n) { write_locked(self, [&] { self.set_query_terms(n); }); },
+                     "Approximate search: use only the query's n largest-valued terms (0, the default: all). "
+                     "Needs forward_index=True. Saved with the index")
+        .def_prop_rw("list_depth",
+                     [](const vecengine::SparseIndex& self) { return read_locked(self, [&] { return self.list_depth(); }); },
+                     [](vecengine::SparseIndex& self, std::size_t n) { write_locked(self, [&] { self.set_list_depth(n); }); },
+                     "Approximate search: read only the n heaviest entries of each query term's list, plus any added "
+                     "since it was last sorted (0, the default: all). Needs forward_index=True. Saved with the index")
+        .def_prop_rw("k_factor",
+                     [](const vecengine::SparseIndex& self) { return read_locked(self, [&] { return self.k_factor(); }); },
+                     [](vecengine::SparseIndex& self, std::size_t n) { write_locked(self, [&] { self.set_k_factor(n); }); },
+                     "Approximate search: the k * k_factor best partial scores are re-scored exactly with the whole "
+                     "query (default 10). Saved with the index")
         .def_prop_ro("terms", [](const vecengine::SparseIndex& self) { return read_locked(self, [&] { return self.terms(); }); },
                      "Distinct terms with a posting list")
         .def_prop_ro("postings",
