@@ -17,6 +17,31 @@ def test_version():
     assert isinstance(qann.__version__, str)
 
 
+def test_index_class_layout(tmp_path, data):
+    # what a sparse index will share lives on IndexBase; dense vectors on Index
+    shared = {"save", "remove", "compact", "size", "update_metadata", "get_metadata", "add_metadata_column",
+              "drop_metadata_column", "metadata_schema"}
+    dense = {"add", "query", "batch_query", "dim", "metric"}
+    assert qann.Index.__mro__[1] is qann.IndexBase
+    assert shared <= set(vars(qann.IndexBase))
+    assert not dense & set(dir(qann.IndexBase))
+    assert dense <= set(vars(qann.Index))
+
+    flat = qann.FlatIndex(32)
+    base = qann.FlatIndex(32)
+    indexes = [flat, qann.IVFIndex(32, 100), qann.HNSWIndex(32), qann.RefineIndex(base, k_factor=2)]
+    for index in indexes:
+        assert isinstance(index, qann.Index) and isinstance(index, qann.IndexBase)
+
+    # the methods inherited from IndexBase still work through a subclass
+    flat.add(data[:3], metadata={"tag": ["a", "b", "c"]})
+    assert flat.get_metadata([1]) == {"tag": ["b"]}
+    assert flat.remove([0]) == 1 and flat.compact() == 1 and flat.size() == 2
+    path = tmp_path / "layout.qann"
+    flat.save(path)
+    assert isinstance(qann.load(path), qann.FlatIndex)
+
+
 def test_flat_finds_self(data):
     index = qann.FlatIndex(32)
     index.add(data)
