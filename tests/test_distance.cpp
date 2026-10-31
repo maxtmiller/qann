@@ -439,7 +439,7 @@ TEST_CASE("IVFIndex+PQ: add_batch through RefineIndex keeps recall", "[ivf][pq][
     REQUIRE(base.size() == n);
     REQUIRE(refine.size() == n);
 
-    auto recall = [&](const vecengine::Index& idx) {
+    auto recall = [&](const vecengine::DenseIndex& idx) {
         size_t hits = 0;
         for (size_t q = 0; q < num_queries; ++q) {
             std::span<const float> query(data.data() + q * 37 * dim, dim);
@@ -713,7 +713,7 @@ TEST_CASE("IVFIndex: precomputed tables stay off without PQ", "[ivf][precomputed
 // Batched coarse search may pick a different list on a near-tie between
 // centroids, so allow a few ids to differ; matching ids must have matching
 // distances.
-static void require_batch_matches_query(const vecengine::Index& idx, const std::vector<float>& queries, size_t nq, size_t k) {
+static void require_batch_matches_query(const vecengine::DenseIndex& idx, const std::vector<float>& queries, size_t nq, size_t k) {
     const size_t dim = idx.dim();
     auto batch = idx.query_batch(queries, nq, k);
     REQUIRE(batch.size() == nq);
@@ -879,7 +879,7 @@ TEST_CASE("RefineIndex: larger k_factor raises recall over the PQ base", "[refin
         refine.add(v);
     }
 
-    auto recall = [&](const vecengine::Index& idx) {
+    auto recall = [&](const vecengine::DenseIndex& idx) {
         size_t hits = 0;
         for (size_t q = 0; q < num_queries; ++q) {
             std::span<const float> query(data.data() + q * 37 * dim, dim);

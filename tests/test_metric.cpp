@@ -36,7 +36,7 @@ static std::vector<float> metric_random(size_t n, size_t dim, unsigned seed) {
 // Exposes the protected helper for direct tests.
 struct NormalizeProbe : FlatIndex {
     using FlatIndex::FlatIndex;
-    using Index::normalize_rows;
+    using DenseIndex::normalize_rows;
 };
 
 // Mean fraction of each truth row's ids found in the matching result row.
@@ -63,7 +63,7 @@ static void require_identical(const std::vector<std::vector<Neighbor>>& a, const
     }
 }
 
-static std::unique_ptr<Index> metric_roundtrip(const Index& index) {
+static std::unique_ptr<DenseIndex> metric_roundtrip(const DenseIndex& index) {
     std::stringstream s;
     index.save(s);
     return load_dense(s);
@@ -232,8 +232,8 @@ TEST_CASE("the metric survives save/load", "[metric][serialize]") {
     HNSWIndex hnsw(dim, 8, 50, false, 1, Metric::Cosine);
     hnsw.add_batch(data, n);
 
-    for (const Index* index : {static_cast<const Index*>(&flat), static_cast<const Index*>(&refine),
-                               static_cast<const Index*>(&hnsw)}) {
+    for (const DenseIndex* index : {static_cast<const DenseIndex*>(&flat), static_cast<const DenseIndex*>(&refine),
+                               static_cast<const DenseIndex*>(&hnsw)}) {
         auto loaded = metric_roundtrip(*index);
         REQUIRE(loaded->metric() == Metric::Cosine);
         require_identical(loaded->query_batch(queries, nq, k), index->query_batch(queries, nq, k));
@@ -261,8 +261,8 @@ TEST_CASE("make_index passes the metric", "[metric]") {
     IndexOptions opts;
     opts.metric = Metric::Cosine;
     for (IndexType type : {IndexType::Flat, IndexType::IVF, IndexType::HNSW})
-        REQUIRE(make_index(type, 8, opts)->metric() == Metric::Cosine);
-    REQUIRE(make_index(IndexType::Flat, 8)->metric() == Metric::L2);
+        REQUIRE(make_dense(type, 8, opts)->metric() == Metric::Cosine);
+    REQUIRE(make_dense(IndexType::Flat, 8)->metric() == Metric::L2);
 }
 
 TEST_CASE("files from format version 4 (0.1.0a10) still load, as L2", "[serialize][compat]") {

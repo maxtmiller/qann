@@ -1,8 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
-#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "vecengine/index_factory.hpp"
-#include "vecengine/sparse_index.hpp"
+#include "vecengine/inverted_index.hpp"
 #include "serialize.hpp"
 
 #include <algorithm>
@@ -13,7 +12,6 @@
 #include <functional>
 #include <map>
 #include <random>
-#include <set>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -106,12 +104,12 @@ std::vector<int64_t> iota_ids(size_t n) {
 
 } // namespace
 
-TEST_CASE("SparseIndex matches brute-force dot products (fuzz)", "[sparse]") {
+TEST_CASE("InvertedIndex matches brute-force dot products (fuzz)", "[sparse]") {
     std::mt19937 rng(7);
     for (bool exact : {true, false}) {
         const auto docs = random_rows(2000, 500, 12, exact, rng);
         const auto queries = random_rows(100, 500, 6, exact, rng);
-        SparseIndex index;
+        InvertedIndex index;
         const Csr csr(docs);
         REQUIRE(index.add_batch(csr.view()) == iota_ids(docs.size()));
         REQUIRE(index.size() == 2000);
@@ -126,7 +124,7 @@ TEST_CASE("SparseIndex matches brute-force dot products (fuzz)", "[sparse]") {
     }
 }
 
-TEST_CASE("SparseIndex: MaxScore pruning matches full scoring, with negative weights and filters (fuzz)", "[sparse]") {
+TEST_CASE("InvertedIndex: MaxScore pruning matches full scoring, with negative weights and filters (fuzz)", "[sparse]") {
     std::mt19937 rng(23);
     std::uniform_int_distribution<int> coin(0, 3);
     for (int trial = 0; trial < 4; ++trial) {
@@ -142,7 +140,7 @@ TEST_CASE("SparseIndex: MaxScore pruning matches full scoring, with negative wei
                     for (auto& [t, v] : row)
                         if (coin(rng) == 0) v = -v;
         }
-        SparseIndex index;
+        InvertedIndex index;
         index.add_batch(Csr(docs).view());
         std::vector<int64_t> gone;
         for (int64_t i = 0; i < 3000; i += 13) gone.push_back(i);
@@ -172,8 +170,8 @@ TEST_CASE("SparseIndex: MaxScore pruning matches full scoring, with negative wei
     }
 }
 
-TEST_CASE("SparseIndex: input order, repeats and zeros don't change scores", "[sparse]") {
-    SparseIndex index;
+TEST_CASE("InvertedIndex: input order, repeats and zeros don't change scores", "[sparse]") {
+    InvertedIndex index;
     // doc 0 as given out of order with a repeat and a zero; doc 1 canonical
     const Csr docs({{{9, 1.0f}, {3, 2.0f}, {9, 2.0f}, {4, 0.0f}}, {{3, 2.0f}, {9, 3.0f}}});
     index.add_batch(docs.view());
@@ -194,7 +192,7 @@ TEST_CASE("SparseIndex: input order, repeats and zeros don't change scores", "[s
     REQUIRE(index.query_batch(Csr({}).view(), 10).empty());
 }
 
-TEST_CASE("SparseIndex: custom ids, remove, compact, filters and metadata", "[sparse]") {
+TEST_CASE("InvertedIndex: custom ids, remove, compact, filters and metadata", "[sparse]") {
     std::mt19937 rng(11);
     const auto docs = random_rows(300, 50, 8, true, rng);
     const auto queries = random_rows(20, 50, 4, true, rng);
@@ -204,7 +202,7 @@ TEST_CASE("SparseIndex: custom ids, remove, compact, filters and metadata", "[sp
         ids[i] = 1000 + 3 * static_cast<int64_t>(i);
         parity[i] = static_cast<int64_t>(i % 2);
     }
-    SparseIndex index(true);
+    InvertedIndex index(true);
     REQUIRE(index.add_batch(Csr(docs).view(), ids.data(), {{"odd", parity}}) == ids);
     REQUIRE_THROWS_AS(index.add_batch(Csr({{{1, 1.0f}}}).view()), std::invalid_argument);  // needs ids
 
@@ -219,7 +217,7 @@ TEST_CASE("SparseIndex: custom ids, remove, compact, filters and metadata", "[sp
     for (size_t i = 0; i < docs.size(); i += 3) allowed.push_back(ids[i]);
     const Expr odd = Expr::compare("odd", Expr::Op::Eq, int64_t{1});
 
-    auto check = [&](const SparseIndex& idx) {
+    auto check = [&](const InvertedIndex& idx) {
         const Csr q(queries);
         const auto plain = idx.query_batch(q.view(), 10);
         const auto by_ids = idx.query_batch(q.view(), 10, allowed);
@@ -248,7 +246,7 @@ TEST_CASE("SparseIndex: custom ids, remove, compact, filters and metadata", "[sp
     std::stringstream s;
     index.save(s);
     std::unique_ptr<IndexBase> loaded = load_index(s);
-    auto* sparse = dynamic_cast<SparseIndex*>(loaded.get());
+    auto* sparse = dynamic_cast<InvertedIndex*>(loaded.get());
     REQUIRE(sparse != nullptr);
     REQUIRE(sparse->custom_ids());
     REQUIRE(sparse->postings() == index.postings());
@@ -261,8 +259,8 @@ TEST_CASE("SparseIndex: custom ids, remove, compact, filters and metadata", "[sp
     REQUIRE(again.str() == s.str());
 }
 
-TEST_CASE("SparseIndex rejects malformed rows and corrupt files", "[sparse]") {
-    SparseIndex index;
+TEST_CASE("InvertedIndex rejects malformed rows and corrupt files", "[sparse]") {
+    InvertedIndex index;
     const std::vector<uint32_t> indices = {1, 2};
     const std::vector<float> values = {1.0f, 1.0f};
     const std::vector<uint64_t> bad_start = {1, 2}, decreasing = {0, 2, 1}, too_long = {0, 3};
@@ -280,43 +278,27 @@ TEST_CASE("SparseIndex rejects malformed rows and corrupt files", "[sparse]") {
     std::stringstream s;
     index.save(s);
     const std::string bytes = s.str();
-    // header (9 bytes), slots, forward flag, query_terms, list_depth,
-    // k_factor, list count, term, head and sorted counts, list length, then
-    // (slot, weight) pairs; two postings stay unsplit (slot order)
-    const size_t forward = 9 + 8, head = forward + 1 + 8 * 3 + 8 + 4, sorted = head + 8, first_slot = sorted + 8 + 8;
+    // header (9 bytes), slots, list count, term, list length, then (slot, weight) pairs
+    const size_t first_slot = 9 + 8 + 8 + 4 + 8;
     auto corrupt = [&](size_t at, uint32_t value) {
         std::string b = bytes;
         std::memcpy(b.data() + at, &value, sizeof value);
         std::stringstream t(b);
         REQUIRE_THROWS_AS(load_index(t), std::runtime_error);
     };
-    corrupt(first_slot, 1);      // slots 1, 1: repeated
+    corrupt(first_slot, 1);      // slots 1, 1: out of order
     corrupt(first_slot, 7);      // slot beyond the index
     corrupt(first_slot + 8, 0);  // slots 0, 0
-    {
-        std::string b = bytes;  // head and sorted 2: weights 1, 2 claimed heaviest first
-        const uint64_t two = 2;
-        std::memcpy(b.data() + head, &two, sizeof two);
-        std::memcpy(b.data() + sorted, &two, sizeof two);
-        std::stringstream t(b);
-        REQUIRE_THROWS_WITH(load_index(t), Catch::Matchers::ContainsSubstring("out of order"));
-    }
-    corrupt(sorted, 3);          // more split than there are
-    corrupt(head, 1);            // head above sorted
-    corrupt(forward, 2);         // not a flag
-    corrupt(forward + 1, 5);     // query_terms without a forward index
-    corrupt(forward + 1 + 16, 0);  // k_factor 0
     std::stringstream truncated(bytes.substr(0, bytes.size() - 3));
     REQUIRE_THROWS_AS(load_index(truncated), std::runtime_error);
 }
 
-TEST_CASE("SparseIndex file saved on macOS (format 9) loads", "[sparse][compat]") {
+TEST_CASE("InvertedIndex file saved on macOS (format 9) loads", "[sparse][compat]") {
     // 1000 docs, custom ids 100, 103, ..., every ninth deleted (not compacted),
-    // int / string / float metadata columns, a forward index and approximate
-    // settings; results are checked in test_sparse.py
+    // int / string / float metadata columns; results are checked in test_sparse.py
     const std::filesystem::path dir = QANN_TEST_DATA_DIR;
     std::unique_ptr<IndexBase> loaded = load_index(dir / "v9_sparse.qann");
-    auto* index = dynamic_cast<SparseIndex*>(loaded.get());
+    auto* index = dynamic_cast<InvertedIndex*>(loaded.get());
     REQUIRE(index != nullptr);
     REQUIRE(index->custom_ids());
     REQUIRE(index->slots() == 1000);
@@ -324,10 +306,6 @@ TEST_CASE("SparseIndex file saved on macOS (format 9) loads", "[sparse][compat]"
     REQUIRE(index->terms() == 297);
     REQUIRE(index->postings() == 11200);
     REQUIRE(index->metadata_schema().size() == 3);
-    REQUIRE(index->forward_index());
-    REQUIRE((index->query_terms() == 3 && index->list_depth() == 40 && index->k_factor() == 4));
-    index->set_query_terms(0);
-    index->set_list_depth(0);
 
     const Csr q({{{0, 1.0f}, {7919, 1.0f}}});  // the two commonest terms
     const auto before = index->query_batch(q.view(), 10)[0];
@@ -345,122 +323,20 @@ TEST_CASE("SparseIndex file saved on macOS (format 9) loads", "[sparse][compat]"
     REQUIRE(again->slots() == 888);
 }
 
-TEST_CASE("SparseIndex approximate search: exact at full depth, exact distances, and list splits", "[sparse]") {
-    std::mt19937 rng(31);
-    const auto docs = random_rows(3000, 400, 20, false, rng);
-    const auto queries = random_rows(40, 400, 12, false, rng);
-    SparseIndex index(false, true);
-    index.add_batch(Csr(docs).view());
-    const Csr q(queries);
-    const auto exact = index.query_batch(q.view(), 10);
+TEST_CASE("make_index builds an InvertedIndex, usable through SparseIndex", "[sparse]") {
+    IndexOptions opts;
+    opts.custom_ids = true;
+    opts.pruning = false;
+    std::unique_ptr<IndexBase> made = make_index(IndexType::Inverted, 0, opts);
+    auto* inverted = dynamic_cast<InvertedIndex*>(made.get());
+    REQUIRE(inverted != nullptr);
+    REQUIRE(inverted->custom_ids());
+    REQUIRE_FALSE(inverted->pruning());
 
-    // every term, every entry (lists here are shorter than kHead) and every candidate: the exact results
-    index.set_list_depth(SparseIndex::kHead);
-    index.set_k_factor(1000);
-    const auto full = index.query_batch(q.view(), 10);
-    for (size_t i = 0; i < queries.size(); ++i) {
-        REQUIRE(full[i].size() == exact[i].size());
-        for (size_t j = 0; j < full[i].size(); ++j) REQUIRE(full[i][j].distance == exact[i][j].distance);
-    }
-
-    // a real approximation: good recall, and every distance is that vector's exact one
-    index.set_query_terms(4);
-    index.set_list_depth(100);
-    index.set_k_factor(5);
-    const auto approx = index.query_batch(q.view(), 10);
-    double found = 0;
-    for (size_t i = 0; i < queries.size(); ++i) {
-        std::map<size_t, float> exact_dist;
-        for (auto [dist, id] : brute_force(docs, iota_ids(docs.size()), queries[i], [](size_t) { return true; }))
-            exact_dist[id] = dist;
-        std::set<size_t> truth;
-        for (const Neighbor& n : exact[i]) truth.insert(n.index);
-        for (const Neighbor& n : approx[i]) {
-            REQUIRE(std::abs(n.distance - exact_dist.at(n.index)) <= 1e-4f);
-            found += truth.count(n.index);
-        }
-    }
-    REQUIRE(found / (10.0 * queries.size()) > 0.5);
-
-    // removed vectors stay out, through compaction too (the forward index is
-    // rebuilt; a shorter head lets the same depth reach a little further, so
-    // results may change, but distances stay exact)
-    std::vector<int64_t> gone;
-    for (const auto& row : approx)
-        if (!row.empty()) gone.push_back(static_cast<int64_t>(row[0].index));
-    std::sort(gone.begin(), gone.end());
-    gone.erase(std::unique(gone.begin(), gone.end()), gone.end());
-    index.remove(gone);
-    const auto after_remove = index.query_batch(q.view(), 10);
-    index.compact();
-    const auto after_compact = index.query_batch(q.view(), 10);
-    for (size_t i = 0; i < queries.size(); ++i) {
-        std::map<size_t, float> exact_dist;
-        for (auto [dist, id] : brute_force(docs, iota_ids(docs.size()), queries[i], [](size_t) { return true; }))
-            exact_dist[id] = dist;
-        for (const auto* row : {&after_remove[i], &after_compact[i]}) {
-            for (const Neighbor& n : *row) {
-                REQUIRE_FALSE(std::binary_search(gone.begin(), gone.end(), static_cast<int64_t>(n.index)));
-                REQUIRE(std::abs(n.distance - exact_dist.at(n.index)) <= 1e-4f);
-            }
-        }
-    }
-
-    // settings are saved, and the forward index comes back on load
-    std::stringstream s;
-    index.save(s);
-    std::unique_ptr<IndexBase> loaded = load_index(s);
-    auto* back = dynamic_cast<SparseIndex*>(loaded.get());
-    REQUIRE(back->forward_index());
-    REQUIRE((back->query_terms() == 4 && back->list_depth() == 100 && back->k_factor() == 5));
-    const auto reloaded = back->query_batch(q.view(), 10);
-    for (size_t i = 0; i < queries.size(); ++i) {
-        REQUIRE(reloaded[i].size() == after_compact[i].size());
-        for (size_t j = 0; j < reloaded[i].size(); ++j) REQUIRE(reloaded[i][j].index == after_compact[i][j].index);
-    }
-
-    SparseIndex plain;
-    REQUIRE_THROWS_AS(plain.set_list_depth(5), std::invalid_argument);
-    REQUIRE_THROWS_AS(plain.set_query_terms(5), std::invalid_argument);
-    REQUIRE_THROWS_AS(index.set_list_depth(SparseIndex::kHead + 1), std::invalid_argument);
-    REQUIRE_THROWS_AS(index.set_k_factor(0), std::invalid_argument);
-    plain.set_list_depth(0);
-}
-
-TEST_CASE("SparseIndex lists longer than the head stay exact through many small adds", "[sparse]") {
-    // term 0 in every vector, so its list outgrows kHead and is split again
-    // and again as batches arrive; the others are random
-    std::mt19937 rng(37);
-    std::uniform_real_distribution<float> u(0.1f, 2.0f);
-    std::uniform_int_distribution<uint32_t> term(1, 300);
-    const size_t n = 40000;
-    std::vector<Row> docs(n);
-    for (Row& row : docs) {
-        std::map<uint32_t, float> terms{{0, u(rng)}};
-        for (int j = 0; j < 4; ++j) terms[term(rng)] = u(rng);
-        row.assign(terms.begin(), terms.end());
-    }
-    SparseIndex index(false, true);
-    for (size_t first = 0; first < n;) {
-        const size_t batch = 1 + rng() % 700;
-        index.add_batch(Csr(std::vector<Row>(docs.begin() + first, docs.begin() + std::min(n, first + batch))).view());
-        first += batch;
-    }
-    const std::vector<Row> queries = {{{0, 1.0f}}, {{0, 0.5f}, {7, 1.0f}}, {{3, 1.0f}, {150, 2.0f}}};
-    const Csr q(queries);
-    const auto exact = index.query_batch(q.view(), 10);
-    for (size_t i = 0; i < queries.size(); ++i)
-        require_top_k(exact[i], brute_force(docs, iota_ids(n), queries[i], [](size_t) { return true; }), 10, 1e-4f);
-
-    // the heaviest entries of term 0 are in its head: depth 10 finds the true top 10 for {0: 1}
-    index.set_list_depth(10);
-    index.set_k_factor(1);
-    const auto top = index.query_batch(Csr({{{0, 1.0f}}}).view(), 10)[0];
-    REQUIRE(top.size() == 10);
-    for (size_t j = 0; j < 10; ++j) REQUIRE(top[j].distance == exact[0][j].distance);
-
-    // the loader checks every list's order
-    std::stringstream s;
-    index.save(s);
-    REQUIRE_NOTHROW(load_index(s));
+    SparseIndex& sparse = *inverted;
+    const std::vector<int64_t> ids = {5, 9};
+    sparse.add_batch(Csr({{{1, 1.0f}}, {{1, 2.0f}, {2, 1.0f}}}).view(), ids.data());
+    const auto r = sparse.query_batch(Csr({{{1, 1.0f}}}).view(), 5)[0];
+    REQUIRE(r.size() == 2);
+    REQUIRE((r[0].index == 9 && r[0].distance == -2.0f));
 }

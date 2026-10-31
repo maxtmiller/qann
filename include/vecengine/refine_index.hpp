@@ -26,19 +26,19 @@ using std::span;
 //
 // User ids live here; the base gets plain slots, so base slot i and this
 // index's slot i are always the same vector.
-class RefineIndex : public Index {
+class RefineIndex : public DenseIndex {
 public:
     // base must have no slots yet, ids equal to its slots (no custom ids, never compacted), and not already be wrapped by
     // another RefineIndex, so its slots line up with this index's raw storage.
     // k_factor >= 1. custom_ids makes add_batch() take user ids. Marks base as
-    // wrapped (see Index::wrapped()).
-    explicit RefineIndex(Index& base, size_t k_factor = 10, bool custom_ids = false);
+    // wrapped (see IndexBase::wrapped()).
+    explicit RefineIndex(DenseIndex& base, size_t k_factor = 10, bool custom_ids = false);
 
     // Clears the base's wrapped mark, so a caller-owned base can be used on
     // its own again.
     ~RefineIndex() override;
 
-    // Index overrides; see Index for the contract of each. Adds go to the base
+    // DenseIndex overrides; see DenseIndex for the contract of each. Adds go to the base
     // too (without ids), and remove() deletes the same slots in the base. The
     // metric is the base's. query_batch fetches every query's candidates with
     // one base query_batch call (so IVFIndex's batched coarse search applies),
@@ -65,8 +65,8 @@ public:
     bool ids_are_slots() const noexcept override { return id_map_.ids_are_slots(); }
 
     // The wrapped approximate index, e.g. to tune nprobe on a loaded index.
-    Index& base() noexcept { return base_; }
-    const Index& base() const noexcept { return base_; }
+    DenseIndex& base() noexcept { return base_; }
+    const DenseIndex& base() const noexcept { return base_; }
 
     // Candidates fetched from the base per result (k * k_factor).
     // set_k_factor throws std::invalid_argument when k_factor is 0.
@@ -74,7 +74,7 @@ public:
     void set_k_factor(size_t k_factor);
 
 private:
-    // Index implementations: vectors already prepared for the metric, and
+    // DenseIndex implementations: vectors already prepared for the metric, and
     // passed to the base's *_impl so they are prepared only once.
     void add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) override;
     vector<Neighbor> query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const override;
@@ -101,13 +101,13 @@ private:
 
     // Used by load_body(): takes ownership of an already filled base and skips
     // the public constructor's empty-base check.
-    RefineIndex(std::unique_ptr<Index> base, size_t k_factor)
-        : Index(base->metric()), owned_base_(std::move(base)), base_(*owned_base_), k_factor_(k_factor) {
+    RefineIndex(std::unique_ptr<DenseIndex> base, size_t k_factor)
+        : DenseIndex(base->metric()), owned_base_(std::move(base)), base_(*owned_base_), k_factor_(k_factor) {
         base_.wrapped_ = true;
     }
 
-    std::unique_ptr<Index> owned_base_; // set on file load; nullptr when wrapping a caller-owned base.
-    Index& base_; // approximate first-stage index
+    std::unique_ptr<DenseIndex> owned_base_; // set on file load; nullptr when wrapping a caller-owned base.
+    DenseIndex& base_; // approximate first-stage index
     size_t k_factor_; // candidates fetched per result: k * k_factor
     vector<float> data_; // raw vectors, row-major: id_map_.slots() * dim
     detail::IdMap id_map_;

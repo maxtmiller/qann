@@ -231,7 +231,7 @@ TEST_CASE("HNSW: settings are validated", "[hnsw]") {
     REQUIRE(hnsw.ef_search() == 64);
 }
 
-static std::unique_ptr<Index> hnsw_roundtrip(const Index& index) {
+static std::unique_ptr<DenseIndex> hnsw_roundtrip(const DenseIndex& index) {
     std::stringstream s;
     index.save(s);
     return load_dense(s);
@@ -323,7 +323,7 @@ TEST_CASE("HNSW: make_index builds one with the given options", "[hnsw]") {
     opts.hnsw_m = 8;
     opts.ef_construction = 40;
     opts.ef_search = 20;
-    auto index = make_index(IndexType::HNSW, 12, opts);
+    auto index = make_dense(IndexType::HNSW, 12, opts);
     auto* hnsw = dynamic_cast<HNSWIndex*>(index.get());
     REQUIRE(hnsw != nullptr);
     REQUIRE(hnsw->dim() == 12);
@@ -550,10 +550,10 @@ TEST_CASE("HNSW SQ: enable_sq and train are checked", "[hnsw][sq]") {
 
     IndexOptions opts;
     opts.hnsw_sq_bits = 4;
-    auto made = make_index(IndexType::HNSW, 8, opts);
+    auto made = make_dense(IndexType::HNSW, 8, opts);
     REQUIRE(dynamic_cast<HNSWIndex&>(*made).sq_bits() == 4);
     opts.hnsw_sq_bits = 5;
-    REQUIRE_THROWS_AS(make_index(IndexType::HNSW, 8, opts), std::invalid_argument);
+    REQUIRE_THROWS_AS(make_dense(IndexType::HNSW, 8, opts), std::invalid_argument);
 }
 
 TEST_CASE("HNSW SQ: save/load keeps codes, ranges and an untrained index", "[hnsw][sq][serialize]") {

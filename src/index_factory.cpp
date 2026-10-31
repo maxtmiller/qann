@@ -3,7 +3,7 @@
 #include "vecengine/ivf_index.hpp"
 #include "vecengine/hnsw_index.hpp"
 #include "vecengine/refine_index.hpp"
-#include "vecengine/sparse_index.hpp"
+#include "vecengine/inverted_index.hpp"
 #include "serialize.hpp"
 
 #include <fstream>
@@ -13,7 +13,7 @@
 
 namespace vecengine {
 
-std::unique_ptr<Index> make_index(IndexType type, size_t dim, const IndexOptions& opts) {
+std::unique_ptr<IndexBase> make_index(IndexType type, size_t dim, const IndexOptions& opts) {
     switch (type) {
         case IndexType::Flat:
             return std::make_unique<FlatIndex>(dim, opts.capacity, opts.custom_ids, opts.metric);
@@ -30,6 +30,11 @@ std::unique_ptr<Index> make_index(IndexType type, size_t dim, const IndexOptions
             if (opts.hnsw_sq_bits) idx->enable_sq(opts.hnsw_sq_bits);
             return idx;
         }
+        case IndexType::Inverted: {
+            auto idx = std::make_unique<InvertedIndex>(opts.custom_ids);
+            idx->set_pruning(opts.pruning);
+            return idx;
+        }
     }
     throw std::invalid_argument("unknown IndexType");
 }
@@ -41,7 +46,7 @@ std::unique_ptr<IndexBase> load_index(std::istream& in) {
         case detail::IndexKind::IVF:    return IVFIndex::load_body(in, header.version);
         case detail::IndexKind::Refine: return RefineIndex::load_body(in, header.version);
         case detail::IndexKind::HNSW:   return HNSWIndex::load_body(in, header.version);
-        case detail::IndexKind::Sparse: return SparseIndex::load_body(in, header.version);
+        case detail::IndexKind::Inverted: return InvertedIndex::load_body(in, header.version);
     }
     throw std::runtime_error("unknown index kind");
 }
