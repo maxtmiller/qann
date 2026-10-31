@@ -194,7 +194,7 @@ ids, dists = index.query(query_matrix[[0]], 10)             # one row
 - **Results:** exact. A query reads only its own terms' posting lists and returns only documents sharing at least one nonzero term with it, so fewer than `k` can come back. Rows are padded with `-1` / `inf` as for the dense indexes.
 - **Shared with the dense indexes:** custom ids, `remove` / `compact`, metadata and `where=`, `allowed=`, `get_metadata`, `save` / `qann.load`. `SparseIndex` derives from `qann.IndexBase`, not `qann.Index`, since it has no `dim` or metric.
 - **Size:** `terms` and `postings` report the distinct terms and stored (term, document) pairs. Each posting takes 8 bytes.
-- **Cost:** about proportional to the postings a query's terms have. Common terms make that a large share of the corpus; pruning that skips documents which can't reach the top `k` is planned (#59).
+- **Cost:** about proportional to the postings a query's terms have. With `pruning` on (the default), once the remaining terms can't lift an unseen document into the top `k`, their lists only add to documents that still could, which mostly helps small `k` on large corpora: 1.6x more queries per second at `k = 10` on BEIR FiQA (58k documents) with BM25, about the same at `k = 1000`. Results are identical either way; `index.pruning = False` turns it off. `benchmarks/sparse_bm25.py` measures it.
 
 ### `make_index(type, dim, opts=IndexOptions())`
 

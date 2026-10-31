@@ -221,3 +221,22 @@ def test_sparse_loads_file_saved_on_macos():
     assert index.size() == 888
     again, _ = index.batch_query(queries, 10, where="price < 30 AND tag != 't0'")
     np.testing.assert_array_equal(again, ids)
+
+
+def test_sparse_pruning_switch(tmp_path):
+    rng = np.random.default_rng(12)
+    docs = _random_csr(rng, 2000, 300, 20)
+    queries = _random_csr(rng, 30, 300, 6)
+    index = qann.SparseIndex()
+    index.add(docs)
+    assert index.pruning
+    pruned = index.batch_query(queries, 10)
+    index.pruning = False
+    full = index.batch_query(queries, 10)
+    np.testing.assert_array_equal(pruned[1], full[1])
+    scores = (queries @ docs.T).toarray()
+    for i in range(30):
+        assert np.array_equal(-scores[i][pruned[0][i]], pruned[1][i])
+
+    index.save(tmp_path / "p.qann")
+    assert qann.load(tmp_path / "p.qann").pruning    # not saved: loads with the default

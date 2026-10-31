@@ -9,6 +9,7 @@
 #include <memory>
 #include <span>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace vecengine {
@@ -34,7 +35,8 @@ struct SparseRows {
 // caller. Scores by inner product: a result's distance is -(q . d), so the
 // largest dot product comes first, as with Metric::InnerProduct. A query
 // reads only its own terms' posting lists, and returns only vectors that
-// share at least one nonzero term with it.
+// share at least one nonzero term with it. With pruning on (the default),
+// queries skip vectors that can't reach the top k; results are the same.
 class SparseIndex : public IndexBase {
 public:
     // custom_ids makes add_batch() take user ids.
@@ -67,6 +69,12 @@ public:
     bool custom_ids() const noexcept override { return id_map_.custom_ids(); }
     size_t size() const noexcept override { return id_map_.live(); }
 
+    // Whether queries prune (default on; see search_one). Off scores every
+    // vector in the query terms' lists; results are the same either way, up
+    // to which of several vectors tied at the k-th distance is kept. Not saved.
+    bool pruning() const noexcept { return pruning_; }
+    void set_pruning(bool on) noexcept { pruning_ = on; }
+
     // Distinct terms with a posting list, and stored (term, vector) pairs,
     // including those of deleted vectors not yet compacted away.
     size_t terms() const noexcept { return lists_.size(); }
@@ -82,14 +90,36 @@ private:
         float weight;
     };
 
+    // A term's postings, in increasing slot order, and the extremes of their
+    // weights, which bound what the term can add to a score.
+    struct List {
+        vector<Posting> postings;
+        float max_weight = 0;
+        float min_weight = 0;
+
+        // Sets max_weight and min_weight from postings.
+        void bound();
+    };
+
     const detail::IdMap& id_map() const noexcept override { return id_map_; }
+
+    using Terms = vector<std::pair<uint32_t, float>>;
 
     // query_batch() for every overload; filter is nullptr for an unfiltered query.
     vector<vector<Neighbor>> search(const SparseRows& queries, size_t k, const detail::SlotFilter* filter) const;
 
-    // The posting lists of each term; a list holds its vectors in increasing slot order.
-    std::unordered_map<uint32_t, vector<Posting>> lists_;
+    // One query (terms canonical, k >= 1), term at a time, its lists taken
+    // from the largest possible contribution down. With pruning_, once the
+    // lists left can't lift an unseen vector into the top k, they only add to
+    // the vectors that can still get there (MaxScore's term-at-a-time form,
+    // Turtle and Flood, 1995), found by searching the lists instead of
+    // reading them. Both ways sum each score in the same order, so they
+    // return the same distances.
+    vector<Neighbor> search_one(const Terms& terms, size_t k, const detail::SlotFilter* filter) const;
+
+    std::unordered_map<uint32_t, List> lists_;
     detail::IdMap id_map_;
+    bool pruning_ = true;
 };
 
 } // namespace vecengine

@@ -67,7 +67,7 @@ std::vector<std::pair<float, size_t>> brute_force(const std::vector<Row>& docs, 
         if (!keep(d)) continue;
         float score = 0;
         bool shared = false;
-        for (auto [t, w] : q) {  // query terms in increasing order, as the index sums them
+        for (auto [t, w] : q) {
             for (auto [dt, dw] : docs[d])
                 if (dt == t) {
                     score += w * dw;
@@ -120,6 +120,52 @@ TEST_CASE("SparseIndex matches brute-force dot products (fuzz)", "[sparse]") {
             for (size_t i = 0; i < queries.size(); ++i)
                 require_top_k(results[i], brute_force(docs, iota_ids(docs.size()), queries[i], [](size_t) { return true; }), k,
                               exact ? 0.0f : 1e-4f);
+        }
+    }
+}
+
+TEST_CASE("SparseIndex: MaxScore pruning matches full scoring, with negative weights and filters (fuzz)", "[sparse]") {
+    std::mt19937 rng(23);
+    std::uniform_int_distribution<int> coin(0, 3);
+    for (int trial = 0; trial < 4; ++trial) {
+        const bool negative = trial % 2 == 1;  // some weights below zero, in docs and queries
+        auto docs = random_rows(3000, 2000, 30, trial < 2, rng);
+        auto queries = random_rows(60, 2000, 8, trial < 2, rng);
+        // like IDF, rarer (higher) terms weigh more, so lists' bounds differ and pruning has room
+        for (Row& row : docs)
+            for (auto& [t, v] : row) v *= trial < 2 ? (t < 40 ? 1.0f : 6.0f) : 6.0f / (1.0f + float(t) / 40.0f);
+        if (negative) {
+            for (auto* rows : {&docs, &queries})
+                for (Row& row : *rows)
+                    for (auto& [t, v] : row)
+                        if (coin(rng) == 0) v = -v;
+        }
+        SparseIndex index;
+        index.add_batch(Csr(docs).view());
+        std::vector<int64_t> gone;
+        for (int64_t i = 0; i < 3000; i += 13) gone.push_back(i);
+        index.remove(gone);
+        std::vector<int64_t> allowed;
+        for (int64_t i = 0; i < 3000; i += 2) allowed.push_back(i);
+
+        const float tolerance = trial < 2 ? 0.0f : 1e-4f;
+        for (size_t k : {1, 5, 100}) {
+            CAPTURE(trial, k);
+            const Csr q(queries);
+            const auto plain = index.query_batch(q.view(), k);
+            const auto filtered = index.query_batch(q.view(), k, allowed);
+            index.set_pruning(false);
+            const auto full = index.query_batch(q.view(), k);
+            index.set_pruning(true);
+            for (size_t i = 0; i < queries.size(); ++i) {
+                require_top_k(plain[i], brute_force(docs, iota_ids(3000), queries[i], [](size_t d) { return d % 13 != 0; }),
+                              k, tolerance);
+                require_top_k(filtered[i],
+                              brute_force(docs, iota_ids(3000), queries[i], [](size_t d) { return d % 13 != 0 && d % 2 == 0; }),
+                              k, tolerance);
+                REQUIRE(plain[i].size() == full[i].size());
+                for (size_t j = 0; j < full[i].size(); ++j) REQUIRE(std::abs(plain[i][j].distance - full[i][j].distance) <= tolerance);
+            }
         }
     }
 }
