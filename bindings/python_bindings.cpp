@@ -24,6 +24,7 @@
 #include "vecengine/pq.hpp"
 #include "vecengine/refine_index.hpp"
 #include "vecengine/inverted_index.hpp"
+#include "vecengine/sparse_approx_index.hpp"
 #include "vecengine/index_factory.hpp"
 #include "vecengine/threads.hpp"
 
@@ -867,11 +868,45 @@ NB_MODULE(qann, m) {
                      [](const vecengine::InvertedIndex& self) { return read_locked(self, [&] { return self.postings(); }); },
                      "Stored (term, vector) pairs, including deleted vectors' until compact()");
 
+    nb::class_<vecengine::SparseApproxIndex, vecengine::SparseIndex>(
+        m, "SparseApproxIndex",
+        "Approximate search over sparse vectors (SPLADE): the query's heaviest terms and each list's heaviest "
+        "entries find candidates, re-scored exactly from a forward index")
+        .def("__init__",
+             [](vecengine::SparseApproxIndex* self, bool custom_ids, std::size_t query_terms, std::size_t list_depth,
+                std::size_t k_factor) {
+                 new (self) vecengine::SparseApproxIndex(custom_ids, query_terms, list_depth, k_factor);
+             },
+             nb::kw_only(), nb::arg("custom_ids") = false, nb::arg("query_terms") = 10, nb::arg("list_depth") = 10000,
+             nb::arg("k_factor") = 10,
+             "An empty SparseApproxIndex. custom_ids=True makes add() take ids. The search settings are the "
+             "properties of the same names. It also keeps each vector's own terms, doubling the memory")
+        .def_prop_rw("query_terms",
+                     [](const vecengine::SparseApproxIndex& self) { return read_locked(self, [&] { return self.query_terms(); }); },
+                     [](vecengine::SparseApproxIndex& self, std::size_t n) { write_locked(self, [&] { self.set_query_terms(n); }); },
+                     "How many of the query's largest values to use (0: all; default 10). Saved with the index")
+        .def_prop_rw("list_depth",
+                     [](const vecengine::SparseApproxIndex& self) { return read_locked(self, [&] { return self.list_depth(); }); },
+                     [](vecengine::SparseApproxIndex& self, std::size_t n) { write_locked(self, [&] { self.set_list_depth(n); }); },
+                     "How many of each query term's heaviest list entries to read, plus any added since the list "
+                     "was last sorted (0: all; default 10000). Saved with the index")
+        .def_prop_rw("k_factor",
+                     [](const vecengine::SparseApproxIndex& self) { return read_locked(self, [&] { return self.k_factor(); }); },
+                     [](vecengine::SparseApproxIndex& self, std::size_t n) { write_locked(self, [&] { self.set_k_factor(n); }); },
+                     "The k * k_factor best partial scores are re-scored exactly with the whole query (default 10; "
+                     "at least 1). Saved with the index")
+        .def_prop_ro("terms", [](const vecengine::SparseApproxIndex& self) { return read_locked(self, [&] { return self.terms(); }); },
+                     "Distinct terms with a posting list")
+        .def_prop_ro("postings",
+                     [](const vecengine::SparseApproxIndex& self) { return read_locked(self, [&] { return self.postings(); }); },
+                     "Stored (term, vector) pairs, including deleted vectors' until compact()");
+
     nb::enum_<vecengine::IndexType>(m, "IndexType")
         .value("Flat", vecengine::IndexType::Flat)
         .value("IVF", vecengine::IndexType::IVF)
         .value("HNSW", vecengine::IndexType::HNSW)
-        .value("Inverted", vecengine::IndexType::Inverted);
+        .value("Inverted", vecengine::IndexType::Inverted)
+        .value("SparseApprox", vecengine::IndexType::SparseApprox);
 
     nb::class_<vecengine::IndexOptions>(m, "IndexOptions")
         .def(nb::init<>())
@@ -887,6 +922,9 @@ NB_MODULE(qann, m) {
         .def_rw("ef_search", &vecengine::IndexOptions::ef_search)
         .def_rw("hnsw_sq_bits", &vecengine::IndexOptions::hnsw_sq_bits)
         .def_rw("pruning", &vecengine::IndexOptions::pruning)
+        .def_rw("query_terms", &vecengine::IndexOptions::query_terms)
+        .def_rw("list_depth", &vecengine::IndexOptions::list_depth)
+        .def_rw("k_factor", &vecengine::IndexOptions::k_factor)
         .def_rw("custom_ids", &vecengine::IndexOptions::custom_ids)
         .def_rw("metric", &vecengine::IndexOptions::metric);
 
@@ -908,10 +946,11 @@ NB_MODULE(qann, m) {
         .def("centroids_per_subspace", &vecengine::PQCodebook::centroids_per_subspace);
 
     m.def("make_index", &vecengine::make_index, nb::arg("type"), nb::arg("dim"), nb::arg("opts") = vecengine::IndexOptions{},
-          "Construct a FlatIndex, IVFIndex, HNSWIndex or InvertedIndex from an IndexType and IndexOptions "
-          "(dim is unused for InvertedIndex)");
+          "Construct a FlatIndex, IVFIndex, HNSWIndex, InvertedIndex or SparseApproxIndex from an IndexType and "
+          "IndexOptions (dim is unused for the sparse ones)");
 
     m.def("load", nb::overload_cast<const std::filesystem::path&>(&vecengine::load_index), nb::arg("path"),
           nb::call_guard<nb::gil_scoped_release>(),
-          "Load an index saved with save(path); returns a FlatIndex, IVFIndex, HNSWIndex, RefineIndex or InvertedIndex");
+          "Load an index saved with save(path); returns a FlatIndex, IVFIndex, HNSWIndex, RefineIndex, InvertedIndex or "
+          "SparseApproxIndex");
 }

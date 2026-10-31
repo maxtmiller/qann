@@ -4,6 +4,7 @@
 #include "vecengine/hnsw_index.hpp"
 #include "vecengine/refine_index.hpp"
 #include "vecengine/inverted_index.hpp"
+#include "vecengine/sparse_approx_index.hpp"
 #include "serialize.hpp"
 
 #include <fstream>
@@ -35,6 +36,8 @@ std::unique_ptr<IndexBase> make_index(IndexType type, size_t dim, const IndexOpt
             idx->set_pruning(opts.pruning);
             return idx;
         }
+        case IndexType::SparseApprox:
+            return std::make_unique<SparseApproxIndex>(opts.custom_ids, opts.query_terms, opts.list_depth, opts.k_factor);
     }
     throw std::invalid_argument("unknown IndexType");
 }
@@ -47,6 +50,7 @@ std::unique_ptr<IndexBase> load_index(std::istream& in) {
         case detail::IndexKind::Refine: return RefineIndex::load_body(in, header.version);
         case detail::IndexKind::HNSW:   return HNSWIndex::load_body(in, header.version);
         case detail::IndexKind::Inverted: return InvertedIndex::load_body(in, header.version);
+        case detail::IndexKind::SparseApprox: return SparseApproxIndex::load_body(in, header.version);
     }
     throw std::runtime_error("unknown index kind");
 }

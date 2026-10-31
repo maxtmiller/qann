@@ -240,3 +240,64 @@ def test_sparse_pruning_switch(tmp_path):
 
     index.save(tmp_path / "p.qann")
     assert qann.load(tmp_path / "p.qann").pruning    # not saved: loads with the default
+
+
+def test_sparse_approx_index(tmp_path):
+    rng = np.random.default_rng(21)
+    docs = _random_csr(rng, 3000, 400, 20).astype(np.float32)
+    docs.data *= rng.random(docs.nnz).astype(np.float32)    # spread weights, as learned sparse vectors have
+    queries = _random_csr(rng, 50, 400, 12).astype(np.float32)
+    exact = qann.InvertedIndex()
+    exact.add(docs)
+    approx = qann.SparseApproxIndex()
+    assert isinstance(approx, qann.SparseIndex) and not isinstance(approx, qann.DenseIndex)
+    assert (approx.query_terms, approx.list_depth, approx.k_factor) == (10, 10000, 10)
+    approx.add(docs)
+    assert approx.postings == exact.postings
+
+    # every term, entry and candidate: InvertedIndex's distances, bit for bit
+    approx.query_terms, approx.list_depth, approx.k_factor = 0, 0, 1000
+    truth_ids, truth = exact.batch_query(queries, 10)
+    np.testing.assert_array_equal(approx.batch_query(queries, 10)[1], truth)
+
+    # an approximation: good recall, and each distance is the exact one
+    approx.query_terms, approx.list_depth, approx.k_factor = 4, 200, 5
+    ids, dists = approx.batch_query(queries, 10)
+    assert np.mean([len(set(a) & set(b)) / 10 for a, b in zip(ids, truth_ids)]) > 0.5
+    all_ids, all_dists = exact.batch_query(queries, 3000)
+    for i in range(50):
+        exact_of = dict(zip(all_ids[i].tolist(), all_dists[i].tolist()))
+        got = ids[i][ids[i] >= 0]
+        assert [exact_of[j] for j in got.tolist()] == dists[i][: len(got)].tolist()
+    np.testing.assert_array_equal(approx.query(queries[[3]], 10)[0], ids[3][ids[3] >= 0])
+
+    approx.save(tmp_path / "approx.qann")
+    loaded = qann.load(tmp_path / "approx.qann")
+    assert type(loaded) is qann.SparseApproxIndex
+    assert (loaded.query_terms, loaded.list_depth, loaded.k_factor) == (4, 200, 5)
+    np.testing.assert_array_equal(loaded.batch_query(queries, 10)[0], ids)
+    with pytest.raises(ValueError, match="at least 1"):
+        approx.k_factor = 0
+    with pytest.raises(ValueError, match="at least 1"):
+        qann.SparseApproxIndex(k_factor=0)
+
+    opts = qann.IndexOptions()
+    opts.query_terms, opts.list_depth, opts.k_factor = 3, 50, 7
+    made = qann.make_index(qann.IndexType.SparseApprox, 0, opts)
+    assert type(made) is qann.SparseApproxIndex and (made.query_terms, made.list_depth, made.k_factor) == (3, 50, 7)
+
+
+def test_sparse_approx_loads_file_saved_on_macos():
+    # Saved on macOS (format version 9): 1500 docs, custom ids 50, 52, ...,
+    # added in two parts, every eleventh deleted (not compacted), a group
+    # column, query_terms 3, list_depth 40, k_factor 4.
+    index = qann.load(DATA / "v9_sparse_approx.qann")
+    assert type(index) is qann.SparseApproxIndex
+    assert index.size() == 1363 and index.terms == 300 and index.postings == 16999
+    assert (index.query_terms, index.list_depth, index.k_factor) == (3, 40, 4)
+    queries = sp.load_npz(DATA / "v9_sparse_approx_queries.npz")
+    ids, dists = index.batch_query(queries, 10, where="group != 1")
+    np.testing.assert_array_equal(ids, np.load(DATA / "v9_sparse_approx_ids.npy"))
+    np.testing.assert_allclose(dists, np.load(DATA / "v9_sparse_approx_dists.npy"), rtol=1e-5, atol=1e-5)
+    index.compact()
+    assert index.size() == 1363

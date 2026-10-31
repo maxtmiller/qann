@@ -36,8 +36,8 @@ def test_index_class_layout(tmp_path, data):
     for index in indexes:
         assert isinstance(index, qann.DenseIndex) and isinstance(index, qann.IndexBase)
         assert not isinstance(index, qann.SparseIndex)
-    inverted = qann.InvertedIndex()
-    assert isinstance(inverted, qann.SparseIndex) and not isinstance(inverted, qann.DenseIndex)
+    for index in (qann.InvertedIndex(), qann.SparseApproxIndex()):
+        assert isinstance(index, qann.SparseIndex) and not isinstance(index, qann.DenseIndex)
 
     # the methods inherited from IndexBase still work through a subclass
     flat.add(data[:3], metadata={"tag": ["a", "b", "c"]})
