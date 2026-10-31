@@ -185,6 +185,12 @@ public:
     // Conditions shared by Or branches are factored out first (see factor()).
     vector<uint64_t> evaluate(const Expr& where, size_t slots) const;
 
+    // The values of the given rows: a column per name in names (every column,
+    // in creation order, when it is nullptr), each with one value per slot and
+    // valid filled in for every slot (a null's value is 0 or ""). Throws
+    // std::invalid_argument on a name the store doesn't have or that repeats.
+    Metadata get(const vector<uint32_t>& slots, const vector<std::string>* names = nullptr) const;
+
     // Each column's name and type, in creation order.
     vector<std::pair<std::string, ColumnType>> schema() const;
 

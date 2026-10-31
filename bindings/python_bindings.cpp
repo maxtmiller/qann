@@ -270,6 +270,39 @@ static void index_update_metadata(vecengine::Index& self, IdsArg ids, nb::dict m
     });
 }
 
+// Read metadata back as {name: values}: int and float columns as NumPy masked
+// arrays (int64 / float64, masked where null), str columns as lists with None
+// for null. columns picks and orders the columns; None means all of them.
+static nb::dict index_get_metadata(const vecengine::Index& self, IdsArg ids,
+                                   std::optional<std::vector<std::string>> columns) {
+    IdVector id_array = as_ids(ids);
+    vecengine::Metadata md = read_locked(self, [&] {
+        return self.get_metadata(std::span<const int64_t>(id_array.data(), id_array.shape(0)),
+                                 columns ? &*columns : nullptr);
+    });
+    nb::module_ ma = nb::module_::import_("numpy.ma");
+    nb::dict out;
+    for (vecengine::MetadataColumn& col : md) {
+        const std::size_t n = col.valid.size();
+        nb::object value;
+        if (auto* strings = std::get_if<std::vector<std::string>>(&col.values)) {
+            nb::list list;
+            for (std::size_t i = 0; i < n; ++i)
+                list.append(col.valid[i] ? nb::object(nb::str((*strings)[i].c_str(), (*strings)[i].size())) : nb::none());
+            value = list;
+        } else {
+            nb::object data = std::holds_alternative<std::vector<int64_t>>(col.values)
+                                  ? nb::cast(to_numpy(std::get<std::vector<int64_t>>(std::move(col.values)), {n}))
+                                  : nb::cast(to_numpy(std::get<std::vector<double>>(std::move(col.values)), {n}));
+            std::vector<uint8_t> mask(n);
+            for (std::size_t i = 0; i < n; ++i) mask[i] = !col.valid[i];
+            value = ma.attr("MaskedArray")(data, nb::arg("mask") = to_numpy(std::move(mask), {n}));
+        }
+        out[nb::str(col.name.c_str(), col.name.size())] = value;
+    }
+    return out;
+}
+
 // Add a metadata column; type is 'int', 'float' or 'str', as metadata_schema
 // reports them. Either fill (one value for every vector) or ids and values.
 static void index_add_metadata_column(vecengine::Index& self, std::string name, const std::string& type,
@@ -540,6 +573,11 @@ NB_MODULE(qann, m) {
              "Overwrite metadata in place: metadata is {name: one value per id}, None sets a value to null, and "
              "columns left out keep their values. Unknown, deleted or repeated ids, and columns the index "
              "doesn't have (see add_metadata_column), raise ValueError; a failed call changes nothing")
+        .def("get_metadata", &index_get_metadata, nb::arg("ids"), nb::arg("columns").none() = nb::none(),
+             "Read metadata back: {name: one value per id} for the columns named (all of them, in the order "
+             "they were added, when columns is None). int and float columns are numpy.ma masked arrays (int64 / "
+             "float64) masked where a value is null; str columns are lists with None for null. Unknown, deleted "
+             "or repeated ids, and columns the index doesn't have or named twice, raise ValueError")
         .def("add_metadata_column", &index_add_metadata_column, nb::arg("name"), nb::arg("type"), nb::kw_only(),
              nb::arg("default").none() = nb::none(), nb::arg("ids").none() = nb::none(),
              nb::arg("values").none() = nb::none(),

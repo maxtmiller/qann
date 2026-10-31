@@ -53,6 +53,10 @@ void Index::update_metadata(span<const int64_t> ids, const Metadata& metadata) {
     metadata_.update(slots, metadata);
 }
 
+Metadata Index::get_metadata(span<const int64_t> ids, const vector<std::string>* columns) const {
+    return metadata_.get(id_map().slots_of(ids), columns);
+}
+
 void Index::add_metadata_column(std::string name, ColumnType type, std::optional<Expr::Value> value) {
     metadata_.add_column(std::move(name), type, slots(), value);
 }

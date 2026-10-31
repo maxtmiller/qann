@@ -122,6 +122,14 @@ public:
     // std::invalid_argument if the index has no such column.
     void drop_metadata_column(const std::string& name);
 
+    // The metadata of the vectors with these ids: the columns named in
+    // columns, in that order, or every column in creation order when it is
+    // nullptr. Each column has one value per id and valid set for every id
+    // (0 where the vector's value is null). Throws std::invalid_argument on an
+    // unknown, deleted or repeated id, or a column the index doesn't have or
+    // that is named twice.
+    Metadata get_metadata(span<const int64_t> ids, const vector<std::string>* columns = nullptr) const;
+
     // Each metadata column's name and type, in the order they were created.
     vector<std::pair<std::string, ColumnType>> metadata_schema() const { return metadata_.schema(); }
 
