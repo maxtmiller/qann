@@ -86,9 +86,9 @@ static NumpyArray<float> batch_cosine(FloatMatrix a, FloatMatrix b) {
 // base is also reachable from Python, e.g. ivf.add() on a wrapped IVFIndex).
 // Always taken outermost index first, so lock order is consistent.
 template <class Lock>
-static std::vector<Lock> lock_chain(const vecengine::Index& index) {
+static std::vector<Lock> lock_chain(const vecengine::IndexBase& index) {
     std::vector<Lock> locks;
-    for (const vecengine::Index* p = &index; p != nullptr;) {
+    for (const vecengine::IndexBase* p = &index; p != nullptr;) {
         locks.emplace_back(p->mutex());
         auto* refine = dynamic_cast<const vecengine::RefineIndex*>(p);
         p = refine ? &refine->base() : nullptr;
@@ -101,14 +101,14 @@ static std::vector<Lock> lock_chain(const vecengine::Index& index) {
 // waiting for the lock never holds the GIL that the lock holder needs back.
 // f must not touch Python objects; build NumPy results after it returns.
 template <class F>
-static auto read_locked(const vecengine::Index& index, F&& f) {
+static auto read_locked(const vecengine::IndexBase& index, F&& f) {
     nb::gil_scoped_release release;
     auto locks = lock_chain<std::shared_lock<std::shared_mutex>>(index);
     return f();
 }
 
 template <class F>
-static auto write_locked(const vecengine::Index& index, F&& f) {
+static auto write_locked(const vecengine::IndexBase& index, F&& f) {
     nb::gil_scoped_release release;
     auto locks = lock_chain<std::unique_lock<std::shared_mutex>>(index);
     return f();
@@ -130,7 +130,7 @@ static IdVector as_ids(nb::handle obj) {
 // Changing a RefineIndex's base directly would misalign the two (an add would
 // give the base a vector the RefineIndex has no copy of), so it is refused.
 // Called with the index locked, since a RefineIndex sets the flag under it.
-static void refuse_if_wrapped(const vecengine::Index& self, const char* what) {
+static void refuse_if_wrapped(const vecengine::IndexBase& self, const char* what) {
     if (self.wrapped())
         throw std::invalid_argument(std::string("cannot ") + what + " on the base of a RefineIndex; " + what +
                                     " through the RefineIndex instead");
@@ -261,7 +261,7 @@ static NumpyArray<int64_t> index_add(vecengine::Index &self, FloatMatrix data, s
 }
 
 // Overwrite metadata columns of the vectors with these ids.
-static void index_update_metadata(vecengine::Index& self, IdsArg ids, nb::dict metadata) {
+static void index_update_metadata(vecengine::IndexBase& self, IdsArg ids, nb::dict metadata) {
     IdVector id_array = as_ids(ids);
     const vecengine::Metadata md = as_metadata(metadata, id_array.shape(0), "id");
     write_locked(self, [&] {
@@ -273,7 +273,7 @@ static void index_update_metadata(vecengine::Index& self, IdsArg ids, nb::dict m
 // Read metadata back as {name: values}: int and float columns as NumPy masked
 // arrays (int64 / float64, masked where null), str columns as lists with None
 // for null. columns picks and orders the columns; None means all of them.
-static nb::dict index_get_metadata(const vecengine::Index& self, IdsArg ids,
+static nb::dict index_get_metadata(const vecengine::IndexBase& self, IdsArg ids,
                                    std::optional<std::vector<std::string>> columns) {
     IdVector id_array = as_ids(ids);
     vecengine::Metadata md = read_locked(self, [&] {
@@ -305,7 +305,7 @@ static nb::dict index_get_metadata(const vecengine::Index& self, IdsArg ids,
 
 // Add a metadata column; type is 'int', 'float' or 'str', as metadata_schema
 // reports them. Either fill (one value for every vector) or ids and values.
-static void index_add_metadata_column(vecengine::Index& self, std::string name, const std::string& type,
+static void index_add_metadata_column(vecengine::IndexBase& self, std::string name, const std::string& type,
                                       std::optional<vecengine::Expr::Value> fill, std::optional<IdsArg> ids,
                                       nb::object values) {
     vecengine::ColumnType t;
@@ -332,7 +332,7 @@ static void index_add_metadata_column(vecengine::Index& self, std::string name, 
 }
 
 // Delete the vectors with these ids; returns how many were deleted.
-static std::size_t index_remove(vecengine::Index& self, IdsArg ids) {
+static std::size_t index_remove(vecengine::IndexBase& self, IdsArg ids) {
     IdVector id_array = as_ids(ids);
     return write_locked(self, [&] {
         refuse_if_wrapped(self, "remove");
@@ -341,14 +341,14 @@ static std::size_t index_remove(vecengine::Index& self, IdsArg ids) {
 }
 
 // Free the storage of deleted vectors; returns how many slots were reclaimed.
-static std::size_t index_compact(vecengine::Index& self) {
+static std::size_t index_compact(vecengine::IndexBase& self) {
     return write_locked(self, [&] {
         refuse_if_wrapped(self, "compact");
         return self.compact();
     });
 }
 
-static std::size_t index_size(const vecengine::Index& self) {
+static std::size_t index_size(const vecengine::IndexBase& self) {
     return read_locked(self, [&] { return self.size(); });
 }
 
@@ -556,19 +556,11 @@ NB_MODULE(qann, m) {
           "string may have, for the whole process. Longer strings raise ValueError, so user input can't make "
           "a query scan its columns thousands of times. Filters built with qann.field aren't limited");
 
-    nb::class_<vecengine::Index>(m, "Index")
-        .def("save", [](const vecengine::Index& self, const std::filesystem::path& path) {
+    nb::class_<vecengine::IndexBase>(m, "IndexBase", "What every index has: ids, deletion, metadata and saving")
+        .def("save", [](const vecengine::IndexBase& self, const std::filesystem::path& path) {
                  read_locked(self, [&] { vecengine::save_index(self, path); });
              },
              nb::arg("path"), "Save the index to a file; load it back with qann.load(path)")
-        .def("add", &index_add, nb::arg("data"), nb::arg("ids").none() = nb::none(), nb::kw_only(),
-             nb::arg("metadata").none() = nb::none(),
-             "Add an (n, dim) array of vectors. Pass ids (n int64 values >= 0) if the index was "
-             "created with custom_ids=True; otherwise ids continue after the highest id ever assigned. "
-             "metadata is {name: n values} (ints, floats or strings) to filter queries on with where=; a new "
-             "column is null for earlier vectors, and a column left out of an add is null for its vectors. "
-             "None in a column's values is a null. Returns the vectors' ids (int64), the given ones or the "
-             "assigned ones")
         .def("update_metadata", &index_update_metadata, nb::arg("ids"), nb::arg("metadata"),
              "Overwrite metadata in place: metadata is {name: one value per id}, None sets a value to null, and "
              "columns left out keep their values. Unknown, deleted or repeated ids, and columns the index "
@@ -586,7 +578,7 @@ NB_MODULE(qann, m) {
              "with neither, every vector is null. default can't be combined with ids and values (TypeError). "
              "Later adds that leave the column out store null. Raises ValueError, changing nothing, if the "
              "name is taken, a value doesn't fit the type, or an id is unknown, deleted or repeated")
-        .def("drop_metadata_column", [](vecengine::Index& self, const std::string& name) {
+        .def("drop_metadata_column", [](vecengine::IndexBase& self, const std::string& name) {
                  write_locked(self, [&] {
                      refuse_if_wrapped(self, "drop a metadata column");
                      self.drop_metadata_column(name);
@@ -597,6 +589,28 @@ NB_MODULE(qann, m) {
              "Delete the vectors with these ids; unknown ids are skipped. Returns how many were deleted")
         .def("compact", &index_compact,
              "Free the memory of deleted vectors; ids and results are unchanged. Returns how many were freed")
+        .def_prop_ro("metadata_schema",
+                     [](const vecengine::IndexBase& self) {
+                         auto schema = read_locked(self, [&] { return self.metadata_schema(); });
+                         nb::dict out;
+                         for (const auto& [name, type] : schema)
+                             out[nb::str(name.c_str())] = type == vecengine::ColumnType::Int64     ? "int"
+                                                          : type == vecengine::ColumnType::Float64 ? "float"
+                                                                                                   : "str";
+                         return out;
+                     },
+                     "Each metadata column's name and type ('int', 'float' or 'str'), in the order they were added")
+        .def("size", &index_size, "Get number of indexed vectors");
+
+    nb::class_<vecengine::Index, vecengine::IndexBase>(m, "Index", "An index of dense float vectors")
+        .def("add", &index_add, nb::arg("data"), nb::arg("ids").none() = nb::none(), nb::kw_only(),
+             nb::arg("metadata").none() = nb::none(),
+             "Add an (n, dim) array of vectors. Pass ids (n int64 values >= 0) if the index was "
+             "created with custom_ids=True; otherwise ids continue after the highest id ever assigned. "
+             "metadata is {name: n values} (ints, floats or strings) to filter queries on with where=; a new "
+             "column is null for earlier vectors, and a column left out of an add is null for its vectors. "
+             "None in a column's values is a null. Returns the vectors' ids (int64), the given ones or the "
+             "assigned ones")
         .def("query", &index_query, nb::arg("query"), nb::arg("k"), nb::kw_only(), nb::arg("allowed").none() = nb::none(),
              nb::arg("where").none() = nb::none(),
              "Query k-NN for a (dim,) vector; returns 1D (indices, distances). With allowed (ids), only those "
@@ -608,19 +622,7 @@ NB_MODULE(qann, m) {
              "Query k-NN for each row; returns (indices, distances) arrays of shape (num_queries, k), padded with "
              "-1 / inf. allowed (ids) and where (a filter, SQL string or (string, params)) restrict the results as "
              "in query(), for every row")
-        .def_prop_ro("metadata_schema",
-                     [](const vecengine::Index& self) {
-                         auto schema = read_locked(self, [&] { return self.metadata_schema(); });
-                         nb::dict out;
-                         for (const auto& [name, type] : schema)
-                             out[nb::str(name.c_str())] = type == vecengine::ColumnType::Int64     ? "int"
-                                                          : type == vecengine::ColumnType::Float64 ? "float"
-                                                                                                   : "str";
-                         return out;
-                     },
-                     "Each metadata column's name and type ('int', 'float' or 'str'), in the order they were added")
         .def_prop_ro("metric", &vecengine::Index::metric, "How vectors are compared (fixed at construction)")
-        .def("size", &index_size, "Get number of indexed vectors")
         .def("dim", &vecengine::Index::dim, "Get vector dimension");
 
     nb::class_<vecengine::FlatIndex, vecengine::Index>(m, "FlatIndex")

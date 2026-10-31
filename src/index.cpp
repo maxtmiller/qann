@@ -47,22 +47,22 @@ vector<int64_t> Index::add_batch(span<const float> vecs, size_t n, const int64_t
     return added;
 }
 
-void Index::update_metadata(span<const int64_t> ids, const Metadata& metadata) {
+void IndexBase::update_metadata(span<const int64_t> ids, const Metadata& metadata) {
     const vector<uint32_t> slots = id_map().slots_of(ids);
     metadata_.check_update(slots.size(), metadata);
     metadata_.update(slots, metadata);
 }
 
-Metadata Index::get_metadata(span<const int64_t> ids, const vector<std::string>* columns) const {
+Metadata IndexBase::get_metadata(span<const int64_t> ids, const vector<std::string>* columns) const {
     return metadata_.get(id_map().slots_of(ids), columns);
 }
 
-void Index::add_metadata_column(std::string name, ColumnType type, std::optional<Expr::Value> value) {
+void IndexBase::add_metadata_column(std::string name, ColumnType type, std::optional<Expr::Value> value) {
     metadata_.add_column(std::move(name), type, slots(), value);
 }
 
-void Index::add_metadata_column(std::string name, ColumnType type, span<const int64_t> ids, MetadataColumn::Values values,
-                                vector<uint8_t> valid) {
+void IndexBase::add_metadata_column(std::string name, ColumnType type, span<const int64_t> ids,
+                                    MetadataColumn::Values values, vector<uint8_t> valid) {
     const vector<uint32_t> slots = id_map().slots_of(ids);
     MetadataColumn col(std::move(name), std::move(values), std::move(valid));
     metadata_.check_new(col, type, slots.size());
@@ -70,7 +70,7 @@ void Index::add_metadata_column(std::string name, ColumnType type, span<const in
     metadata_.update(slots, {std::move(col)});
 }
 
-void Index::drop_metadata_column(const std::string& name) { metadata_.drop_column(name); }
+void IndexBase::drop_metadata_column(const std::string& name) { metadata_.drop_column(name); }
 
 vector<Neighbor> Index::query(span<const float> vec, size_t k) const {
     assert(vec.size() == dim());
@@ -121,7 +121,7 @@ vector<vector<Neighbor>> Index::query_batch(span<const float> queries, size_t nu
     return query_prepared(queries, num_queries, k, &filter, true);
 }
 
-detail::SlotFilter Index::where_filter(const Expr& where, const span<const int64_t>* allowed) const {
+detail::SlotFilter IndexBase::where_filter(const Expr& where, const span<const int64_t>* allowed) const {
     vector<uint64_t> words = metadata_.evaluate(where, slots());
     if (allowed) {
         const vector<uint64_t> also = id_map().filter(*allowed).words;

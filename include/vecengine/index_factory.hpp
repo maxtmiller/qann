@@ -44,7 +44,7 @@ std::unique_ptr<Index> load_index(std::istream& in);
 
 // Saves an index to a file. Writes to path + ".tmp" first and renames it into
 // place, so a failed save never leaves a partial file at `path`.
-void save_index(const Index& index, const std::filesystem::path& path);
+void save_index(const IndexBase& index, const std::filesystem::path& path);
 
 // Loads an index saved by save_index. Every problem with the file's contents
 // is reported as std::runtime_error.
