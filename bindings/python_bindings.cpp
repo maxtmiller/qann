@@ -23,6 +23,7 @@
 #include "vecengine/metadata.hpp"
 #include "vecengine/pq.hpp"
 #include "vecengine/refine_index.hpp"
+#include "vecengine/sparse_index.hpp"
 #include "vecengine/index_factory.hpp"
 #include "vecengine/threads.hpp"
 
@@ -352,6 +353,33 @@ static std::size_t index_size(const vecengine::IndexBase& self) {
     return read_locked(self, [&] { return self.size(); });
 }
 
+// One query's results as 1D (ids, distances) arrays (int64, float32).
+static std::pair<NumpyArray<int64_t>, NumpyArray<float>> results_1d(const std::vector<vecengine::Neighbor>& results) {
+    const std::size_t n = results.size();
+    std::vector<int64_t> indices(n);
+    std::vector<float> distances(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        indices[i] = static_cast<int64_t>(results[i].index);
+        distances[i] = results[i].distance;
+    }
+    return {to_numpy(std::move(indices), {n}), to_numpy(std::move(distances), {n})};
+}
+
+// Each query's results as (num_queries, k) arrays, rows padded with -1 / inf.
+static std::pair<NumpyArray<int64_t>, NumpyArray<float>>
+results_padded(const std::vector<std::vector<vecengine::Neighbor>>& results, std::size_t k) {
+    const std::size_t num_queries = results.size();
+    std::vector<int64_t> indices(num_queries * k, -1);
+    std::vector<float> distances(num_queries * k, std::numeric_limits<float>::infinity());
+    for (std::size_t i = 0; i < num_queries; ++i) {
+        for (std::size_t j = 0; j < results[i].size(); ++j) {
+            indices[i * k + j] = static_cast<int64_t>(results[i][j].index);
+            distances[i * k + j] = results[i][j].distance;
+        }
+    }
+    return {to_numpy(std::move(indices), {num_queries, k}), to_numpy(std::move(distances), {num_queries, k})};
+}
+
 // Query k-NN for a single vector, among the ids in allowed when given;
 // returns (indices, distances) as 1D arrays with one entry per result (int64,
 // float32).
@@ -371,15 +399,7 @@ index_query(const vecengine::Index &self, FloatVector query, std::size_t k, std:
         return self.query(as_span(query), k, *where,
                           std::span<const int64_t>(allowed_ids->data(), allowed_ids->shape(0)));
     });
-
-    const std::size_t n = results.size();
-    std::vector<int64_t> indices(n);
-    std::vector<float> distances(n);
-    for (std::size_t i = 0; i < n; ++i) {
-        indices[i] = static_cast<int64_t>(results[i].index);
-        distances[i] = results[i].distance;
-    }
-    return {to_numpy(std::move(indices), {n}), to_numpy(std::move(distances), {n})};
+    return results_1d(results);
 }
 
 // Query k-NN for each row, among the ids in allowed when given; returns
@@ -405,16 +425,75 @@ index_batch_query(const vecengine::Index &self, FloatMatrix query, std::size_t k
         return self.query_batch(queries, num_queries, k, *where,
                                 std::span<const int64_t>(allowed_ids->data(), allowed_ids->shape(0)));
     });
+    return results_padded(results, k);
+}
 
-    std::vector<int64_t> indices(num_queries * k, -1);
-    std::vector<float> distances(num_queries * k, std::numeric_limits<float>::infinity());
-    for (std::size_t i = 0; i < num_queries; ++i) {
-        for (std::size_t j = 0; j < results[i].size(); ++j) {
-            indices[i * k + j] = static_cast<int64_t>(results[i][j].index);
-            distances[i * k + j] = results[i][j].distance;
-        }
+// A batch of sparse rows copied from Python, and the SparseRows view of it.
+struct OwnedRows {
+    std::vector<uint64_t> indptr;
+    std::vector<uint32_t> indices;
+    std::vector<float> values;
+
+    vecengine::SparseRows view() const { return {indptr, indices, values}; }
+};
+
+// Converts a scipy.sparse matrix (or anything with format, indptr, indices
+// and data; other formats go through tocsr()) to CSR rows: term ids must be
+// in [0, 2^32), values become float32. Must run with the GIL held.
+static OwnedRows as_sparse_rows(nb::handle obj, const char* what) {
+    nb::object x = nb::borrow(obj);
+    if (!nb::hasattr(x, "format") || !nb::hasattr(x, "tocsr"))
+        throw nb::type_error((std::string(what) + " must be a scipy.sparse matrix, e.g. scipy.sparse.csr_array").c_str());
+    if (nb::cast<std::string>(x.attr("format")) != "csr") x = x.attr("tocsr")();
+
+    nb::module_ np = nb::module_::import_("numpy");
+    auto as = [&](const char* name, const char* dtype) { return np.attr("ascontiguousarray")(x.attr(name), nb::arg("dtype") = dtype); };
+    OwnedRows rows;
+    auto indptr = nb::cast<IdVector>(as("indptr", "int64"));
+    rows.indptr.assign(indptr.data(), indptr.data() + indptr.shape(0));
+    auto indices = nb::cast<IdVector>(as("indices", "int64"));
+    for (std::size_t i = 0; i < indices.shape(0); ++i) {
+        if (indices.data()[i] < 0 || indices.data()[i] > static_cast<int64_t>(UINT32_MAX))
+            throw std::invalid_argument(std::string(what) + " has a column index outside [0, 2^32)");
+        rows.indices.push_back(static_cast<uint32_t>(indices.data()[i]));
     }
-    return {to_numpy(std::move(indices), {num_queries, k}), to_numpy(std::move(distances), {num_queries, k})};
+    auto values = nb::cast<FloatVector>(as("data", "float32"));
+    rows.values.assign(values.data(), values.data() + values.shape(0));
+    return rows;
+}
+
+// Add the rows of a sparse matrix, with ids and metadata as in Index.add.
+static NumpyArray<int64_t> sparse_add(vecengine::SparseIndex& self, nb::handle data, std::optional<IdsArg> ids,
+                                      std::optional<nb::dict> metadata) {
+    const OwnedRows rows = as_sparse_rows(data, "data");
+    std::optional<IdVector> id_array;
+    if (ids) {
+        id_array = as_ids(*ids);
+        if (id_array->shape(0) != rows.view().rows()) throw std::invalid_argument("ids must have one entry per row of data");
+    }
+    const vecengine::Metadata md = metadata ? as_metadata(*metadata, rows.view().rows(), "row of data") : vecengine::Metadata{};
+    std::vector<int64_t> added = write_locked(self, [&] {
+        return self.add_batch(rows.view(), id_array ? id_array->data() : nullptr, md);
+    });
+    const std::size_t n = added.size();
+    return to_numpy(std::move(added), {n});
+}
+
+// SparseIndex.query_batch with whichever of allowed and where are given.
+static std::vector<std::vector<vecengine::Neighbor>>
+sparse_search(const vecengine::SparseIndex& self, const OwnedRows& rows, std::size_t k, std::optional<IdsArg> allowed,
+              std::optional<WhereArg> where_arg) {
+    const std::optional<vecengine::Expr> where = to_expr(where_arg);
+    std::optional<IdVector> allowed_ids;
+    if (allowed) allowed_ids = as_ids(*allowed);
+    return read_locked(self, [&] {
+        if (!allowed_ids && !where) return self.query_batch(rows.view(), k);
+        const std::span<const int64_t> ids = allowed_ids ? std::span<const int64_t>(allowed_ids->data(), allowed_ids->shape(0))
+                                                         : std::span<const int64_t>();
+        if (!where) return self.query_batch(rows.view(), k, ids);
+        if (!allowed_ids) return self.query_batch(rows.view(), k, *where);
+        return self.query_batch(rows.view(), k, *where, ids);
+    });
 }
 
 // Train an IVFIndex's coarse centroids from a (N x dim) matrix of sample vectors.
@@ -739,6 +818,45 @@ NB_MODULE(qann, m) {
                      nb::rv_policy::reference_internal,
                      "The wrapped approximate index, e.g. to change nprobe on a loaded RefineIndex");
 
+    nb::class_<vecengine::SparseIndex, vecengine::IndexBase>(
+        m, "SparseIndex",
+        "Exact inverted index over sparse vectors (BM25, SPLADE): scores by dot product, distance -(q . d)")
+        .def("__init__", [](vecengine::SparseIndex* self, bool custom_ids) { new (self) vecengine::SparseIndex(custom_ids); },
+             nb::kw_only(), nb::arg("custom_ids") = false,
+             "An empty SparseIndex. custom_ids=True makes add() take ids, as for the dense indexes")
+        .def("add", &sparse_add, nb::arg("data"), nb::arg("ids").none() = nb::none(), nb::kw_only(),
+             nb::arg("metadata").none() = nb::none(),
+             "Add the rows of a scipy.sparse matrix (CSR, or converted with tocsr()); a column is a term id in "
+             "[0, 2^32), values become float32, repeated entries in a row are summed and zeros dropped. ids and "
+             "metadata as in Index.add. Returns the vectors' ids")
+        .def("query",
+             [](const vecengine::SparseIndex& self, nb::handle query, std::size_t k, std::optional<IdsArg> allowed,
+                std::optional<WhereArg> where) {
+                 const OwnedRows rows = as_sparse_rows(query, "query");
+                 if (rows.view().rows() != 1) throw std::invalid_argument("query must be one row; use batch_query for more");
+                 return results_1d(sparse_search(self, rows, k, std::move(allowed), std::move(where))[0]);
+             },
+             nb::arg("query"), nb::arg("k"), nb::kw_only(), nb::arg("allowed").none() = nb::none(),
+             nb::arg("where").none() = nb::none(),
+             "The k vectors with the largest dot product with a one-row sparse matrix, largest first; returns 1D "
+             "(ids, distances) with distance -(q . d). Only vectors sharing a nonzero term with the query are "
+             "returned. allowed and where filter as in Index.query")
+        .def("batch_query",
+             [](const vecengine::SparseIndex& self, nb::handle queries, std::size_t k, std::optional<IdsArg> allowed,
+                std::optional<WhereArg> where) {
+                 const OwnedRows rows = as_sparse_rows(queries, "queries");
+                 return results_padded(sparse_search(self, rows, k, std::move(allowed), std::move(where)), k);
+             },
+             nb::arg("queries"), nb::arg("k"), nb::kw_only(), nb::arg("allowed").none() = nb::none(),
+             nb::arg("where").none() = nb::none(),
+             "query() for each row of a sparse matrix, in parallel; returns (ids, distances) arrays of shape "
+             "(num_queries, k), padded with -1 / inf")
+        .def_prop_ro("terms", [](const vecengine::SparseIndex& self) { return read_locked(self, [&] { return self.terms(); }); },
+                     "Distinct terms with a posting list")
+        .def_prop_ro("postings",
+                     [](const vecengine::SparseIndex& self) { return read_locked(self, [&] { return self.postings(); }); },
+                     "Stored (term, vector) pairs, including deleted vectors' until compact()");
+
     nb::enum_<vecengine::IndexType>(m, "IndexType")
         .value("Flat", vecengine::IndexType::Flat)
         .value("IVF", vecengine::IndexType::IVF)
@@ -782,5 +900,5 @@ NB_MODULE(qann, m) {
 
     m.def("load", nb::overload_cast<const std::filesystem::path&>(&vecengine::load_index), nb::arg("path"),
           nb::call_guard<nb::gil_scoped_release>(),
-          "Load an index saved with Index.save(path); returns a FlatIndex, IVFIndex, HNSWIndex or RefineIndex");
+          "Load an index saved with save(path); returns a FlatIndex, IVFIndex, HNSWIndex, RefineIndex or SparseIndex");
 }

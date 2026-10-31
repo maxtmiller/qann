@@ -1,5 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include "load_dense.hpp"
+
 #include "vecengine/distance.hpp"
 #include "vecengine/flat_index.hpp"
 #include "vecengine/index_factory.hpp"
@@ -290,7 +292,7 @@ TEST_CASE("Rotated IVF-PQ keeps distances, batch results and file round trips", 
 
         std::stringstream s;
         ivf->save(s);
-        auto loaded = load_index(s);
+        auto loaded = load_dense(s);
         REQUIRE(dynamic_cast<IVFIndex&>(*loaded).pq_rotate());
         rot_require_identical(loaded->query_batch(queries, nq, k), before);
 
@@ -303,7 +305,7 @@ TEST_CASE("Rotated IVF-PQ keeps distances, batch results and file round trips", 
         ivf.enable_pq(m, 256, false, true);
         std::stringstream s;
         ivf.save(s);
-        auto loaded = load_index(s);
+        auto loaded = load_dense(s);
         auto& back = dynamic_cast<IVFIndex&>(*loaded);
         REQUIRE(back.pq_rotate());
         back.train(data, n, 25, 1);
@@ -346,7 +348,7 @@ TEST_CASE("Rotated IVF-PQ: load rejects bad rotation data", "[rotation][ivf][ser
 
     auto rejects = [](const std::string& b) {
         std::stringstream t(b);
-        REQUIRE_THROWS_AS(load_index(t), std::runtime_error);
+        REQUIRE_THROWS_AS(load_dense(t), std::runtime_error);
     };
 
     std::string bad_flag = bytes;

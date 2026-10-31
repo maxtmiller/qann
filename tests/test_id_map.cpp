@@ -1,6 +1,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
+#include "load_dense.hpp"
+
 #include "vecengine/id_map.hpp"
 #include "serialize.hpp"
 
@@ -563,7 +565,7 @@ using vecengine::Neighbor;
 static std::unique_ptr<Index> roundtrip(const Index& index) {
     std::stringstream s;
     index.save(s);
-    return load_index(s);
+    return load_dense(s);
 }
 
 static void require_same(const Index& a, const Index& b, const std::vector<float>& queries, size_t nq, size_t k) {
@@ -645,7 +647,7 @@ TEST_CASE("files from format version 1 (0.1.0a4) still load", "[serialize][compa
     const std::filesystem::path dir = QANN_TEST_DATA_DIR;
     for (const char* name : {"v1_flat.qann", "v1_ivf_pq.qann", "v1_refine.qann"}) {
         CAPTURE(name);
-        auto index = load_index(dir / name);
+        auto index = load_dense(dir / name);
         REQUIRE(index->size() == 2000);
         REQUIRE(index->slots() == 2000);
         REQUIRE_FALSE(index->custom_ids());
@@ -663,7 +665,7 @@ TEST_CASE("files from format version 1 (0.1.0a4) still load", "[serialize][compa
         index->save(s);
         REQUIRE(read_header(s).version == kFormatVersion);
         s.seekg(0);
-        auto reloaded = load_index(s);
+        auto reloaded = load_dense(s);
         REQUIRE(reloaded->size() == 1999);
     }
 }
@@ -674,7 +676,7 @@ TEST_CASE("files from format version 2 (0.1.0a6) still load", "[serialize][compa
     const std::filesystem::path dir = QANN_TEST_DATA_DIR;
     for (const char* name : {"v2_flat.qann", "v2_ivf_pq.qann", "v2_refine.qann"}) {
         CAPTURE(name);
-        auto index = load_index(dir / name);
+        auto index = load_dense(dir / name);
         REQUIRE(index->size() == 1600);
         REQUIRE(index->slots() == 2000);
         REQUIRE(index->dim() == 16);
@@ -693,7 +695,7 @@ TEST_CASE("files from format version 2 (0.1.0a6) still load", "[serialize][compa
         index->save(s);
         REQUIRE(read_header(s).version == kFormatVersion);
         s.seekg(0);
-        auto reloaded = load_index(s);
+        auto reloaded = load_dense(s);
         REQUIRE(reloaded->size() == 1600);
         REQUIRE(reloaded->slots() == 1600);
         const auto again = reloaded->query(query, 10);
@@ -710,7 +712,7 @@ TEST_CASE("files from format version 3 (0.1.0a7) still load", "[serialize][compa
     for (const Expect e : {Expect{"v3_flat.qann", 1300, 1500, false}, Expect{"v3_ivf_pq.qann", 1500, 1500, false},
                            Expect{"v3_refine.qann", 1500, 1500, true}}) {
         CAPTURE(e.name);
-        auto index = load_index(dir / e.name);
+        auto index = load_dense(dir / e.name);
         REQUIRE(index->size() == e.size);
         REQUIRE(index->slots() == e.slots);
         REQUIRE(index->custom_ids() == e.custom);
@@ -729,7 +731,7 @@ TEST_CASE("files from format version 3 (0.1.0a7) still load", "[serialize][compa
         index->save(s);
         REQUIRE(read_header(s).version == kFormatVersion);
         s.seekg(0);
-        auto reloaded = load_index(s);
+        auto reloaded = load_dense(s);
         const auto again = reloaded->query(query, 10);
         for (size_t i = 0; i < before.size(); ++i) {
             REQUIRE(again[i].index == before[i].index);
@@ -749,7 +751,7 @@ TEST_CASE("load rejects bad versions and misaligned id maps", "[serialize][ids]"
         std::string bytes = s.str();
         bytes[4] = static_cast<char>(kFormatVersion + 1);
         std::stringstream t(bytes);
-        REQUIRE_THROWS_AS(load_index(t), std::runtime_error);
+        REQUIRE_THROWS_AS(load_dense(t), std::runtime_error);
     }
 
     SECTION("RefineIndex base written with a different version") {
@@ -764,7 +766,7 @@ TEST_CASE("load rejects bad versions and misaligned id maps", "[serialize][ids]"
         std::string inner_bytes = inner.str();
         inner_bytes[4] = 1;   // nested header claims an older version than the file
         t << inner_bytes;
-        REQUIRE_THROWS_AS(load_index(t), std::runtime_error);
+        REQUIRE_THROWS_AS(load_dense(t), std::runtime_error);
     }
 
     SECTION("RefineIndex base with custom ids") {
@@ -780,7 +782,7 @@ TEST_CASE("load rejects bad versions and misaligned id maps", "[serialize][ids]"
         IdMap map;
         map.add(10, nullptr);
         map.save(t);
-        REQUIRE_THROWS_AS(load_index(t), std::runtime_error);
+        REQUIRE_THROWS_AS(load_dense(t), std::runtime_error);
     }
 
     SECTION("id map with a different slot count") {
@@ -792,7 +794,7 @@ TEST_CASE("load rejects bad versions and misaligned id maps", "[serialize][ids]"
         IdMap map;
         map.add(9, nullptr);
         map.save(t);
-        REQUIRE_THROWS_AS(load_index(t), std::runtime_error);
+        REQUIRE_THROWS_AS(load_dense(t), std::runtime_error);
     }
 }
 
@@ -811,7 +813,7 @@ TEST_CASE("RefineIndex marks its base as wrapped", "[refine][ids]") {
 
         std::stringstream s;
         refine.save(s);
-        auto loaded = load_index(s);
+        auto loaded = load_dense(s);
         REQUIRE(dynamic_cast<RefineIndex&>(*loaded).base().wrapped());
     }
     REQUIRE_FALSE(base.wrapped());  // cleared when the RefineIndex is destroyed

@@ -32,7 +32,7 @@ Issues = "https://github.com/maxtmiller/qann/issues"
 
 [project.optional-dependencies]
 bench = ["matplotlib"]
-test = ["pytest"]
+test = ["pytest", "scipy"]
 
 [tool.scikit-build]
 minimum-version = "0.10"

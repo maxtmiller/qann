@@ -177,6 +177,25 @@ Wraps a trained, empty approximate index created without custom ids (and never c
 
 This is the usual way to combine PQ's speed with near-exact ranking. It keeps the original vectors in memory alongside the PQ codes.
 
+### `SparseIndex(*, custom_ids=False)`
+
+An exact inverted index over sparse vectors, for keyword-style retrieval: BM25 weights, or learned sparse vectors such as SPLADE, computed by you and passed in as `scipy.sparse` matrices (a column is a term id). It scores by dot product, so results come largest first with distance `-(q . d)`, as with `Metric.InnerProduct`.
+
+```python
+import scipy.sparse as sp
+
+index = qann.SparseIndex()
+index.add(doc_matrix, metadata={"lang": langs})             # (n_docs, vocab) CSR
+ids, dists = index.batch_query(query_matrix, 10, where="lang = 'en'")
+ids, dists = index.query(query_matrix[[0]], 10)             # one row
+```
+
+- **Input:** any `scipy.sparse` matrix or array (CSR is used directly, other formats go through `tocsr()`). Column indices must be in `[0, 2^32)`; values become float32. Repeated entries in a row are summed and zeros are dropped. There is no fixed dimension.
+- **Results:** exact. A query reads only its own terms' posting lists and returns only documents sharing at least one nonzero term with it, so fewer than `k` can come back. Rows are padded with `-1` / `inf` as for the dense indexes.
+- **Shared with the dense indexes:** custom ids, `remove` / `compact`, metadata and `where=`, `allowed=`, `get_metadata`, `save` / `qann.load`. `SparseIndex` derives from `qann.IndexBase`, not `qann.Index`, since it has no `dim` or metric.
+- **Size:** `terms` and `postings` report the distinct terms and stored (term, document) pairs. Each posting takes 8 bytes.
+- **Cost:** about proportional to the postings a query's terms have. Common terms make that a large share of the corpus; pruning that skips documents which can't reach the top `k` is planned (#59).
+
 ### `make_index(type, dim, opts=IndexOptions())`
 
 Builds an index from a type and an options object, returning a `FlatIndex`, `IVFIndex` or `HNSWIndex`:

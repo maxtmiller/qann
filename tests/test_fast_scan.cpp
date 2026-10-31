@@ -1,6 +1,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
+#include "load_dense.hpp"
+
 #include "fast_scan.hpp"
 
 #include <algorithm>
@@ -243,7 +245,7 @@ TEST_CASE("fast-scan matches the float ADC scan on the same codes", "[fastscan][
 
     std::stringstream s;
     fast->save(s);
-    require_identical(vecengine::load_index(s)->query_batch(queries, nq, k), rf);
+    require_identical(load_dense(s)->query_batch(queries, nq, k), rf);
 }
 
 TEST_CASE("fast-scan: add and add_batch store the same codes", "[fastscan][ivf]") {
@@ -293,7 +295,7 @@ TEST_CASE("fast-scan: deletions, compaction and save/load", "[fastscan][ivf][com
 
     std::stringstream s;
     index->save(s);
-    auto loaded = vecengine::load_index(s);
+    auto loaded = load_dense(s);
     auto& ivf = dynamic_cast<IVFIndex&>(*loaded);
     REQUIRE(ivf.fast_scan());
     require_identical(ivf.query_batch(queries, nq, k), before);

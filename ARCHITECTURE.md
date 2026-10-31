@@ -32,6 +32,7 @@ vecengine/
 │   ├── pq.hpp                      # PQCodebook + PQDistance
 │   ├── sq.hpp                      # SQ: 8- and 4-bit scalar quantizer used by HNSWIndex
 │   ├── refine_index.hpp            # exact re-ranking wrapper
+│   ├── sparse_index.hpp            # SparseIndex: exact inverted index over sparse vectors
 │   └── index_factory.hpp           # make_index() + IndexOptions, save_index() / load_index()
 ├── src/
 │   ├── distance.cpp                # scalar / AVX2 / NEON kernels
@@ -49,6 +50,7 @@ vecengine/
 │   ├── ivf_index.cpp
 │   ├── hnsw_index.cpp
 │   ├── refine_index.cpp
+│   ├── sparse_index.cpp
 │   └── index_factory.cpp
 ├── tests/
 │   ├── test_distance.cpp           # Catch2 v3 tests for every layer
@@ -63,6 +65,8 @@ vecengine/
 │   ├── test_metric.cpp             # cosine metric: exact ranking, normalize_rows, zero vectors, save/load, format v4 files
 │   ├── test_inner_product.cpp      # inner product: kernels, exact ranking on every index type, HNSW vs explicit L2 transform, PQ, save/load
 │   ├── test_python.py              # pytest smoke, save/load, ids and threading tests
+│   ├── test_sparse.cpp / .py       # SparseIndex against brute-force dot products, input forms, ids, filters, compaction, save/load, corrupt files
+│   ├── load_dense.hpp              # test helper: load_index() checked to hold a dense Index
 │   └── data/                       # index files saved by 0.1.0a4 (v1), 0.1.0a6 (v2), 0.1.0a7 (v3), 0.1.0a10 (v4), 0.1.0a11 (v5), macOS-made SQ8 / SQ4 files (v6) and inner product files (v9) + their results
 ├── benchmarks/
 │   ├── bench_distance.cpp          # Google Benchmark distance kernels
@@ -363,11 +367,20 @@ Changing the base directly would break that alignment (an add gives the base a v
 
 It only helps when `base` ranks with approximate distances (IVF + PQ). It restores recall but stores the raw vectors in RAM, so IVF + PQ + re-ranking uses more memory than plain IVF; in production the raw vectors would live on disk and only the candidates would be read. `k_factor` is a query-time setting; `k_factor = 1` returns the base's IDs with exact distances.
 
+### `sparse_index.hpp`: `SparseIndex`
+
+An exact inverted index over sparse vectors (issue #59), derived from `IndexBase` rather than `Index`: it has no `dim` and takes `SparseRows` (a CSR view: `indptr` as u64, `indices` as u32 term ids, `values` as floats) instead of float rows. Ids, deletion, metadata, `where=` and `allowed` come from `IndexBase` unchanged.
+
+- **Storage:** `lists_` maps each term to its posting list, `(slot, weight)` pairs in increasing slot order. Adds append, since new slots are the largest. Each row is made canonical first (`canonical_row`: sorted by term, repeats summed in their original order, zeros dropped), so a list never holds a slot twice. A row with no nonzero values still gets a slot.
+- **Query (term at a time):** for each query term, walk its list and add `q_t * w` into a per-thread dense `scores` array, recording each slot on first touch. Then push every touched slot that is live (or passes the filter) into a `TopK` by `-score`, resetting its accumulator as it goes, so the scratch stays zero between queries and costs O(slots) memory per thread once. The result is the exact dot product, summed in the query's term order. Only vectors sharing a nonzero term with the query are candidates; the rest would score 0. Distances are `-(q . d)`, like `Metric::InnerProduct`. Filters are applied when collecting, not per posting, which gives the same results more cheaply. `query_batch` runs queries in `parallel_for`.
+- **Compaction:** the `IdMap` remap keeps slot order, so each list is rewritten in place without re-sorting; lists left empty are erased.
+- **Not yet:** dynamic pruning (MaxScore, then WAND / Block-Max WAND) to skip documents that can't reach the top k, which the #59 prototype showed skips most of the touched documents with identical results.
+
 ### `index_factory.hpp`: `make_index`
 
 `make_index(IndexType, dim, IndexOptions)` returns `unique_ptr<Index>`. `IndexOptions` holds `capacity` (Flat), `nlist`, `nprobe`, `pq_subspaces` (0 = PQ off) and `pq_centroids` (IVF), `hnsw_m`, `ef_construction`, `ef_search` and `ivf_sq_bits` (IVF) and `hnsw_sq_bits` (HNSW) (0 for floats, 8 or 4 calls `enable_sq()`), and `custom_ids` (all). Type-specific calls like `train()` require the concrete `IVFIndex` or `HNSWIndex`.
 
-`load_index(std::istream&)` reads a file header and dispatches to `FlatIndex::load_body`, `IVFIndex::load_body`, `HNSWIndex::load_body` or `RefineIndex::load_body`. The path overloads wrap it for files:
+`load_index(std::istream&)` reads a file header and dispatches to `FlatIndex::load_body`, `IVFIndex::load_body`, `HNSWIndex::load_body`, `RefineIndex::load_body` or `SparseIndex::load_body`. It returns `unique_ptr<IndexBase>`; C++ callers `dynamic_cast` to `Index` for a dense index (the tests use `load_dense` in `tests/load_dense.hpp`). The path overloads wrap it for files:
 
 - `save_index(index, path)` writes to `path + ".tmp"`, checks the stream after `close()` (write errors don't throw on their own), then renames into place; on any failure it removes the `.tmp` file and rethrows.
 - `load_index(path)` opens in binary mode, rethrows `invalid_argument` from constructors and setters (bad `nlist`, `nprobe`, ...) as `runtime_error("corrupt file: ...")` so every bad file reports the same way, and rejects trailing bytes after the index.
@@ -385,6 +398,7 @@ Every index starts with a 9-byte header: magic `QANN` (`uint32`), format version
 | `Flat` (1) | `dim`, `count` (slots), `data` (`count * dim` floats), id map |
 | `IVF` (2) | `dim`, `nlist`, `nprobe`, `n_total` (slots), `trained` (u8), `pq_distance` (u8), coarse centroids (`nlist * dim`, or empty if untrained), PQ flag (u8) + `PQCodebook`, `fast_scan` (u8, version 4+) and the rotate flag (u8) + rotation (`dim * dim` floats, or empty while untrained; version 8+) if set, SQ bits (u8, version 7+: 0, 4 or 8) + `vmin` and `step` (`dim` floats each, or empty while untrained) if nonzero, then `nlist` lists in cluster order `0..nlist-1`, each slot `ids` + `codes` (PQ: `n * m` bytes, or `ceil(n / 32) * m * 16` in fast-scan blocks; SQ: `n * dim` bytes for 8 bits, `n * ceil(dim / 2)` for 4) or `vecs` (neither), empty lists written as empty vectors; id map; `use_precomputed` (u8, version 3+) |
 | `Refine` (3) | `k_factor`, `count` (slots), the base index (full header + body, same version), `data` (`count * dim` floats), id map |
+| `Sparse` (5, version 9+) | `count` (slots), the number of posting lists, then per list in increasing term order the term (u32) and its postings (`write_vec` of `(slot u32, weight f32)` pairs), id map. Loading requires non-empty lists with slots strictly increasing and below `count`, and no term twice |
 | `HNSW` (4) | `dim`, `M`, `ef_construction`, `ef_search`, `count` (slots), `max_level` (i32), `entry` (u32), the level generator's state (version 5: one u64, the splitmix64 state, so adds after a load draw the same levels; version 4 stored `std::mt19937`'s text form, which libc++ and libstdc++ write differently, so a version-4 file continues from an FNV-1a hash of that text), the SQ bits per dimension (u8, version 6+: 0 for floats, 8 or 4) and, if nonzero, `vmin` and `step` (`dim` floats each, or empty while untrained) and the codes (`count * dim` bytes for 8 bits, `count * ceil(dim / 2)` for 4), `data` (`count * dim` floats, empty with SQ), `levels` (u8 per slot), level 0 (`count * (2M + 1)` u32), then each slot's upper-level lists in slot and level order, id map |
 
 The id map (`IdMap::save`, version 2+) is `custom_ids` (u8), the slot count, `next_id` (i64, version 3+), `labels` (empty while ids equal slots) and one deleted flag (u8) per slot. It ends each body (in IVF, only the `use_precomputed` flag follows it). For version 1, `load_body` skips it and starts from a map with every slot live and no custom ids; for version 2, `next_id` is the slot count and auto ids carry no labels. Version 3 added `next_id` and auto-id labels for compaction, and IVF's `use_precomputed` flag (version 2 files load with the tables on).
@@ -393,7 +407,7 @@ The id map (`IdMap::save`, version 2+) is `custom_ids` (u8), the slot count, `ne
 
 **Validation on load.** Files are untrusted input, so every loader checks before allocating or indexing: `read_vec` takes a `max_len` and callers then require the exact expected length; sizes are checked against overflow (`count > UINT64_MAX / dim`); IVF ids must be `< n_total` and list sizes must sum to `n_total`; the PQ codebook's `dim` must match the index, and a fast-scan flag needs 16 centroids, an even `m <= 1024` and ADC; a rotation must be present exactly when its flag is set and the index is trained, have `dim * dim` entries and be orthogonal (`RᵀR = I` within 1e-3); a Refine's `count` must equal its base's `slots()` (queries index the raw vectors by base slot), its base's ids must equal its slots and it must have the same format version. A Refine base must be Flat, IVF or HNSW, which also stops a crafted file from nesting Refines until the stack overflows. An HNSW file's neighbor lists must be within capacity and point at real slots, and its entry point must sit on the top level; the SQ bits must be 0, 4 or 8, and with SQ the ranges must have `dim` entries (or none, with no slots) and the codes exactly `count` rows of the width's code bytes. The id map must match its index's slot count, with no duplicate live ids; auto-id labels must be strictly increasing, `>= 0` and below `next_id`, and without labels `next_id` must equal the slot count (or the index must be empty). Metadata columns must have unique non-empty names, a known type, 0/1 null flags and exactly `count` rows, and string codes of non-null rows must point into a dictionary without duplicates. Any failure throws `runtime_error`.
 
-**Changing the format.** `IndexKind` values are append-only: never renumber or reuse one. Bump `kFormatVersion` whenever an existing type's layout changes, and read older versions explicitly in each `load_body` (as version 9 does for versions 1 to 8). `tests/data/` holds files saved by 0.1.0a4 (version 1), 0.1.0a6 (version 2, with deletions and custom ids) 0.1.0a7 (version 3, compacted, with precomputed tables off on the IVF file) 0.1.0a10 (version 4: Flat with deletions, IVF fast-scan, and HNSW with deletions) and 0.1.0a11 (version 5: cosine Flat and HNSW, with deletions) with the results they returned, plus version-6 RefineIndexes over SQ8 and SQ4 HNSW graphs (odd `dim`, so 4-bit rows end in half a byte) saved on macOS, version-7 SQ8 IVF and SQ4 IVF under a RefineIndex (odd `dim`), a version-8 rotated IVF-PQ under a RefineIndex, and a version-9 RefineIndex with int, float and string metadata (nulls from a second add, deletions), also saved on macOS, so Linux CI checks they are portable; the C++ and Python tests load them to catch compatibility breaks, and re-save them in the current version.
+**Changing the format.** `IndexKind` values are append-only: never renumber or reuse one. A new kind needs no version bump: older readers reject it as an unknown kind (`Sparse` was added within version 9). Bump `kFormatVersion` whenever an existing type's layout changes, and read older versions explicitly in each `load_body` (as version 9 does for versions 1 to 8). `tests/data/` holds files saved by 0.1.0a4 (version 1), 0.1.0a6 (version 2, with deletions and custom ids) 0.1.0a7 (version 3, compacted, with precomputed tables off on the IVF file) 0.1.0a10 (version 4: Flat with deletions, IVF fast-scan, and HNSW with deletions) and 0.1.0a11 (version 5: cosine Flat and HNSW, with deletions) with the results they returned, plus version-6 RefineIndexes over SQ8 and SQ4 HNSW graphs (odd `dim`, so 4-bit rows end in half a byte) saved on macOS, version-7 SQ8 IVF and SQ4 IVF under a RefineIndex (odd `dim`), a version-8 rotated IVF-PQ under a RefineIndex, and a version-9 RefineIndex with int, float and string metadata (nulls from a second add, deletions), also saved on macOS, so Linux CI checks they are portable; the C++ and Python tests load them to catch compatibility breaks, and re-save them in the current version.
 
 ---
 
