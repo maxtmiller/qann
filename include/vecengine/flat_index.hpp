@@ -18,13 +18,13 @@ using std::span;
 
 // Exact brute-force index: query() computes the distance to every live
 // vector. 100% recall, cost linear in the number of vectors.
-class FlatIndex : public Index {
+class FlatIndex : public DenseIndex {
 public:
     // dim floats per vector; capacity is an initial reserve (vectors, not a
     // limit). custom_ids makes add_batch() take user ids.
     explicit FlatIndex(size_t dim, size_t capacity = 1024, bool custom_ids = false, Metric metric = Metric::L2);
 
-    // Index overrides; see Index for the contract of each.
+    // DenseIndex overrides; see DenseIndex for the contract of each.
     size_t remove(span<const int64_t> ids) override;
     size_t compact() override;
 
@@ -42,7 +42,7 @@ public:
     size_t dim() const noexcept override { return dim_; }
 
 private:
-    // Index implementations: vectors already prepared for the metric.
+    // DenseIndex implementations: vectors already prepared for the metric.
     void add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) override;
     vector<Neighbor> query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const override;
     const detail::IdMap& id_map() const noexcept override { return id_map_; }

@@ -132,7 +132,7 @@ private:
 namespace detail {
 
 // Metadata columns of one index, aligned to its slots: row s of every column
-// belongs to slot s. Each index owns one (Index::metadata_). A column is
+// belongs to slot s. Each index owns one (IndexBase::metadata_). A column is
 // created by the first add that mentions it, with earlier rows null; an add
 // that leaves a column out fills its rows with null. remove() needs nothing
 // here (deleted slots stay until compact(), and filters drop them).

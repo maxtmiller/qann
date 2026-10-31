@@ -91,6 +91,7 @@ add_library(vecengine_core STATIC
   src/hnsw_index.cpp
   src/sq.cpp
   src/sparse_index.cpp
+  src/inverted_index.cpp
 )
 
 target_include_directories(vecengine_core PUBLIC

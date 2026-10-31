@@ -269,7 +269,7 @@ static std::unique_ptr<IVFIndex> ivf_roundtrip(const IVFIndex& index) {
     return IVFIndex::load_body(s, header.version);
 }
 
-static void require_same_results(const Index& a, const Index& b, const std::vector<float>& queries, size_t nq, size_t k) {
+static void require_same_results(const DenseIndex& a, const DenseIndex& b, const std::vector<float>& queries, size_t nq, size_t k) {
     const std::span<const float> q(queries.data(), nq * a.dim());
     auto expected = a.query_batch(q, nq, k);
     auto actual = b.query_batch(q, nq, k);
@@ -433,7 +433,7 @@ TEST_CASE("IVFIndex: load rejects truncated and corrupt data", "[ivf][serialize]
 // RefineIndex and load_index
 // ---------------------------------------------------------------------------
 
-static std::unique_ptr<Index> index_roundtrip(const Index& index) {
+static std::unique_ptr<DenseIndex> index_roundtrip(const DenseIndex& index) {
     std::stringstream s;
     index.save(s);
     return load_dense(s);

@@ -438,7 +438,7 @@ TEST_CASE("IVFIndex: rejected adds store nothing; deleted ids can be re-added", 
 
 #include "vecengine/refine_index.hpp"
 
-using vecengine::Index;
+using vecengine::DenseIndex;
 using vecengine::RefineIndex;
 
 TEST_CASE("RefineIndex: custom ids and deletion", "[refine][ids]") {
@@ -448,7 +448,7 @@ TEST_CASE("RefineIndex: custom ids and deletion", "[refine][ids]") {
     for (int base_kind = 0; base_kind < 3; ++base_kind) {
         for (bool custom : {false, true}) {
             CAPTURE(base_kind, custom);
-            std::unique_ptr<Index> base;
+            std::unique_ptr<DenseIndex> base;
             if (base_kind == 0) base = std::make_unique<FlatIndex>(dim);
             else base = make_ivf(base_kind == 1 ? IvfMode::ADC : IvfMode::SDC, dim, data, n, false);
 
@@ -562,13 +562,13 @@ TEST_CASE("RefineIndex: query after deleting everything returns nothing", "[refi
 using vecengine::load_index;
 using vecengine::Neighbor;
 
-static std::unique_ptr<Index> roundtrip(const Index& index) {
+static std::unique_ptr<DenseIndex> roundtrip(const DenseIndex& index) {
     std::stringstream s;
     index.save(s);
     return load_dense(s);
 }
 
-static void require_same(const Index& a, const Index& b, const std::vector<float>& queries, size_t nq, size_t k) {
+static void require_same(const DenseIndex& a, const DenseIndex& b, const std::vector<float>& queries, size_t nq, size_t k) {
     REQUIRE(a.size() == b.size());
     REQUIRE(a.slots() == b.slots());
     REQUIRE(a.custom_ids() == b.custom_ids());
@@ -584,7 +584,7 @@ static void require_same(const Index& a, const Index& b, const std::vector<float
 }
 
 // Applies the same adds and deletes to two indexes, which must stay identical.
-static void mutate(Index& index, size_t dim, int64_t next_id) {
+static void mutate(DenseIndex& index, size_t dim, int64_t next_id) {
     auto extra = random_matrix(5, dim, static_cast<unsigned>(next_id));
     std::vector<int64_t> ids(5);
     for (size_t i = 0; i < 5; ++i) ids[i] = next_id + static_cast<int64_t>(i);
@@ -601,8 +601,8 @@ TEST_CASE("save/load keeps custom ids and deletions", "[serialize][ids]") {
     for (int kind = 0; kind < 5; ++kind) {
         for (bool custom : {false, true}) {
             CAPTURE(kind, custom);
-            std::unique_ptr<Index> base;   // RefineIndex's base, kept alive alongside it
-            std::unique_ptr<Index> index;
+            std::unique_ptr<DenseIndex> base;   // RefineIndex's base, kept alive alongside it
+            std::unique_ptr<DenseIndex> index;
             if (kind == 0) index = std::make_unique<FlatIndex>(dim, 16, custom);
             else if (kind <= 3) {
                 auto ivf = make_ivf(kind == 1 ? IvfMode::Plain : kind == 2 ? IvfMode::ADC : IvfMode::SDC, dim, data, n, false);
@@ -635,7 +635,7 @@ TEST_CASE("save/load keeps custom ids and deletions", "[serialize][ids]") {
             REQUIRE(loaded->remove(del) == (custom ? 1u : 0u));  // only the re-added id is live
 
             // Both keep behaving the same after further adds and deletes.
-            std::unique_ptr<Index> loaded_again = roundtrip(*index);
+            std::unique_ptr<DenseIndex> loaded_again = roundtrip(*index);
             mutate(*index, dim, 900000);
             mutate(*loaded_again, dim, 900000);
             require_same(*index, *loaded_again, queries, nq, k);
@@ -903,7 +903,7 @@ TEST_CASE("IdMap: compact drops deleted slots and keeps ids", "[idmap][compact]"
 // Deletes every third live id, compacts, and checks that nothing a caller can
 // see changed: same results (ids and distances), same size, old ids still
 // removable, new ids continuing after the highest ever assigned.
-static void check_compaction(Index& index, const std::vector<int64_t>& ids, const std::vector<float>& data, size_t dim) {
+static void check_compaction(DenseIndex& index, const std::vector<int64_t>& ids, const std::vector<float>& data, size_t dim) {
     const size_t nq = 40, k = 10;
     auto queries = random_matrix(nq, dim, 77);
 

@@ -1,5 +1,5 @@
 // Per-section single-query profile of IVF fast-scan under a RefineIndex, the
-// path ann-benchmarks and VIBE time: one Index::query per query, one thread.
+// path ann-benchmarks and VIBE time: one DenseIndex::query per query, one thread.
 //
 //   cmake -B build-prof -DCMAKE_BUILD_TYPE=Release -DVECENGINE_PROFILE=ON -DVECENGINE_BUILD_TESTS=OFF
 //   cmake --build build-prof --target profile_fastscan -j

@@ -1,7 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "vecengine/index_factory.hpp"
-#include "vecengine/sparse_index.hpp"
+#include "vecengine/inverted_index.hpp"
 #include "serialize.hpp"
 
 #include <algorithm>
@@ -104,12 +104,12 @@ std::vector<int64_t> iota_ids(size_t n) {
 
 } // namespace
 
-TEST_CASE("SparseIndex matches brute-force dot products (fuzz)", "[sparse]") {
+TEST_CASE("InvertedIndex matches brute-force dot products (fuzz)", "[sparse]") {
     std::mt19937 rng(7);
     for (bool exact : {true, false}) {
         const auto docs = random_rows(2000, 500, 12, exact, rng);
         const auto queries = random_rows(100, 500, 6, exact, rng);
-        SparseIndex index;
+        InvertedIndex index;
         const Csr csr(docs);
         REQUIRE(index.add_batch(csr.view()) == iota_ids(docs.size()));
         REQUIRE(index.size() == 2000);
@@ -124,7 +124,7 @@ TEST_CASE("SparseIndex matches brute-force dot products (fuzz)", "[sparse]") {
     }
 }
 
-TEST_CASE("SparseIndex: MaxScore pruning matches full scoring, with negative weights and filters (fuzz)", "[sparse]") {
+TEST_CASE("InvertedIndex: MaxScore pruning matches full scoring, with negative weights and filters (fuzz)", "[sparse]") {
     std::mt19937 rng(23);
     std::uniform_int_distribution<int> coin(0, 3);
     for (int trial = 0; trial < 4; ++trial) {
@@ -140,7 +140,7 @@ TEST_CASE("SparseIndex: MaxScore pruning matches full scoring, with negative wei
                     for (auto& [t, v] : row)
                         if (coin(rng) == 0) v = -v;
         }
-        SparseIndex index;
+        InvertedIndex index;
         index.add_batch(Csr(docs).view());
         std::vector<int64_t> gone;
         for (int64_t i = 0; i < 3000; i += 13) gone.push_back(i);
@@ -170,8 +170,8 @@ TEST_CASE("SparseIndex: MaxScore pruning matches full scoring, with negative wei
     }
 }
 
-TEST_CASE("SparseIndex: input order, repeats and zeros don't change scores", "[sparse]") {
-    SparseIndex index;
+TEST_CASE("InvertedIndex: input order, repeats and zeros don't change scores", "[sparse]") {
+    InvertedIndex index;
     // doc 0 as given out of order with a repeat and a zero; doc 1 canonical
     const Csr docs({{{9, 1.0f}, {3, 2.0f}, {9, 2.0f}, {4, 0.0f}}, {{3, 2.0f}, {9, 3.0f}}});
     index.add_batch(docs.view());
@@ -192,7 +192,7 @@ TEST_CASE("SparseIndex: input order, repeats and zeros don't change scores", "[s
     REQUIRE(index.query_batch(Csr({}).view(), 10).empty());
 }
 
-TEST_CASE("SparseIndex: custom ids, remove, compact, filters and metadata", "[sparse]") {
+TEST_CASE("InvertedIndex: custom ids, remove, compact, filters and metadata", "[sparse]") {
     std::mt19937 rng(11);
     const auto docs = random_rows(300, 50, 8, true, rng);
     const auto queries = random_rows(20, 50, 4, true, rng);
@@ -202,7 +202,7 @@ TEST_CASE("SparseIndex: custom ids, remove, compact, filters and metadata", "[sp
         ids[i] = 1000 + 3 * static_cast<int64_t>(i);
         parity[i] = static_cast<int64_t>(i % 2);
     }
-    SparseIndex index(true);
+    InvertedIndex index(true);
     REQUIRE(index.add_batch(Csr(docs).view(), ids.data(), {{"odd", parity}}) == ids);
     REQUIRE_THROWS_AS(index.add_batch(Csr({{{1, 1.0f}}}).view()), std::invalid_argument);  // needs ids
 
@@ -217,7 +217,7 @@ TEST_CASE("SparseIndex: custom ids, remove, compact, filters and metadata", "[sp
     for (size_t i = 0; i < docs.size(); i += 3) allowed.push_back(ids[i]);
     const Expr odd = Expr::compare("odd", Expr::Op::Eq, int64_t{1});
 
-    auto check = [&](const SparseIndex& idx) {
+    auto check = [&](const InvertedIndex& idx) {
         const Csr q(queries);
         const auto plain = idx.query_batch(q.view(), 10);
         const auto by_ids = idx.query_batch(q.view(), 10, allowed);
@@ -246,7 +246,7 @@ TEST_CASE("SparseIndex: custom ids, remove, compact, filters and metadata", "[sp
     std::stringstream s;
     index.save(s);
     std::unique_ptr<IndexBase> loaded = load_index(s);
-    auto* sparse = dynamic_cast<SparseIndex*>(loaded.get());
+    auto* sparse = dynamic_cast<InvertedIndex*>(loaded.get());
     REQUIRE(sparse != nullptr);
     REQUIRE(sparse->custom_ids());
     REQUIRE(sparse->postings() == index.postings());
@@ -259,8 +259,8 @@ TEST_CASE("SparseIndex: custom ids, remove, compact, filters and metadata", "[sp
     REQUIRE(again.str() == s.str());
 }
 
-TEST_CASE("SparseIndex rejects malformed rows and corrupt files", "[sparse]") {
-    SparseIndex index;
+TEST_CASE("InvertedIndex rejects malformed rows and corrupt files", "[sparse]") {
+    InvertedIndex index;
     const std::vector<uint32_t> indices = {1, 2};
     const std::vector<float> values = {1.0f, 1.0f};
     const std::vector<uint64_t> bad_start = {1, 2}, decreasing = {0, 2, 1}, too_long = {0, 3};
@@ -293,12 +293,12 @@ TEST_CASE("SparseIndex rejects malformed rows and corrupt files", "[sparse]") {
     REQUIRE_THROWS_AS(load_index(truncated), std::runtime_error);
 }
 
-TEST_CASE("SparseIndex file saved on macOS (format 9) loads", "[sparse][compat]") {
+TEST_CASE("InvertedIndex file saved on macOS (format 9) loads", "[sparse][compat]") {
     // 1000 docs, custom ids 100, 103, ..., every ninth deleted (not compacted),
     // int / string / float metadata columns; results are checked in test_sparse.py
     const std::filesystem::path dir = QANN_TEST_DATA_DIR;
     std::unique_ptr<IndexBase> loaded = load_index(dir / "v9_sparse.qann");
-    auto* index = dynamic_cast<SparseIndex*>(loaded.get());
+    auto* index = dynamic_cast<InvertedIndex*>(loaded.get());
     REQUIRE(index != nullptr);
     REQUIRE(index->custom_ids());
     REQUIRE(index->slots() == 1000);
@@ -321,4 +321,22 @@ TEST_CASE("SparseIndex file saved on macOS (format 9) loads", "[sparse][compat]"
     std::unique_ptr<IndexBase> again = load_index(s);
     REQUIRE(again->size() == 888);
     REQUIRE(again->slots() == 888);
+}
+
+TEST_CASE("make_index builds an InvertedIndex, usable through SparseIndex", "[sparse]") {
+    IndexOptions opts;
+    opts.custom_ids = true;
+    opts.pruning = false;
+    std::unique_ptr<IndexBase> made = make_index(IndexType::Inverted, 0, opts);
+    auto* inverted = dynamic_cast<InvertedIndex*>(made.get());
+    REQUIRE(inverted != nullptr);
+    REQUIRE(inverted->custom_ids());
+    REQUIRE_FALSE(inverted->pruning());
+
+    SparseIndex& sparse = *inverted;
+    const std::vector<int64_t> ids = {5, 9};
+    sparse.add_batch(Csr({{{1, 1.0f}}, {{1, 2.0f}, {2, 1.0f}}}).view(), ids.data());
+    const auto r = sparse.query_batch(Csr({{{1, 1.0f}}}).view(), 5)[0];
+    REQUIRE(r.size() == 2);
+    REQUIRE((r[0].index == 9 && r[0].distance == -2.0f));
 }

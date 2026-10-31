@@ -149,7 +149,7 @@ private:
 };
 
 // An index of dense vectors: dim() floats each, compared by a Metric.
-class Index : public IndexBase {
+class DenseIndex : public IndexBase {
 public:
     // add, add_batch, query and query_batch prepare vectors for the metric
     // (scaling them to unit length for Cosine) exactly once, call the index's
@@ -205,7 +205,7 @@ public:
     virtual size_t dim() const noexcept = 0;
 
 protected:
-    explicit Index(Metric metric = Metric::L2) : metric_(metric) {}
+    explicit DenseIndex(Metric metric = Metric::L2) : metric_(metric) {}
 
     // A copy of the n rows of vecs (dim() floats each), each scaled to unit
     // length. Throws std::invalid_argument on a zero row. Used for

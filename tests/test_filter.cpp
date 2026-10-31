@@ -89,8 +89,8 @@ namespace {
 // One index under test plus whatever it wraps.
 struct Built {
     std::string name;
-    std::unique_ptr<Index> base;   // the RefineIndex's base, or nullptr
-    std::unique_ptr<Index> index;  // what queries run on
+    std::unique_ptr<DenseIndex> base;   // the RefineIndex's base, or nullptr
+    std::unique_ptr<DenseIndex> index;  // what queries run on
 };
 
 } // namespace
@@ -221,7 +221,7 @@ TEST_CASE("Filtered search with custom ids and after compaction", "[filter]") {
         allowed.push_back(1001);
 
         const auto truth = filtered_truth(data, dim, queries, nq, k, rows);
-        for (Index* index : {static_cast<Index*>(&flat), static_cast<Index*>(&hnsw)}) {
+        for (DenseIndex* index : {static_cast<DenseIndex*>(&flat), static_cast<DenseIndex*>(&hnsw)}) {
             const auto got = index->query_batch(queries, nq, k, allowed);
             for (size_t q = 0; q < nq; ++q) {
                 REQUIRE(got[q].size() == k);
@@ -341,7 +341,7 @@ TEST_CASE("Bare IVF scores a narrow filter's vectors directly: exact for plain, 
     for (auto& row : truth)
         for (auto& nb : row) nb.index = static_cast<size_t>(ids[nb.index]);
 
-    auto require_exact = [&](const Index& index) {
+    auto require_exact = [&](const DenseIndex& index) {
         const auto batch = index.query_batch(queries, nq, k, allowed);
         for (size_t q = 0; q < nq; ++q) {
             const auto one = index.query(std::span<const float>(queries.data() + q * dim, dim), k, allowed);

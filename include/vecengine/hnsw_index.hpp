@@ -32,7 +32,7 @@ using std::span;
 // training is needed. With enable_sq() they are stored as 8- or 4-bit codes
 // per dimension (see detail::SQ): 4x or 8x less vector memory and faster
 // searches, with approximate distances that a RefineIndex can make exact again.
-class HNSWIndex : public Index {
+class HNSWIndex : public DenseIndex {
 public:
     // dim floats per vector. M is the neighbors a node keeps per upper level
     // (2 * M on level 0); ef_construction the beam width used while inserting.
@@ -42,7 +42,7 @@ public:
     explicit HNSWIndex(size_t dim, size_t M = 16, size_t ef_construction = 200, bool custom_ids = false,
                        std::optional<uint32_t> seed = std::nullopt, Metric metric = Metric::L2);
 
-    // Index overrides; see Index for the contract of each. add_batch inserts
+    // DenseIndex overrides; see DenseIndex for the contract of each. add_batch inserts
     // the vectors on num_threads() threads.
     // add_batch throws std::logic_error with SQ enabled but not trained.
     size_t remove(span<const int64_t> ids) override;
@@ -102,7 +102,7 @@ public:
     bool trained() const noexcept { return quant_.dim() > 0; }
 
 private:
-    // Index implementations: vectors already prepared for the metric.
+    // DenseIndex implementations: vectors already prepared for the metric.
     void add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) override;
     vector<Neighbor> query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const override;
     const detail::IdMap& id_map() const noexcept override { return id_map_; }

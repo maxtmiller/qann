@@ -1,14 +1,10 @@
 #pragma once
 
 #include "vecengine/index.hpp"
-#include "vecengine/id_map.hpp"
 
 #include <cstddef>
 #include <cstdint>
-#include <iosfwd>
-#include <memory>
 #include <span>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -30,19 +26,15 @@ struct SparseRows {
     size_t rows() const noexcept { return indptr.empty() ? 0 : indptr.size() - 1; }
 };
 
-// Exact inverted index over sparse vectors (issue #59), for keyword-style
-// retrieval with BM25 or learned sparse weights (SPLADE) computed by the
-// caller. Scores by inner product: a result's distance is -(q . d), so the
-// largest dot product comes first, as with Metric::InnerProduct. A query
-// reads only its own terms' posting lists, and returns only vectors that
-// share at least one nonzero term with it. With pruning on (the default),
-// queries skip vectors that can't reach the top k; results are the same.
+// An index of sparse vectors (issue #59), scored by inner product: a
+// result's distance is -(q . d), so the largest dot product comes first, as
+// with Metric::InnerProduct. For keyword-style retrieval with BM25 or learned
+// sparse weights (SPLADE) computed by the caller. add_batch and query_batch
+// check the rows and make each one canonical (see canonical_row), handle ids,
+// metadata and filters, and call the index's *_impl; InvertedIndex is exact.
 class SparseIndex : public IndexBase {
 public:
-    // custom_ids makes add_batch() take user ids.
-    explicit SparseIndex(bool custom_ids = false) : id_map_(custom_ids) {}
-
-    // Adds rows.rows() vectors, with ids and metadata as in Index::add_batch.
+    // Adds rows.rows() vectors, with ids and metadata as in DenseIndex::add_batch.
     // Zero values are dropped. Throws std::invalid_argument, adding nothing,
     // on malformed rows (see SparseRows), bad ids or bad metadata. Returns the
     // vectors' ids, in order.
@@ -53,73 +45,33 @@ public:
     // malformed rows.
     vector<vector<Neighbor>> query_batch(const SparseRows& queries, size_t k) const;
 
-    // Filtered search, as in Index: only vectors whose id is in `allowed`,
+    // Filtered search, as in DenseIndex: only vectors whose id is in `allowed`,
     // whose metadata matches `where`, or both, can be returned.
     vector<vector<Neighbor>> query_batch(const SparseRows& queries, size_t k, span<const int64_t> allowed) const;
     vector<vector<Neighbor>> query_batch(const SparseRows& queries, size_t k, const Expr& where) const;
     vector<vector<Neighbor>> query_batch(const SparseRows& queries, size_t k, const Expr& where,
                                          span<const int64_t> allowed) const;
 
-    // IndexBase overrides; see IndexBase for the contract of each.
-    size_t remove(span<const int64_t> ids) override { return id_map_.remove(ids); }
-    size_t compact() override;
-    void save(std::ostream& out) const override;
-    size_t slots() const noexcept override { return id_map_.slots(); }
-    bool ids_are_slots() const noexcept override { return id_map_.ids_are_slots(); }
-    bool custom_ids() const noexcept override { return id_map_.custom_ids(); }
-    size_t size() const noexcept override { return id_map_.live(); }
+protected:
+    SparseIndex() = default;
 
-    // Whether queries prune (default on; see search_one). Off scores every
-    // vector in the query terms' lists; results are the same either way, up
-    // to which of several vectors tied at the k-th distance is kept. Not saved.
-    bool pruning() const noexcept { return pruning_; }
-    void set_pruning(bool on) noexcept { pruning_ = on; }
+    // A row's (term, value) pairs.
+    using Terms = vector<std::pair<uint32_t, float>>;
 
-    // Distinct terms with a posting list, and stored (term, vector) pairs,
-    // including those of deleted vectors not yet compacted away.
-    size_t terms() const noexcept { return lists_.size(); }
-    size_t postings() const noexcept;
-
-    // Rebuilds a SparseIndex from the body save() wrote, after load_index()
-    // has read the header. Throws std::runtime_error on corrupt data.
-    static std::unique_ptr<SparseIndex> load_body(std::istream& in, uint32_t version);
+    // Row i of rows, sorted by term, repeats summed (in their original order)
+    // and zeros dropped, into out.
+    static void canonical_row(const SparseRows& rows, size_t i, Terms& out);
 
 private:
-    struct Posting {
-        uint32_t slot;
-        float weight;
-    };
-
-    // A term's postings, in increasing slot order, and the extremes of their
-    // weights, which bound what the term can add to a score.
-    struct List {
-        vector<Posting> postings;
-        float max_weight = 0;
-        float min_weight = 0;
-
-        // Sets max_weight and min_weight from postings.
-        void bound();
-    };
-
-    const detail::IdMap& id_map() const noexcept override { return id_map_; }
-
-    using Terms = vector<std::pair<uint32_t, float>>;
+    // What each sparse index implements. add_batch_impl gets well-formed rows
+    // and must throw on bad ids before changing anything. query_impl gets one
+    // canonical query and k >= 1; a non-null filter holds the live slots that
+    // may be returned (count > 0), and without one every live slot may.
+    virtual void add_batch_impl(const SparseRows& rows, const int64_t* ids) = 0;
+    virtual vector<Neighbor> query_impl(const Terms& terms, size_t k, const detail::SlotFilter* filter) const = 0;
 
     // query_batch() for every overload; filter is nullptr for an unfiltered query.
     vector<vector<Neighbor>> search(const SparseRows& queries, size_t k, const detail::SlotFilter* filter) const;
-
-    // One query (terms canonical, k >= 1), term at a time, its lists taken
-    // from the largest possible contribution down. With pruning_, once the
-    // lists left can't lift an unseen vector into the top k, they only add to
-    // the vectors that can still get there (MaxScore's term-at-a-time form,
-    // Turtle and Flood, 1995), found by searching the lists instead of
-    // reading them. Both ways sum each score in the same order, so they
-    // return the same distances.
-    vector<Neighbor> search_one(const Terms& terms, size_t k, const detail::SlotFilter* filter) const;
-
-    std::unordered_map<uint32_t, List> lists_;
-    detail::IdMap id_map_;
-    bool pruning_ = true;
 };
 
 } // namespace vecengine

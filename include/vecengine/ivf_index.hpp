@@ -33,7 +33,7 @@ struct InvertedList {
 // query scans only the nprobe clusters nearest to it. Optionally stores PQ
 // codes of each vector's residual, or SQ codes of each vector, instead of the
 // raw floats.
-class IVFIndex : public Index {
+class IVFIndex : public DenseIndex {
 public:
     // nlist must be in [100, 65535] and nprobe in [1, nlist]; throws
     // std::invalid_argument otherwise. custom_ids makes add_batch() take user
@@ -96,7 +96,7 @@ public:
     bool filter_probe_scaling() const noexcept { return filter_probe_scaling_; }
     void set_filter_probe_scaling(bool enabled) noexcept { filter_probe_scaling_ = enabled; }
 
-    // Index overrides; see Index for the contract of each. Adds throw
+    // DenseIndex overrides; see DenseIndex for the contract of each. Adds throw
     // std::logic_error before train(). query_batch picks every query's nprobe
     // lists with one matrix multiply per block of queries (with BLAS), then
     // scans the lists in parallel; results match query() except that a
@@ -126,7 +126,7 @@ public:
     size_t dim() const noexcept override { return dim_; }
 
 private:
-    // Index implementations: vectors already prepared for the metric.
+    // DenseIndex implementations: vectors already prepared for the metric.
     void add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) override;
     vector<Neighbor> query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const override;
     vector<vector<Neighbor>> query_batch_impl(span<const float> queries, size_t num_queries, size_t k,
