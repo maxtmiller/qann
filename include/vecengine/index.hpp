@@ -39,7 +39,8 @@ enum class Metric : uint8_t {
     InnerProduct = 2,  // -(a . b), so the largest inner product comes first
 };
 
-// Common interface every index type implements.
+// What every index has, whatever form its vectors take: ids, slots,
+// deletion, metadata, saving and locking.
 //
 // Every added vector gets a slot: its position in insertion order (0, 1, 2,
 // ...), which never changes. Without custom ids a vector's id is its slot;
@@ -47,10 +48,109 @@ enum class Metric : uint8_t {
 // Neighbor::index reports them. remove() only marks slots deleted, so slots
 // stay stable; RefineIndex relies on that to keep its raw vectors aligned
 // with its base's slots.
-class Index {
+class IndexBase {
 public:
-    virtual ~Index() = default;
+    virtual ~IndexBase() = default;
 
+    // Overwrites the given metadata columns of the vectors with these ids; other
+    // columns keep their values. Throws std::invalid_argument before changing
+    // anything on an unknown, deleted or repeated id, a column the index
+    // doesn't have (see add_metadata_column), or metadata an add would reject.
+    void update_metadata(span<const int64_t> ids, const Metadata& metadata);
+
+    // The metadata of the vectors with these ids: the columns named in
+    // columns, in that order, or every column in creation order when it is
+    // nullptr. Each column has one value per id and valid set for every id
+    // (0 where the vector's value is null). Throws std::invalid_argument on an
+    // unknown, deleted or repeated id, or a column the index doesn't have or
+    // that is named twice.
+    Metadata get_metadata(span<const int64_t> ids, const vector<std::string>* columns = nullptr) const;
+
+    // Adds a metadata column with value for every vector, or null for every
+    // vector without one; fill it further with update_metadata() or later
+    // adds. Throws std::invalid_argument if the name is empty or taken, or the
+    // value doesn't fit the type (ints fit a Float64 column).
+    void add_metadata_column(std::string name, ColumnType type, std::optional<Expr::Value> value = std::nullopt);
+
+    // Adds a metadata column holding values for the vectors with these ids
+    // (valid as in MetadataColumn), null for every other vector, in one step.
+    // Throws std::invalid_argument before changing anything on update_metadata()'s
+    // errors, a taken name, or values that don't fit the type.
+    void add_metadata_column(std::string name, ColumnType type, span<const int64_t> ids, MetadataColumn::Values values,
+                             vector<uint8_t> valid = {});
+
+    // Removes a metadata column and its values from every vector. Throws
+    // std::invalid_argument if the index has no such column.
+    void drop_metadata_column(const std::string& name);
+
+    // Each metadata column's name and type, in the order they were created.
+    vector<std::pair<std::string, ColumnType>> metadata_schema() const { return metadata_.schema(); }
+
+    // Deletes the vectors with these ids; unknown and already deleted ids are
+    // skipped. Returns how many were deleted. Their memory is kept, and
+    // queries skip them.
+    virtual size_t remove(span<const int64_t> ids) = 0;
+
+    // Frees the storage of deleted vectors and returns how many slots were
+    // reclaimed (0 when nothing is deleted). Ids stay the same: results,
+    // remove() and later adds behave as before, with new ids continuing after
+    // the highest ever assigned. Slots are renumbered, so slots() shrinks.
+    virtual size_t compact() = 0;
+
+    // Writes the index (header + body) so load_index() can rebuild it.
+    virtual void save(std::ostream& out) const = 0;
+
+    // Current slots: live vectors plus deleted ones not yet compacted away.
+    virtual size_t slots() const noexcept = 0;
+
+    // Whether every vector's id is its slot (auto ids, never compacted with
+    // stable ids). RefineIndex requires this of its base.
+    virtual bool ids_are_slots() const noexcept = 0;
+
+    // Whether adds take user ids (fixed at construction).
+    virtual bool custom_ids() const noexcept = 0;
+
+    // Number of live (not deleted) vectors.
+    virtual size_t size() const noexcept = 0;
+
+    // Not used by the library itself, which is not thread-safe for writes.
+    // Callers sharing an index across threads (the Python bindings) take it
+    // shared for queries and exclusive for adds, writes and setters; for a
+    // RefineIndex they lock it first, then its base.
+    std::shared_mutex& mutex() const noexcept { return mutex_; }
+
+    // Whether a RefineIndex currently wraps this index. While it does, the
+    // Python add() and remove() refuse to run on this index directly: changes
+    // must go through the RefineIndex to keep its slots aligned with this
+    // index's. The C++ API doesn't enforce it, since RefineIndex itself calls
+    // add_batch() and remove() here.
+    bool wrapped() const noexcept { return wrapped_.load(); }
+
+protected:
+    IndexBase() = default;
+
+    // Metadata columns, aligned to slots. Filled by adds; each index compacts,
+    // saves and loads it with its own storage. Stays empty in the base of a
+    // RefineIndex, whose metadata lives in the RefineIndex.
+    detail::MetadataStore metadata_;
+
+    // The filter of a metadata query: where's matching slots, also in allowed
+    // when it is given, minus deleted slots.
+    detail::SlotFilter where_filter(const Expr& where, const span<const int64_t>* allowed) const;
+
+    // This index's slot <-> id map.
+    virtual const detail::IdMap& id_map() const noexcept = 0;
+
+private:
+    friend class RefineIndex;  // sets and clears wrapped_; reads its base's id_map()
+
+    mutable std::shared_mutex mutex_;
+    std::atomic<bool> wrapped_{false};
+};
+
+// An index of dense vectors: dim() floats each, compared by a Metric.
+class Index : public IndexBase {
+public:
     // add, add_batch, query and query_batch prepare vectors for the metric
     // (scaling them to unit length for Cosine) exactly once, call the index's
     // *_impl, and turn its scores into the metric's distance on the way out.
@@ -98,86 +198,11 @@ public:
     vector<vector<Neighbor>> query_batch(span<const float> queries, size_t num_queries, size_t k,
                                          const Expr& where, span<const int64_t> allowed) const;
 
-    // Overwrites the given metadata columns of the vectors with these ids; other
-    // columns keep their values. Throws std::invalid_argument before changing
-    // anything on an unknown, deleted or repeated id, a column the index
-    // doesn't have (see add_metadata_column), or metadata add_batch() would
-    // reject.
-    void update_metadata(span<const int64_t> ids, const Metadata& metadata);
-
-    // Adds a metadata column with value for every vector, or null for every
-    // vector without one; fill it further with update_metadata() or later
-    // adds. Throws std::invalid_argument if the name is empty or taken, or the
-    // value doesn't fit the type (ints fit a Float64 column).
-    void add_metadata_column(std::string name, ColumnType type, std::optional<Expr::Value> value = std::nullopt);
-
-    // Adds a metadata column holding values for the vectors with these ids
-    // (valid as in MetadataColumn), null for every other vector, in one step.
-    // Throws std::invalid_argument before changing anything on update_metadata()'s
-    // errors, a taken name, or values that don't fit the type.
-    void add_metadata_column(std::string name, ColumnType type, span<const int64_t> ids, MetadataColumn::Values values,
-                             vector<uint8_t> valid = {});
-
-    // Removes a metadata column and its values from every vector. Throws
-    // std::invalid_argument if the index has no such column.
-    void drop_metadata_column(const std::string& name);
-
-    // The metadata of the vectors with these ids: the columns named in
-    // columns, in that order, or every column in creation order when it is
-    // nullptr. Each column has one value per id and valid set for every id
-    // (0 where the vector's value is null). Throws std::invalid_argument on an
-    // unknown, deleted or repeated id, or a column the index doesn't have or
-    // that is named twice.
-    Metadata get_metadata(span<const int64_t> ids, const vector<std::string>* columns = nullptr) const;
-
-    // Each metadata column's name and type, in the order they were created.
-    vector<std::pair<std::string, ColumnType>> metadata_schema() const { return metadata_.schema(); }
-
     // How this index compares vectors (fixed at construction).
     Metric metric() const noexcept { return metric_; }
 
-    // Deletes the vectors with these ids; unknown and already deleted ids are
-    // skipped. Returns how many were deleted. Their memory is kept, and
-    // queries skip them.
-    virtual size_t remove(span<const int64_t> ids) = 0;
-
-    // Frees the storage of deleted vectors and returns how many slots were
-    // reclaimed (0 when nothing is deleted). Ids stay the same: results,
-    // remove() and later adds behave as before, with new ids continuing after
-    // the highest ever assigned. Slots are renumbered, so slots() shrinks.
-    virtual size_t compact() = 0;
-
-    // Writes the index (header + body) so load_index() can rebuild it.
-    virtual void save(std::ostream& out) const = 0;
-
-    // Current slots: live vectors plus deleted ones not yet compacted away.
-    virtual size_t slots() const noexcept = 0;
-
-    // Whether every vector's id is its slot (auto ids, never compacted with
-    // stable ids). RefineIndex requires this of its base.
-    virtual bool ids_are_slots() const noexcept = 0;
-
-    // Whether add_batch() takes user ids (fixed at construction).
-    virtual bool custom_ids() const noexcept = 0;
-
-    // Number of live (not deleted) vectors.
-    virtual size_t size() const noexcept = 0;
-
     // Floats per vector.
     virtual size_t dim() const noexcept = 0;
-
-    // Not used by the library itself, which is not thread-safe for writes.
-    // Callers sharing an index across threads (the Python bindings) take it
-    // shared for queries and exclusive for add/train/setters; for a
-    // RefineIndex they lock it first, then its base.
-    std::shared_mutex& mutex() const noexcept { return mutex_; }
-
-    // Whether a RefineIndex currently wraps this index. While it does, the
-    // Python add() and remove() refuse to run on this index directly: changes
-    // must go through the RefineIndex to keep its slots aligned with this
-    // index's. The C++ API doesn't enforce it, since RefineIndex itself calls
-    // add_batch() and remove() here.
-    bool wrapped() const noexcept { return wrapped_.load(); }
 
 protected:
     explicit Index(Metric metric = Metric::L2) : metric_(metric) {}
@@ -195,18 +220,13 @@ protected:
 
     Metric metric_; // set by the constructor, or by a load_body
 
-    // Metadata columns, aligned to slots. Filled by add_batch; each index
-    // compacts, saves and loads it with its own storage. Stays empty in the
-    // base of a RefineIndex, whose metadata lives in the RefineIndex.
-    detail::MetadataStore metadata_;
-
     // Default: query_impl() for each row, in parallel. Protected so an
     // override can fall back to it.
     virtual vector<vector<Neighbor>> query_batch_impl(span<const float> queries, size_t num_queries, size_t k,
                                                       const detail::SlotFilter* filter) const;
 
 private:
-    friend class RefineIndex;  // sets and clears wrapped_; calls compact_as_base() and the *_impl methods
+    friend class RefineIndex;  // calls compact_as_base() and the *_impl methods
 
     // Shared by the public query() and query_batch() overloads: prepares the
     // queries for the metric, calls query_impl() (one query, batch false) or
@@ -214,13 +234,6 @@ private:
     // unfiltered query.
     vector<vector<Neighbor>> query_prepared(span<const float> queries, size_t num_queries, size_t k,
                                             const detail::SlotFilter* filter, bool batch) const;
-
-    // The filter of a metadata query: where's matching slots, also in allowed
-    // when it is given, minus deleted slots.
-    detail::SlotFilter where_filter(const Expr& where, const span<const int64_t>* allowed) const;
-
-    // This index's slot <-> id map, used to turn allowed ids into slots.
-    virtual const detail::IdMap& id_map() const noexcept = 0;
 
     // What each index implements. Vectors arrive already prepared for the
     // metric, and distances go back as squared L2 between prepared vectors,
@@ -233,9 +246,6 @@ private:
     // compact() for the base of a RefineIndex: same storage compaction, but
     // ids become the new slots so they keep matching the RefineIndex's slots.
     virtual size_t compact_as_base() = 0;
-
-    mutable std::shared_mutex mutex_;
-    std::atomic<bool> wrapped_{false};
 };
 
 } // namespace vecengine

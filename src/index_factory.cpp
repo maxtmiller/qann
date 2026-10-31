@@ -44,7 +44,7 @@ std::unique_ptr<Index> load_index(std::istream& in) {
     throw std::runtime_error("unknown index kind");
 }
 
-void save_index(const Index& index, const std::filesystem::path& path) {
+void save_index(const IndexBase& index, const std::filesystem::path& path) {
     std::filesystem::path tmp = path;
     tmp += ".tmp";
 
