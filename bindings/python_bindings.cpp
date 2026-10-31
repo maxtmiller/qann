@@ -851,6 +851,11 @@ NB_MODULE(qann, m) {
              nb::arg("where").none() = nb::none(),
              "query() for each row of a sparse matrix, in parallel; returns (ids, distances) arrays of shape "
              "(num_queries, k), padded with -1 / inf")
+        .def_prop_rw("pruning",
+                     [](const vecengine::SparseIndex& self) { return read_locked(self, [&] { return self.pruning(); }); },
+                     [](vecengine::SparseIndex& self, bool on) { write_locked(self, [&] { self.set_pruning(on); }); },
+                     "Whether queries skip vectors that can't reach the top k (MaxScore; default True). Results are "
+                     "the same either way, up to which of several vectors tied at the k-th distance is kept. Not saved")
         .def_prop_ro("terms", [](const vecengine::SparseIndex& self) { return read_locked(self, [&] { return self.terms(); }); },
                      "Distinct terms with a posting list")
         .def_prop_ro("postings",
