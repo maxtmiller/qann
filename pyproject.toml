@@ -5,13 +5,13 @@ build-backend = "scikit_build_core.build"
 [project]
 name = "qann"
 version = "0.1.0a23"
-description = "Fast nearest-neighbor vector search for Python: exact, IVF and product-quantized indexes with exact re-ranking, implemented in C++"
+description = "Fast nearest-neighbor vector search for Python: exact, IVF, HNSW and quantized indexes for dense vectors, inverted indexes for sparse vectors, with metadata filters, implemented in C++"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Maximilian Miller" }]
 requires-python = ">=3.10"
 dependencies = ["numpy"]
-keywords = ["ann", "vector search", "nearest neighbors", "product quantization", "ivf"]
+keywords = ["ann", "vector search", "nearest neighbors", "product quantization", "scalar quantization", "ivf", "hnsw", "sparse vectors", "bm25", "splade", "filtered search"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
