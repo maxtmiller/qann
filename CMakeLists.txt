@@ -90,6 +90,7 @@ add_library(vecengine_core STATIC
   src/fast_scan.cpp
   src/hnsw_index.cpp
   src/sq.cpp
+  src/sparse_index.cpp
 )
 
 target_include_directories(vecengine_core PUBLIC
@@ -149,6 +150,7 @@ add_executable(test_vecengine
   tests/test_rotation.cpp
   tests/test_metadata.cpp
   tests/test_inner_product.cpp
+  tests/test_sparse.cpp
 )
 
 target_link_libraries(test_vecengine PRIVATE

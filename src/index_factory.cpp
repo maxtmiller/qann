@@ -3,6 +3,7 @@
 #include "vecengine/ivf_index.hpp"
 #include "vecengine/hnsw_index.hpp"
 #include "vecengine/refine_index.hpp"
+#include "vecengine/sparse_index.hpp"
 #include "serialize.hpp"
 
 #include <fstream>
@@ -33,13 +34,14 @@ std::unique_ptr<Index> make_index(IndexType type, size_t dim, const IndexOptions
     throw std::invalid_argument("unknown IndexType");
 }
 
-std::unique_ptr<Index> load_index(std::istream& in) {
+std::unique_ptr<IndexBase> load_index(std::istream& in) {
     const detail::Header header = detail::read_header(in);
     switch (header.kind) {
         case detail::IndexKind::Flat:   return FlatIndex::load_body(in, header.version);
         case detail::IndexKind::IVF:    return IVFIndex::load_body(in, header.version);
         case detail::IndexKind::Refine: return RefineIndex::load_body(in, header.version);
         case detail::IndexKind::HNSW:   return HNSWIndex::load_body(in, header.version);
+        case detail::IndexKind::Sparse: return SparseIndex::load_body(in, header.version);
     }
     throw std::runtime_error("unknown index kind");
 }
@@ -62,11 +64,11 @@ void save_index(const IndexBase& index, const std::filesystem::path& path) {
     }
 }
 
-std::unique_ptr<Index> load_index(const std::filesystem::path& path) {
+std::unique_ptr<IndexBase> load_index(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) throw std::runtime_error("cannot open " + path.string() + " for reading");
 
-    std::unique_ptr<Index> index;
+    std::unique_ptr<IndexBase> index;
     try {
         index = load_index(in);
     } catch (const std::invalid_argument& e) {

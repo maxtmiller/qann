@@ -1,5 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include "load_dense.hpp"
+
 #include "vecengine/distance.hpp"
 #include "vecengine/flat_index.hpp"
 #include "vecengine/hnsw_index.hpp"
@@ -105,7 +107,7 @@ struct OneThread {
 static std::unique_ptr<Index> roundtrip(const Index& index) {
     std::stringstream s;
     index.save(s);
-    return load_index(s);
+    return load_dense(s);
 }
 
 TEST_CASE("inner_product kernels match a double-precision reference", "[ip][distance]") {

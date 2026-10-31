@@ -1,5 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include "load_dense.hpp"
+
 #include "vecengine/distance.hpp"
 #include "vecengine/flat_index.hpp"
 #include "vecengine/id_map.hpp"
@@ -434,7 +436,7 @@ TEST_CASE("IVFIndex: load rejects truncated and corrupt data", "[ivf][serialize]
 static std::unique_ptr<Index> index_roundtrip(const Index& index) {
     std::stringstream s;
     index.save(s);
-    return load_index(s);
+    return load_dense(s);
 }
 
 TEST_CASE("load_index: returns the saved concrete type", "[serialize]") {
@@ -634,12 +636,12 @@ TEST_CASE("save_index/load_index: file round-trip", "[serialize][file]") {
     REQUIRE(fs::exists(file));
     REQUIRE_FALSE(fs::exists(dir.path / "index.qann.tmp"));
 
-    auto loaded = load_index(file);
+    auto loaded = load_dense(file);
     require_same_results(refine, *loaded, data, 20, 5);
 
     // Saving again overwrites the existing file.
     save_index(ivf, file);
-    REQUIRE(dynamic_cast<IVFIndex*>(load_index(file).get()) != nullptr);
+    REQUIRE(dynamic_cast<IVFIndex*>(load_dense(file).get()) != nullptr);
 }
 
 TEST_CASE("save_index/load_index: file errors", "[serialize][file]") {
@@ -650,7 +652,7 @@ TEST_CASE("save_index/load_index: file errors", "[serialize][file]") {
     save_index(flat, file);
 
     SECTION("missing file") {
-        REQUIRE_THROWS_AS(load_index(dir.path / "missing.qann"), std::runtime_error);
+        REQUIRE_THROWS_AS(load_dense(dir.path / "missing.qann"), std::runtime_error);
     }
 
     SECTION("unwritable path") {
@@ -659,7 +661,7 @@ TEST_CASE("save_index/load_index: file errors", "[serialize][file]") {
 
     SECTION("junk after the index") {
         std::ofstream(file, std::ios::binary | std::ios::app) << "junk";
-        REQUIRE_THROWS_AS(load_index(file), std::runtime_error);
+        REQUIRE_THROWS_AS(load_dense(file), std::runtime_error);
     }
 
     SECTION("out-of-range field reported as runtime_error") {
@@ -669,7 +671,7 @@ TEST_CASE("save_index/load_index: file errors", "[serialize][file]") {
         std::string bytes = s.str();
         bytes[9 + 16] = 0; // nprobe = 0
         std::ofstream(file, std::ios::binary | std::ios::trunc) << bytes;
-        REQUIRE_THROWS_AS(load_index(file), std::runtime_error);
-        try { load_index(file); } catch (const std::invalid_argument&) { FAIL("leaked invalid_argument"); } catch (const std::runtime_error&) {}
+        REQUIRE_THROWS_AS(load_dense(file), std::runtime_error);
+        try { load_dense(file); } catch (const std::invalid_argument&) { FAIL("leaked invalid_argument"); } catch (const std::runtime_error&) {}
     }
 }

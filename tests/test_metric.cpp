@@ -1,5 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include "load_dense.hpp"
+
 #include "vecengine/distance.hpp"
 #include "vecengine/flat_index.hpp"
 #include "vecengine/hnsw_index.hpp"
@@ -64,7 +66,7 @@ static void require_identical(const std::vector<std::vector<Neighbor>>& a, const
 static std::unique_ptr<Index> metric_roundtrip(const Index& index) {
     std::stringstream s;
     index.save(s);
-    return load_index(s);
+    return load_dense(s);
 }
 
 TEST_CASE("normalize_rows scales each row to unit length", "[metric]") {
@@ -252,7 +254,7 @@ TEST_CASE("an unknown metric byte is rejected on load", "[metric][serialize]") {
     REQUIRE(bytes[metric_at] == static_cast<char>(Metric::Cosine));
     bytes[metric_at] = 7;
     std::stringstream t(bytes);
-    REQUIRE_THROWS_AS(load_index(t), std::runtime_error);
+    REQUIRE_THROWS_AS(load_dense(t), std::runtime_error);
 }
 
 TEST_CASE("make_index passes the metric", "[metric]") {
@@ -270,7 +272,7 @@ TEST_CASE("files from format version 4 (0.1.0a10) still load, as L2", "[serializ
     struct Expect { const char* name; size_t size; };
     for (const Expect e : {Expect{"v4_flat.qann", 1285}, Expect{"v4_ivf_fs.qann", 1500}, Expect{"v4_hnsw.qann", 1200}}) {
         CAPTURE(e.name);
-        auto index = load_index(dir / e.name);
+        auto index = load_dense(dir / e.name);
         REQUIRE(index->size() == e.size);
         REQUIRE(index->dim() == 16);
         REQUIRE(index->metric() == Metric::L2);
@@ -285,7 +287,7 @@ TEST_CASE("files from format version 4 (0.1.0a10) still load, as L2", "[serializ
         index->save(s);
         REQUIRE(read_header(s).version == kFormatVersion);
         s.seekg(0);
-        auto reloaded = load_index(s);
+        auto reloaded = load_dense(s);
         REQUIRE(reloaded->metric() == Metric::L2);
         const auto again = reloaded->query(query, 10);
         for (size_t i = 0; i < before.size(); ++i) {

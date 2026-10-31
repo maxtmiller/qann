@@ -1,6 +1,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
+#include "load_dense.hpp"
+
 #include "vecengine/flat_index.hpp"
 #include "vecengine/hnsw_index.hpp"
 #include "vecengine/index_factory.hpp"
@@ -694,7 +696,7 @@ TEST_CASE("Metadata is saved and loaded with every index", "[metadata][serialize
 
         std::stringstream s;
         index->save(s);
-        auto loaded = load_index(s);
+        auto loaded = load_dense(s);
         REQUIRE(loaded->metadata_schema() == index->metadata_schema());
         md_require_identical(loaded->query_batch(queries, nq, k, where), index->query_batch(queries, nq, k, where));
         md_require_identical(loaded->query_batch(queries, nq, k, Expr::is_null("price")),
@@ -928,7 +930,7 @@ TEST_CASE("update_metadata overwrites rows in place and validates first", "[meta
         std::stringstream buf;
         flat.save(buf);
         REQUIRE(buf.str().find("teal") != std::string::npos);
-        auto loaded = load_index(buf);
+        auto loaded = load_dense(buf);
         const auto got = loaded->query(q, n, color("teal"));
         REQUIRE(got.size() == 2);
         flat.update_metadata(Ids{12, 15}, {{"color", std::vector<std::string>{"red", "red"}}});
@@ -1144,7 +1146,7 @@ TEST_CASE("update_metadata and string cleanup on compact work on every index", "
         index->save(buf);
         REQUIRE(buf.str().find("rare") == std::string::npos);
         REQUIRE(buf.str().find("fresh") != std::string::npos);
-        auto loaded = load_index(buf);
+        auto loaded = load_dense(buf);
         const auto again = loaded->query(q, n, f("tag", Op::Eq, std::string("fresh")));
         REQUIRE(again.size() == 1);
         REQUIRE(again[0].index == 9);

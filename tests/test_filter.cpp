@@ -1,5 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include "load_dense.hpp"
+
 #include "vecengine/distance.hpp"
 #include "vecengine/flat_index.hpp"
 #include "vecengine/hnsw_index.hpp"
@@ -356,7 +358,7 @@ TEST_CASE("Bare IVF scores a narrow filter's vectors directly: exact for plain, 
     require_exact(ivf);
     std::stringstream buf;
     ivf.save(buf);
-    require_exact(*load_index(buf));
+    require_exact(*load_dense(buf));
 
     // vectors added after compaction are found through the lookup too
     const auto extra = filter_random(1, dim, 11);
