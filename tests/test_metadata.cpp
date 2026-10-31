@@ -975,6 +975,62 @@ TEST_CASE("update_metadata on auto ids after compaction, and through a RefineInd
     REQUIRE(fresh.query(q, 1, Expr::is_null("tag")).size() == 1);
 }
 
+TEST_CASE("get_metadata reads values and nulls back by id", "[metadata]") {
+    const size_t dim = 4, n = 6;
+    const auto data = md_random(n, dim, 13);
+    using Ids = std::vector<int64_t>;
+    using Names = std::vector<std::string>;
+
+    FlatIndex flat(dim, 1024, true);
+    const Ids ids = {10, 20, 30, 40, 50, 60};
+    flat.add_batch(data, n, ids.data(),
+                   {{"price", std::vector<int64_t>{1, 2, 3, 4, 5, 6}, {1, 0, 1, 1, 1, 1}},
+                    {"weight", std::vector<double>{0.5, 1.5, 2.5, 3.5, 4.5, 5.5}},
+                    {"color", std::vector<std::string>{"red", "green", "", "red", "blue", "x"}, {1, 1, 0, 1, 1, 1}}});
+    flat.update_metadata(Ids{60}, {{"color", std::vector<std::string>{"green"}}});
+
+    const Metadata all = flat.get_metadata(Ids{60, 20, 30});
+    REQUIRE(all.size() == 3);
+    REQUIRE(all[0].name == "price");
+    REQUIRE(std::get<std::vector<int64_t>>(all[0].values) == std::vector<int64_t>{6, 0, 3});
+    REQUIRE(all[0].valid == std::vector<uint8_t>{1, 0, 1});
+    REQUIRE(all[1].name == "weight");
+    REQUIRE(std::get<std::vector<double>>(all[1].values) == std::vector<double>{5.5, 1.5, 2.5});
+    REQUIRE(all[1].valid == std::vector<uint8_t>{1, 1, 1});
+    REQUIRE(all[2].name == "color");
+    REQUIRE(std::get<std::vector<std::string>>(all[2].values) == std::vector<std::string>{"green", "green", ""});
+    REQUIRE(all[2].valid == std::vector<uint8_t>{1, 1, 0});
+
+    const Names picked = {"color", "price"};
+    const Metadata some = flat.get_metadata(Ids{40}, &picked);
+    REQUIRE(some.size() == 2);
+    REQUIRE(some[0].name == "color");
+    REQUIRE(std::get<std::vector<std::string>>(some[0].values) == std::vector<std::string>{"red"});
+    REQUIRE(some[1].name == "price");
+    const Names none;
+    REQUIRE(flat.get_metadata(Ids{40}, &none).empty());
+    REQUIRE(std::get<std::vector<int64_t>>(flat.get_metadata(Ids{}).at(0).values).empty());
+
+    // values follow their vector through compaction
+    flat.remove(Ids{10, 30});
+    flat.compact();
+    REQUIRE(std::get<std::vector<double>>(flat.get_metadata(Ids{50, 20})[1].values) == std::vector<double>{4.5, 1.5});
+
+    const Names unknown = {"size"}, twice = {"price", "price"};
+    REQUIRE_THROWS_AS(flat.get_metadata(Ids{10}), std::invalid_argument);      // deleted
+    REQUIRE_THROWS_AS(flat.get_metadata(Ids{99}), std::invalid_argument);      // never added
+    REQUIRE_THROWS_AS(flat.get_metadata(Ids{20, 20}), std::invalid_argument);  // repeated
+    REQUIRE_THROWS_AS(flat.get_metadata(Ids{20}, &unknown), std::invalid_argument);
+    REQUIRE_THROWS_AS(flat.get_metadata(Ids{20}, &twice), std::invalid_argument);
+
+    FlatIndex base(dim);
+    RefineIndex refine(base, 2, true);
+    refine.add_batch(std::span<const float>(data.data(), 2 * dim), 2, ids.data(),
+                     {{"color", std::vector<std::string>{"a", "b"}}});
+    REQUIRE(std::get<std::vector<std::string>>(refine.get_metadata(Ids{20})[0].values) == std::vector<std::string>{"b"});
+    REQUIRE(base.get_metadata(Ids{0}).empty());
+}
+
 TEST_CASE("add_metadata_column: a default, values by id, ints into floats, and drop", "[metadata]") {
     const size_t dim = 4, n = 5;
     const auto data = md_random(n, dim, 14);

@@ -1243,6 +1243,65 @@ def test_metadata_none_and_update(tmp_path, data):
     assert refine.metadata_schema["rank"] == "float"
 
 
+def test_get_metadata(tmp_path, data):
+    index = qann.FlatIndex(32, custom_ids=True)
+    index.add(data[:4], [10, 20, 30, 40], metadata={"price": [1, None, 3, 2**62 + 1],
+                                                     "weight": np.array([0.5, 1.5, np.nan, 3.5]),
+                                                     "color": ["red", None, "blue", "red"]})
+    nan = index.get_metadata([30], columns=["weight"])["weight"]
+    assert np.isnan(nan.data[0]) and not nan.mask[0]    # a stored NaN is a value, not a null
+    index.update_metadata([30], {"color": ["green"], "weight": [None]})
+
+    md = index.get_metadata([40, 20, 30])
+    assert list(md) == ["price", "weight", "color"]
+    assert isinstance(md["price"], np.ma.MaskedArray) and md["price"].dtype == np.int64
+    assert md["price"].mask.tolist() == [False, True, False]
+    assert md["price"][0] == 2**62 + 1    # ints stay exact
+    assert md["weight"].dtype == np.float64
+    assert md["weight"].mask.tolist() == [False, False, True]
+    assert md["weight"].compressed().tolist() == [3.5, 1.5]
+    assert md["color"] == ["red", None, "green"]
+    assert md["weight"][2] is np.ma.masked
+
+    picked = index.get_metadata(np.array([10]), columns=["color", "price"])
+    assert list(picked) == ["color", "price"]
+    assert picked["color"] == ["red"] and picked["price"].tolist() == [1]
+    assert index.get_metadata([10], columns=[]) == {}
+    assert index.get_metadata([], columns=["price"])["price"].shape == (0,)
+
+    # read-modify-write
+    stock = index.get_metadata([10, 40], columns=["price"])["price"]
+    index.update_metadata([10, 40], {"price": (stock - 1).tolist()})
+    assert index.get_metadata([10, 40])["price"].tolist() == [0, 2**62]
+
+    with pytest.raises(ValueError, match="id 99 is not in the index"):
+        index.get_metadata([99])
+    with pytest.raises(ValueError, match="id 10 appears twice"):
+        index.get_metadata([10, 10])
+    with pytest.raises(ValueError, match="no metadata column 'size'"):
+        index.get_metadata([10], columns=["size"])
+    with pytest.raises(ValueError, match="'price' appears twice"):
+        index.get_metadata([10], columns=["price", "price"])
+    with pytest.raises(TypeError):    # a bare string isn't a list of columns
+        index.get_metadata([10], columns="price")
+    index.remove([20])
+    with pytest.raises(ValueError, match="id 20 is not in the index"):
+        index.get_metadata([20])
+
+    # follows the vectors through compaction and save / load
+    index.compact()
+    path = tmp_path / "md.qann"
+    index.save(path)
+    assert qann.load(path).get_metadata([30, 10])["color"] == ["green", "red"]
+
+    # a RefineIndex holds the metadata; its base has none
+    base = qann.FlatIndex(32)
+    refine = qann.RefineIndex(base, k_factor=2)
+    refine.add(data[:2], metadata={"color": ["a", "b"]})
+    assert refine.get_metadata([1]) == {"color": ["b"]}
+    assert base.get_metadata([1]) == {}
+
+
 def test_metadata_columns_defaults_values_and_drop(tmp_path, data):
     f = qann.field
     index = qann.FlatIndex(32, custom_ids=True)

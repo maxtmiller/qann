@@ -1411,6 +1411,43 @@ vector<uint64_t> MetadataStore::evaluate_leaf(const Expr& leaf, size_t slots) co
     return words;
 }
 
+Metadata MetadataStore::get(const vector<uint32_t>& slots, const vector<std::string>* names) const {
+    vector<const Column*> cols;
+    if (!names)
+        for (const Column& col : columns_) cols.push_back(&col);
+    else {
+        std::unordered_set<std::string> seen;
+        for (const std::string& name : *names) {
+            if (!seen.insert(name).second) throw std::invalid_argument("metadata column '" + name + "' appears twice");
+            const Column* col = find(name);
+            if (!col) throw std::invalid_argument("the index has no metadata column '" + name + "'");
+            cols.push_back(col);
+        }
+    }
+    Metadata out;
+    for (const Column* col : cols) {
+        vector<uint8_t> valid(slots.size());
+        for (size_t i = 0; i < slots.size(); ++i) valid[i] = col->valid[slots[i]];
+        MetadataColumn::Values values;
+        if (col->type == ColumnType::Int64) {
+            vector<int64_t> v(slots.size());
+            for (size_t i = 0; i < slots.size(); ++i) v[i] = valid[i] ? col->ints[slots[i]] : 0;
+            values = std::move(v);
+        } else if (col->type == ColumnType::Float64) {
+            vector<double> v(slots.size());
+            for (size_t i = 0; i < slots.size(); ++i) v[i] = valid[i] ? col->floats[slots[i]] : 0.0;
+            values = std::move(v);
+        } else {
+            vector<std::string> v(slots.size());
+            for (size_t i = 0; i < slots.size(); ++i)
+                if (valid[i]) v[i] = col->dict[col->codes[slots[i]]];
+            values = std::move(v);
+        }
+        out.emplace_back(col->name, std::move(values), std::move(valid));
+    }
+    return out;
+}
+
 vector<std::pair<std::string, ColumnType>> MetadataStore::schema() const {
     vector<std::pair<std::string, ColumnType>> out;
     for (const Column& col : columns_) out.emplace_back(col.name, col.type);
