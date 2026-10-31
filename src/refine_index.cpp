@@ -23,7 +23,7 @@ using std::vector;
 using std::span;
 using std::pair;
 
-RefineIndex::RefineIndex(Index& base, size_t k_factor, bool custom_ids) : Index(base.metric()), base_(base), k_factor_(k_factor), id_map_(custom_ids) {
+RefineIndex::RefineIndex(DenseIndex& base, size_t k_factor, bool custom_ids) : DenseIndex(base.metric()), base_(base), k_factor_(k_factor), id_map_(custom_ids) {
     if (base.slots() != 0) throw std::invalid_argument("base index must be empty");
     if (k_factor == 0) throw std::invalid_argument("k_factor must be >= 1");
     if (!base.ids_are_slots()) throw std::invalid_argument("base index must not use custom ids or have been compacted");
@@ -193,7 +193,7 @@ std::unique_ptr<RefineIndex> RefineIndex::load_body(std::istream& in, uint32_t v
     const auto count = read_pod<uint64_t>(in);
     if (k_factor == 0) throw std::runtime_error("corrupt file: invalid RefineIndex shape");
 
-    std::unique_ptr<Index> base;
+    std::unique_ptr<DenseIndex> base;
 
     const Header header = read_header(in);
     if (header.version != version)

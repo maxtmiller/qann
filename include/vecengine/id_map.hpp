@@ -103,7 +103,7 @@ public:
     // Whether add() takes user ids.
     bool custom_ids() const noexcept { return custom_ids_; }
     size_t slots() const noexcept { return slots_; }                  // current slots, including deleted
-    size_t live() const noexcept { return slots_ - deleted_count_; }  // what Index::size() reports
+    size_t live() const noexcept { return slots_ - deleted_count_; }  // what IndexBase::size() reports
 
     // Writes the custom_ids flag, the slot count, the next auto id, the labels
     // (when ids differ from slots) and the deleted flags. No header: it is part

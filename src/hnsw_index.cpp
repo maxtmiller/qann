@@ -46,7 +46,7 @@ thread_local VisitedTags t_visited;
 
 
 HNSWIndex::HNSWIndex(size_t dim, size_t M, size_t ef_construction, bool custom_ids, std::optional<uint32_t> seed, Metric metric)
-    : Index(metric), dim_(dim), M_(M), M0_(2 * M), ef_construction_(ef_construction),
+    : DenseIndex(metric), dim_(dim), M_(M), M0_(2 * M), ef_construction_(ef_construction),
       rng_state_(seed ? *seed : std::random_device{}()), id_map_(custom_ids) {
     if (dim == 0) throw std::invalid_argument("dim must be >= 1");
     if (M < 2) throw std::invalid_argument("M must be >= 2");

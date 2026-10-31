@@ -1,4 +1,4 @@
-"""BM25 retrieval with SparseIndex on BEIR datasets (issue #59).
+"""BM25 retrieval with InvertedIndex on BEIR datasets (issue #59).
 
 Builds BM25 document vectors (Lucene's IDF, k1 = 1.2, b = 0.75, lowercase
 alphanumeric tokens, Lucene's English stopwords, no stemming) and runs the
@@ -93,7 +93,7 @@ def main():
     for name in args.datasets:
         docs, queries, qrels = load(name)
         D, Q = bm25(docs, queries)
-        index = qann.SparseIndex()
+        index = qann.InvertedIndex()
         index.add(D)
         print(f"{name}: {D.shape[0]:,} docs, {index.terms:,} terms, {index.postings:,} postings, {Q.shape[0]} queries")
         for k in (10, 100, 1000):

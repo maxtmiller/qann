@@ -53,7 +53,7 @@ static void sq_require_identical(const std::vector<std::vector<Neighbor>>& a, co
     }
 }
 
-static std::unique_ptr<Index> sq_roundtrip(const Index& index) {
+static std::unique_ptr<DenseIndex> sq_roundtrip(const DenseIndex& index) {
     std::stringstream s;
     index.save(s);
     return load_dense(s);
@@ -124,10 +124,10 @@ TEST_CASE("IVF SQ: enable_sq is checked", "[ivf][sq]") {
 
     IndexOptions opts;
     opts.ivf_sq_bits = 8;
-    auto made = make_index(IndexType::IVF, 8, opts);
+    auto made = make_dense(IndexType::IVF, 8, opts);
     REQUIRE(dynamic_cast<IVFIndex&>(*made).sq_bits() == 8);
     opts.pq_subspaces = 4;
-    REQUIRE_THROWS_AS(make_index(IndexType::IVF, 8, opts), std::logic_error);
+    REQUIRE_THROWS_AS(make_dense(IndexType::IVF, 8, opts), std::logic_error);
 }
 
 TEST_CASE("IVF SQ: save/load keeps codes, ranges and an untrained index", "[ivf][sq][serialize]") {

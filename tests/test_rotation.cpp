@@ -318,7 +318,7 @@ TEST_CASE("Rotated IVF-PQ keeps distances, batch results and file round trips", 
         opts.nlist = 100;
         opts.pq_subspaces = m;
         opts.pq_rotate = true;
-        auto index = make_index(IndexType::IVF, d, opts);
+        auto index = make_dense(IndexType::IVF, d, opts);
         REQUIRE(dynamic_cast<IVFIndex&>(*index).pq_rotate());
     }
 

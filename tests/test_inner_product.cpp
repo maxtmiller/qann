@@ -104,7 +104,7 @@ struct OneThread {
     ~OneThread() { set_num_threads(0); }
 };
 
-static std::unique_ptr<Index> roundtrip(const Index& index) {
+static std::unique_ptr<DenseIndex> roundtrip(const DenseIndex& index) {
     std::stringstream s;
     index.save(s);
     return load_dense(s);
@@ -211,7 +211,7 @@ TEST_CASE("the inner product metric survives save/load", "[ip][serialize]") {
     RefineIndex refine(base, 4);
     refine.add_batch(data, n);
 
-    for (const Index* index : {static_cast<const Index*>(&flat), static_cast<const Index*>(&refine)}) {
+    for (const DenseIndex* index : {static_cast<const DenseIndex*>(&flat), static_cast<const DenseIndex*>(&refine)}) {
         auto loaded = roundtrip(*index);
         REQUIRE(loaded->metric() == Metric::InnerProduct);
         require_same(loaded->query_batch(queries, nq, k), index->query_batch(queries, nq, k));
@@ -222,9 +222,9 @@ TEST_CASE("make_index passes the inner product metric", "[ip]") {
     IndexOptions opts;
     opts.metric = Metric::InnerProduct;
     for (IndexType type : {IndexType::Flat, IndexType::IVF, IndexType::HNSW})
-        REQUIRE(make_index(type, 8, opts)->metric() == Metric::InnerProduct);
+        REQUIRE(make_dense(type, 8, opts)->metric() == Metric::InnerProduct);
     opts.pq_subspaces = 4;
-    REQUIRE(make_index(IndexType::IVF, 8, opts)->metric() == Metric::InnerProduct);
+    REQUIRE(make_dense(IndexType::IVF, 8, opts)->metric() == Metric::InnerProduct);
 }
 
 TEST_CASE("IVF-PQ inner product: SDC is rejected and no precomputed tables are built", "[ip][ivf][pq]") {
@@ -325,7 +325,7 @@ TEST_CASE("IVF finds inner product neighbors with floats and SQ", "[ip][ivf]") {
         IVFIndex ivf(dim, 100, 20, false, Metric::InnerProduct);
         if (bits) ivf.enable_sq(bits);
         ivf.train(data, n, 10, 1);
-        Index* index = &ivf;
+        DenseIndex* index = &ivf;
         std::unique_ptr<RefineIndex> refine;
         if (bits == 4) {   // 4 bits needs re-ranking
             refine = std::make_unique<RefineIndex>(ivf, 4);
@@ -515,7 +515,7 @@ TEST_CASE("inner product with custom ids and where= filters on every index", "[i
         std::partial_sort(all.begin(), all.begin() + k, all.end());
         for (size_t i = 0; i < k; ++i) truth[q].push_back(all[i].second);
     }
-    auto check = [&](const Index& index, double min_recall) {
+    auto check = [&](const DenseIndex& index, double min_recall) {
         double hit = 0;
         for (size_t q = 0; q < nq; ++q) {
             const auto got = index.query({queries.data() + q * dim, dim}, k, where);

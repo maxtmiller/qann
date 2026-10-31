@@ -23,7 +23,7 @@
 #include "vecengine/metadata.hpp"
 #include "vecengine/pq.hpp"
 #include "vecengine/refine_index.hpp"
-#include "vecengine/sparse_index.hpp"
+#include "vecengine/inverted_index.hpp"
 #include "vecengine/index_factory.hpp"
 #include "vecengine/threads.hpp"
 
@@ -239,7 +239,7 @@ static vecengine::Metadata as_metadata(nb::dict metadata, std::size_t n, const c
 
 // Add all rows of a (N x dim) matrix to the index, with one id per row when
 // the index uses custom ids, and optional metadata columns. Returns the ids.
-static NumpyArray<int64_t> index_add(vecengine::Index &self, FloatMatrix data, std::optional<IdsArg> ids,
+static NumpyArray<int64_t> index_add(vecengine::DenseIndex &self, FloatMatrix data, std::optional<IdsArg> ids,
                                      std::optional<nb::dict> metadata) {
     if (data.shape(1) != self.dim())
         throw std::invalid_argument("vector dimension does not match index dimension");
@@ -384,7 +384,7 @@ results_padded(const std::vector<std::vector<vecengine::Neighbor>>& results, std
 // returns (indices, distances) as 1D arrays with one entry per result (int64,
 // float32).
 static std::pair<NumpyArray<int64_t>, NumpyArray<float>>
-index_query(const vecengine::Index &self, FloatVector query, std::size_t k, std::optional<IdsArg> allowed,
+index_query(const vecengine::DenseIndex &self, FloatVector query, std::size_t k, std::optional<IdsArg> allowed,
             std::optional<WhereArg> where_arg) {
     if (query.shape(0) != self.dim())
         throw std::invalid_argument("query dimension does not match index dimension");
@@ -406,7 +406,7 @@ index_query(const vecengine::Index &self, FloatVector query, std::size_t k, std:
 // (indices, distances) as (num_queries, k) arrays. Rows with fewer than k
 // results are padded with -1 / inf.
 static std::pair<NumpyArray<int64_t>, NumpyArray<float>>
-index_batch_query(const vecengine::Index &self, FloatMatrix query, std::size_t k, std::optional<IdsArg> allowed,
+index_batch_query(const vecengine::DenseIndex &self, FloatMatrix query, std::size_t k, std::optional<IdsArg> allowed,
                   std::optional<WhereArg> where_arg) {
     if (query.shape(1) != self.dim())
         throw std::invalid_argument("query dimension does not match index dimension");
@@ -462,7 +462,7 @@ static OwnedRows as_sparse_rows(nb::handle obj, const char* what) {
     return rows;
 }
 
-// Add the rows of a sparse matrix, with ids and metadata as in Index.add.
+// Add the rows of a sparse matrix, with ids and metadata as in DenseIndex.add.
 static NumpyArray<int64_t> sparse_add(vecengine::SparseIndex& self, nb::handle data, std::optional<IdsArg> ids,
                                       std::optional<nb::dict> metadata) {
     const OwnedRows rows = as_sparse_rows(data, "data");
@@ -560,7 +560,7 @@ NB_MODULE(qann, m) {
     m.def("num_threads", &vecengine::num_threads,
           "Thread count parallel work will use (resolves the 0 default to the core count).");
 
-    // Methods bound on Index are inherited by FlatIndex, IVFIndex and RefineIndex,
+    // Methods bound on DenseIndex are inherited by FlatIndex, IVFIndex and RefineIndex,
     // and give type checkers the right methods for what load() and make_index() return.
     // Registered before the index classes, which use it as a default argument.
     nb::enum_<vecengine::Metric>(m, "Metric")
@@ -681,7 +681,7 @@ NB_MODULE(qann, m) {
                      "Each metadata column's name and type ('int', 'float' or 'str'), in the order they were added")
         .def("size", &index_size, "Get number of indexed vectors");
 
-    nb::class_<vecengine::Index, vecengine::IndexBase>(m, "Index", "An index of dense float vectors")
+    nb::class_<vecengine::DenseIndex, vecengine::IndexBase>(m, "DenseIndex", "An index of dense float vectors")
         .def("add", &index_add, nb::arg("data"), nb::arg("ids").none() = nb::none(), nb::kw_only(),
              nb::arg("metadata").none() = nb::none(),
              "Add an (n, dim) array of vectors. Pass ids (n int64 values >= 0) if the index was "
@@ -701,10 +701,11 @@ NB_MODULE(qann, m) {
              "Query k-NN for each row; returns (indices, distances) arrays of shape (num_queries, k), padded with "
              "-1 / inf. allowed (ids) and where (a filter, SQL string or (string, params)) restrict the results as "
              "in query(), for every row")
-        .def_prop_ro("metric", &vecengine::Index::metric, "How vectors are compared (fixed at construction)")
-        .def("dim", &vecengine::Index::dim, "Get vector dimension");
+        .def_prop_ro("metric", &vecengine::DenseIndex::metric, "How vectors are compared (fixed at construction)")
+        .def("dim", &vecengine::DenseIndex::dim, "Get vector dimension");
+    m.attr("Index") = m.attr("DenseIndex");  // the name before 0.1.0a24
 
-    nb::class_<vecengine::FlatIndex, vecengine::Index>(m, "FlatIndex")
+    nb::class_<vecengine::FlatIndex, vecengine::DenseIndex>(m, "FlatIndex")
         .def("__init__", [](vecengine::FlatIndex* self, std::size_t dim, bool custom_ids, vecengine::Metric metric) {
                  new (self) vecengine::FlatIndex(dim, 1024, custom_ids, metric);
              },
@@ -715,7 +716,7 @@ NB_MODULE(qann, m) {
         .value("ADC", vecengine::PQDistance::ADC)
         .value("SDC", vecengine::PQDistance::SDC);
 
-    nb::class_<vecengine::IVFIndex, vecengine::Index>(m, "IVFIndex")
+    nb::class_<vecengine::IVFIndex, vecengine::DenseIndex>(m, "IVFIndex")
         .def(nb::init<std::size_t, std::size_t, std::size_t, bool, vecengine::Metric>(), nb::arg("dim"), nb::arg("nlist"),
              nb::arg("nprobe") = 10, nb::kw_only(), nb::arg("custom_ids") = false, nb::arg("metric") = vecengine::Metric::L2,
              "Construct IVFIndex with vector dimension, number of coarse clusters, and search breadth")
@@ -768,7 +769,7 @@ NB_MODULE(qann, m) {
                      "unfiltered query's (on by default). Off is faster but loses recall under narrow filters. "
                      "Not saved: a loaded index has it on");
 
-    nb::class_<vecengine::HNSWIndex, vecengine::Index>(m, "HNSWIndex")
+    nb::class_<vecengine::HNSWIndex, vecengine::DenseIndex>(m, "HNSWIndex")
         .def(nb::init<std::size_t, std::size_t, std::size_t, bool, std::optional<uint32_t>, vecengine::Metric>(),
              nb::arg("dim"), nb::arg("M") = 16, nb::arg("ef_construction") = 200, nb::kw_only(),
              nb::arg("custom_ids") = false, nb::arg("seed") = nb::none(), nb::arg("metric") = vecengine::Metric::L2,
@@ -801,10 +802,10 @@ NB_MODULE(qann, m) {
 
     // Holds `base` by reference; keep_alive ties base's lifetime to the
     // RefineIndex so Python can't free it first.
-    nb::class_<vecengine::RefineIndex, vecengine::Index>(m, "RefineIndex")
+    nb::class_<vecengine::RefineIndex, vecengine::DenseIndex>(m, "RefineIndex")
         // The constructor checks base is empty; lock base so a concurrent
         // base.add() can't race that check.
-        .def("__init__", [](vecengine::RefineIndex* self, vecengine::Index& base, std::size_t k_factor, bool custom_ids) {
+        .def("__init__", [](vecengine::RefineIndex* self, vecengine::DenseIndex& base, std::size_t k_factor, bool custom_ids) {
                  write_locked(base, [&] { new (self) vecengine::RefineIndex(base, k_factor, custom_ids); });
              },
              nb::arg("base"), nb::arg("k_factor") = 10, nb::kw_only(), nb::arg("custom_ids") = false,
@@ -814,21 +815,19 @@ NB_MODULE(qann, m) {
                      [](const vecengine::RefineIndex& self) { return read_locked(self, [&] { return self.k_factor(); }); },
                      [](vecengine::RefineIndex& self, std::size_t v) { write_locked(self, [&] { self.set_k_factor(v); }); },
                      "Candidates fetched from base per result (k * k_factor)")
-        .def_prop_ro("base", [](vecengine::RefineIndex& self) -> vecengine::Index& { return self.base(); },
+        .def_prop_ro("base", [](vecengine::RefineIndex& self) -> vecengine::DenseIndex& { return self.base(); },
                      nb::rv_policy::reference_internal,
                      "The wrapped approximate index, e.g. to change nprobe on a loaded RefineIndex");
 
     nb::class_<vecengine::SparseIndex, vecengine::IndexBase>(
         m, "SparseIndex",
-        "Exact inverted index over sparse vectors (BM25, SPLADE): scores by dot product, distance -(q . d)")
-        .def("__init__", [](vecengine::SparseIndex* self, bool custom_ids) { new (self) vecengine::SparseIndex(custom_ids); },
-             nb::kw_only(), nb::arg("custom_ids") = false,
-             "An empty SparseIndex. custom_ids=True makes add() take ids, as for the dense indexes")
+        "An index of sparse vectors (BM25, SPLADE), scored by dot product with distance -(q . d); see "
+        "InvertedIndex")
         .def("add", &sparse_add, nb::arg("data"), nb::arg("ids").none() = nb::none(), nb::kw_only(),
              nb::arg("metadata").none() = nb::none(),
              "Add the rows of a scipy.sparse matrix (CSR, or converted with tocsr()); a column is a term id in "
              "[0, 2^32), values become float32, repeated entries in a row are summed and zeros dropped. ids and "
-             "metadata as in Index.add. Returns the vectors' ids")
+             "metadata as in DenseIndex.add. Returns the vectors' ids")
         .def("query",
              [](const vecengine::SparseIndex& self, nb::handle query, std::size_t k, std::optional<IdsArg> allowed,
                 std::optional<WhereArg> where) {
@@ -840,7 +839,7 @@ NB_MODULE(qann, m) {
              nb::arg("where").none() = nb::none(),
              "The k vectors with the largest dot product with a one-row sparse matrix, largest first; returns 1D "
              "(ids, distances) with distance -(q . d). Only vectors sharing a nonzero term with the query are "
-             "returned. allowed and where filter as in Index.query")
+             "returned. allowed and where filter as in DenseIndex.query")
         .def("batch_query",
              [](const vecengine::SparseIndex& self, nb::handle queries, std::size_t k, std::optional<IdsArg> allowed,
                 std::optional<WhereArg> where) {
@@ -850,22 +849,29 @@ NB_MODULE(qann, m) {
              nb::arg("queries"), nb::arg("k"), nb::kw_only(), nb::arg("allowed").none() = nb::none(),
              nb::arg("where").none() = nb::none(),
              "query() for each row of a sparse matrix, in parallel; returns (ids, distances) arrays of shape "
-             "(num_queries, k), padded with -1 / inf")
+             "(num_queries, k), padded with -1 / inf");
+
+    nb::class_<vecengine::InvertedIndex, vecengine::SparseIndex>(
+        m, "InvertedIndex", "Exact search over sparse vectors: a posting list per term, with MaxScore pruning")
+        .def("__init__", [](vecengine::InvertedIndex* self, bool custom_ids) { new (self) vecengine::InvertedIndex(custom_ids); },
+             nb::kw_only(), nb::arg("custom_ids") = false,
+             "An empty InvertedIndex. custom_ids=True makes add() take ids, as for the dense indexes")
         .def_prop_rw("pruning",
-                     [](const vecengine::SparseIndex& self) { return read_locked(self, [&] { return self.pruning(); }); },
-                     [](vecengine::SparseIndex& self, bool on) { write_locked(self, [&] { self.set_pruning(on); }); },
+                     [](const vecengine::InvertedIndex& self) { return read_locked(self, [&] { return self.pruning(); }); },
+                     [](vecengine::InvertedIndex& self, bool on) { write_locked(self, [&] { self.set_pruning(on); }); },
                      "Whether queries skip vectors that can't reach the top k (MaxScore; default True). Results are "
                      "the same either way, up to which of several vectors tied at the k-th distance is kept. Not saved")
-        .def_prop_ro("terms", [](const vecengine::SparseIndex& self) { return read_locked(self, [&] { return self.terms(); }); },
+        .def_prop_ro("terms", [](const vecengine::InvertedIndex& self) { return read_locked(self, [&] { return self.terms(); }); },
                      "Distinct terms with a posting list")
         .def_prop_ro("postings",
-                     [](const vecengine::SparseIndex& self) { return read_locked(self, [&] { return self.postings(); }); },
+                     [](const vecengine::InvertedIndex& self) { return read_locked(self, [&] { return self.postings(); }); },
                      "Stored (term, vector) pairs, including deleted vectors' until compact()");
 
     nb::enum_<vecengine::IndexType>(m, "IndexType")
         .value("Flat", vecengine::IndexType::Flat)
         .value("IVF", vecengine::IndexType::IVF)
-        .value("HNSW", vecengine::IndexType::HNSW);
+        .value("HNSW", vecengine::IndexType::HNSW)
+        .value("Inverted", vecengine::IndexType::Inverted);
 
     nb::class_<vecengine::IndexOptions>(m, "IndexOptions")
         .def(nb::init<>())
@@ -880,6 +886,7 @@ NB_MODULE(qann, m) {
         .def_rw("ef_construction", &vecengine::IndexOptions::ef_construction)
         .def_rw("ef_search", &vecengine::IndexOptions::ef_search)
         .def_rw("hnsw_sq_bits", &vecengine::IndexOptions::hnsw_sq_bits)
+        .def_rw("pruning", &vecengine::IndexOptions::pruning)
         .def_rw("custom_ids", &vecengine::IndexOptions::custom_ids)
         .def_rw("metric", &vecengine::IndexOptions::metric);
 
@@ -901,9 +908,10 @@ NB_MODULE(qann, m) {
         .def("centroids_per_subspace", &vecengine::PQCodebook::centroids_per_subspace);
 
     m.def("make_index", &vecengine::make_index, nb::arg("type"), nb::arg("dim"), nb::arg("opts") = vecengine::IndexOptions{},
-          "Construct a FlatIndex, IVFIndex or HNSWIndex from an IndexType and IndexOptions");
+          "Construct a FlatIndex, IVFIndex, HNSWIndex or InvertedIndex from an IndexType and IndexOptions "
+          "(dim is unused for InvertedIndex)");
 
     m.def("load", nb::overload_cast<const std::filesystem::path&>(&vecengine::load_index), nb::arg("path"),
           nb::call_guard<nb::gil_scoped_release>(),
-          "Load an index saved with save(path); returns a FlatIndex, IVFIndex, HNSWIndex, RefineIndex or SparseIndex");
+          "Load an index saved with save(path); returns a FlatIndex, IVFIndex, HNSWIndex, RefineIndex or InvertedIndex");
 }

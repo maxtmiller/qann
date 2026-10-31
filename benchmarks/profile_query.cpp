@@ -54,7 +54,7 @@ static double clock_read_cost() {
     return (t1 - t0) / n;
 }
 
-static void report(const char* label, const Index& index, const std::vector<float>& queries, size_t nq) {
+static void report(const char* label, const DenseIndex& index, const std::vector<float>& queries, size_t nq) {
     static const double read_cost = clock_read_cost();
     for (double& s : detail::g_prof) s = 0;
     detail::g_prof_calls = 0;

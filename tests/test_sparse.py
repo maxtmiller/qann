@@ -36,7 +36,7 @@ def test_sparse_matches_brute_force():
     rng = np.random.default_rng(3)
     docs = _random_csr(rng, 3000, 400, 12)
     queries = _random_csr(rng, 50, 400, 5)
-    index = qann.SparseIndex()
+    index = qann.InvertedIndex()
     assert index.add(docs).tolist() == list(range(3000))
     assert index.size() == 3000 and index.postings == docs.nnz
 
@@ -52,7 +52,7 @@ def test_sparse_matches_brute_force():
 
 
 def test_sparse_input_formats():
-    index = qann.SparseIndex()
+    index = qann.InvertedIndex()
     dense = np.array([[1, 0, 2], [0, 3, 0]], dtype=np.float64)
     index.add(sp.csr_matrix(dense))
     index.add(sp.csc_array(dense))
@@ -85,11 +85,11 @@ def test_sparse_ids_filters_metadata_and_save(tmp_path):
     docs = _random_csr(rng, 200, 60, 8)
     queries = _random_csr(rng, 10, 60, 4)
     ids = np.arange(200) * 3 + 1000
-    index = qann.SparseIndex(custom_ids=True)
+    index = qann.InvertedIndex(custom_ids=True)
     index.add(docs, ids, metadata={"odd": np.arange(200) % 2, "tag": [f"t{i % 5}" for i in range(200)]})
     with pytest.raises(ValueError):
         index.add(docs[[0]])    # needs ids
-    assert isinstance(index, qann.IndexBase) and not isinstance(index, qann.Index)
+    assert isinstance(index, qann.SparseIndex) and isinstance(index, qann.IndexBase) and not isinstance(index, qann.Index)
 
     index.remove(ids[::7])
     scores = (queries @ docs.T).toarray()
@@ -122,13 +122,13 @@ def test_sparse_ids_filters_metadata_and_save(tmp_path):
     path = tmp_path / "sparse.qann"
     index.save(path)
     loaded = qann.load(path)
-    assert type(loaded) is qann.SparseIndex
+    assert type(loaded) is qann.InvertedIndex
     assert loaded.size() == index.size() and loaded.postings == index.postings
     check(loaded)
 
 
 def test_sparse_metadata_update_add_and_drop():
-    index = qann.SparseIndex(custom_ids=True)
+    index = qann.InvertedIndex(custom_ids=True)
     docs = sp.csr_array(np.array([[1, 0, 2], [0, 3, 1], [2, 1, 0], [1, 1, 1]], dtype=np.float32))
     index.add(docs, [10, 20, 30, 40], metadata={"price": [5, 15, None, 25]})
     q = sp.csr_array(np.array([[1, 1, 1]], dtype=np.float32))
@@ -159,7 +159,7 @@ def test_sparse_concurrent_adds_removes_and_filtered_queries():
     # adds and removes (exclusive lock) interleaved with filtered queries
     # (shared): every result must match the filter and be live at some point
     rng = np.random.default_rng(8)
-    index = qann.SparseIndex()
+    index = qann.InvertedIndex()
     first = _random_csr(rng, 500, 100, 8)
     index.add(first, metadata={"group": np.arange(500) % 5})
     batches = [_random_csr(rng, 100, 100, 8) for _ in range(15)]
@@ -204,7 +204,7 @@ def test_sparse_loads_file_saved_on_macos():
     # compacted), int and string columns with nulls and a float column added
     # by the second of two adds.
     index = qann.load(DATA / "v9_sparse.qann")
-    assert type(index) is qann.SparseIndex
+    assert type(index) is qann.InvertedIndex
     assert index.size() == 888 and index.terms == 297 and index.postings == 11200
     assert index.metadata_schema == {"price": "int", "tag": "str", "score": "float"}
     md = index.get_metadata([100 + 3 * 143, 100 + 3 * 601])    # slot 143: price and tag null
@@ -227,7 +227,7 @@ def test_sparse_pruning_switch(tmp_path):
     rng = np.random.default_rng(12)
     docs = _random_csr(rng, 2000, 300, 20)
     queries = _random_csr(rng, 30, 300, 6)
-    index = qann.SparseIndex()
+    index = qann.InvertedIndex()
     index.add(docs)
     assert index.pruning
     pruned = index.batch_query(queries, 10)

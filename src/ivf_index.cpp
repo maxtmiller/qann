@@ -36,7 +36,7 @@ using std::vector;
 using std::span;
 using std::pair;
 
-IVFIndex::IVFIndex(size_t dim, size_t nlist, size_t nprobe, bool custom_ids, Metric metric): Index(metric), dim_(dim), nlist_(nlist), nprobe_(nprobe), id_map_(custom_ids)  {
+IVFIndex::IVFIndex(size_t dim, size_t nlist, size_t nprobe, bool custom_ids, Metric metric): DenseIndex(metric), dim_(dim), nlist_(nlist), nprobe_(nprobe), id_map_(custom_ids)  {
     if (nlist < 100 || nlist > 65535) throw std::invalid_argument("nlist must be in [100, 65535]");
     if (dim == 0) throw std::invalid_argument("dim must be >= 1");
     set_nprobe(nprobe);
@@ -230,10 +230,10 @@ vector<vector<Neighbor>> IVFIndex::query_batch_impl(span<const float> queries, s
     if (!trained_) throw std::logic_error("train() has not be run yet");
 
 #ifndef VECENGINE_USE_BLAS
-    return Index::query_batch_impl(queries, num_queries, k, filter);
+    return DenseIndex::query_batch_impl(queries, num_queries, k, filter);
 #else
     // a filtered query may probe every list, which the batched coarse step doesn't rank
-    if (filter) return Index::query_batch_impl(queries, num_queries, k, filter);
+    if (filter) return DenseIndex::query_batch_impl(queries, num_queries, k, filter);
 
     // after the early returns above, which go through query_impl and rotate there
     vector<float> rot;

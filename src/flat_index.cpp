@@ -18,7 +18,7 @@ using std::span;
 using std::pair;
 
 FlatIndex::FlatIndex(size_t dim, size_t capacity, bool custom_ids, Metric metric)
-    : Index(metric), dim_(dim), id_map_(custom_ids) {
+    : DenseIndex(metric), dim_(dim), id_map_(custom_ids) {
     if (dim == 0) throw std::invalid_argument("dim must be >= 1");
 
     data_.reserve(dim_ * capacity);

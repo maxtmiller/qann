@@ -602,7 +602,7 @@ TEST_CASE("Metadata filters search like the same ids passed as allowed, on every
     pq->enable_pq(8);
     pq->train(data, n, 25, 1);
     auto refine = std::make_unique<RefineIndex>(*pq, 8);
-    std::vector<std::pair<std::string, Index*>> indexes = {
+    std::vector<std::pair<std::string, DenseIndex*>> indexes = {
         {"flat", flat.get()}, {"ivf", ivf.get()}, {"hnsw", hnsw.get()}, {"refine", refine.get()}};
 
     // added in two batches, so rows line up across adds
@@ -689,7 +689,7 @@ TEST_CASE("Metadata is saved and loaded with every index", "[metadata][serialize
     pq.train(data, n, 25, 1);
     RefineIndex refine(pq, 4);
     HNSWIndex hnsw(dim, 16, 100, false, 1);
-    for (Index* index : {static_cast<Index*>(&flat), static_cast<Index*>(&refine), static_cast<Index*>(&hnsw)}) {
+    for (DenseIndex* index : {static_cast<DenseIndex*>(&flat), static_cast<DenseIndex*>(&refine), static_cast<DenseIndex*>(&hnsw)}) {
         index->add_batch(std::span<const float>(data.data(), 400 * dim), 400, nullptr, md_rows(0, 400));
         index->add_batch(std::span<const float>(data.data() + 400 * dim, 200 * dim), 200);  // nulls
         index->remove(std::vector<int64_t>{1, 2, 3});
@@ -765,44 +765,44 @@ TEST_CASE("Metadata filters on other index settings, and HNSW's graph path", "[m
     const auto narrow_ids = ids_where(n, [](size_t i) { return i % 100 < 30 && i % 4 != 0; });
     const auto wide_ids = ids_where(n, [](size_t i) { return i % 100 < 80; });
 
-    std::vector<std::pair<std::string, std::function<std::pair<std::unique_ptr<Index>, std::unique_ptr<Index>>()>>> configs = {
+    std::vector<std::pair<std::string, std::function<std::pair<std::unique_ptr<DenseIndex>, std::unique_ptr<DenseIndex>>()>>> configs = {
         {"ivf-sq8", [&] {
              auto ivf = std::make_unique<IVFIndex>(dim, 100, 20);
              ivf->enable_sq(8);
              ivf->train(data, n, 25, 1);
-             return std::make_pair(std::unique_ptr<Index>(), std::unique_ptr<Index>(std::move(ivf)));
+             return std::make_pair(std::unique_ptr<DenseIndex>(), std::unique_ptr<DenseIndex>(std::move(ivf)));
          }},
         {"ivf-fastscan+R", [&] {
              auto ivf = std::make_unique<IVFIndex>(dim, 100, 20);
              ivf->enable_pq(8, 16, true);
              ivf->train(data, n, 25, 1);
              auto refine = std::make_unique<RefineIndex>(*ivf, 8);
-             return std::make_pair(std::unique_ptr<Index>(std::move(ivf)), std::unique_ptr<Index>(std::move(refine)));
+             return std::make_pair(std::unique_ptr<DenseIndex>(std::move(ivf)), std::unique_ptr<DenseIndex>(std::move(refine)));
          }},
         {"ivf-pq-rotate+R", [&] {
              auto ivf = std::make_unique<IVFIndex>(dim, 100, 20);
              ivf->enable_pq(8, 256, false, true);
              ivf->train(data, n, 25, 1);
              auto refine = std::make_unique<RefineIndex>(*ivf, 8);
-             return std::make_pair(std::unique_ptr<Index>(std::move(ivf)), std::unique_ptr<Index>(std::move(refine)));
+             return std::make_pair(std::unique_ptr<DenseIndex>(std::move(ivf)), std::unique_ptr<DenseIndex>(std::move(refine)));
          }},
         {"hnsw-sq8+R", [&] {
              auto hnsw = std::make_unique<HNSWIndex>(dim, 16, 100, false, 1);
              hnsw->enable_sq(8);
              hnsw->train(data, n);
              auto refine = std::make_unique<RefineIndex>(*hnsw, 4);
-             return std::make_pair(std::unique_ptr<Index>(std::move(hnsw)), std::unique_ptr<Index>(std::move(refine)));
+             return std::make_pair(std::unique_ptr<DenseIndex>(std::move(hnsw)), std::unique_ptr<DenseIndex>(std::move(refine)));
          }},
         {"hnsw", [&] {
-             return std::make_pair(std::unique_ptr<Index>(),
-                                   std::unique_ptr<Index>(std::make_unique<HNSWIndex>(dim, 16, 100, false, 1)));
+             return std::make_pair(std::unique_ptr<DenseIndex>(),
+                                   std::unique_ptr<DenseIndex>(std::make_unique<HNSWIndex>(dim, 16, 100, false, 1)));
          }},
         {"flat-cosine", [&] {
-             return std::make_pair(std::unique_ptr<Index>(),
-                                   std::unique_ptr<Index>(std::make_unique<FlatIndex>(dim, n, false, Metric::Cosine)));
+             return std::make_pair(std::unique_ptr<DenseIndex>(),
+                                   std::unique_ptr<DenseIndex>(std::make_unique<FlatIndex>(dim, n, false, Metric::Cosine)));
          }},
         {"hnsw-cosine", [&] {
-             return std::make_pair(std::unique_ptr<Index>(), std::unique_ptr<Index>(std::make_unique<HNSWIndex>(
+             return std::make_pair(std::unique_ptr<DenseIndex>(), std::unique_ptr<DenseIndex>(std::make_unique<HNSWIndex>(
                                                                  dim, 16, 100, false, 1, Metric::Cosine)));
          }},
     };
@@ -1126,7 +1126,7 @@ TEST_CASE("update_metadata and string cleanup on compact work on every index", "
     auto hnsw = std::make_unique<HNSWIndex>(dim, 16, 100, false, 1);
     auto base = std::make_unique<FlatIndex>(dim);
     auto refine = std::make_unique<RefineIndex>(*base, 4);
-    std::vector<std::pair<std::string, Index*>> indexes = {
+    std::vector<std::pair<std::string, DenseIndex*>> indexes = {
         {"flat", flat.get()}, {"ivf", ivf.get()}, {"hnsw", hnsw.get()}, {"refine", refine.get()}};
 
     using Ids = std::vector<int64_t>;

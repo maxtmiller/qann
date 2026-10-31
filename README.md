@@ -37,7 +37,16 @@ ids, dists = index.batch_query(x[:5], 10)   # both shaped (5, 10)
 
 ## Indexes
 
-Every index has the same core methods:
+Indexes come in two families, chosen by the kind of vectors they hold, with one class per search algorithm:
+
+| | Dense vectors (`qann.DenseIndex`) | Sparse vectors (`qann.SparseIndex`) |
+| --- | --- | --- |
+| Exact | `FlatIndex` | `InvertedIndex` |
+| Approximate | `IVFIndex`, `HNSWIndex`, `RefineIndex` (exact re-ranking of either) | |
+
+The algorithm is fixed when an index is created; search settings such as `nprobe` or `ef_search` are properties that can change at any time. Everything except `add`, `query`, `batch_query`, `dim` and `metric` is shared by both families through `qann.IndexBase`: custom ids, deletion, metadata and filters, saving. `qann.Index` is the old name of `qann.DenseIndex` and still works.
+
+Every dense index has these methods (sparse indexes have the same ones, minus `dim`, taking `scipy.sparse` matrices; see [`InvertedIndex`](#invertedindex-custom_idsfalse)):
 
 | Method | Description |
 | --- | --- |
@@ -177,14 +186,14 @@ Wraps a trained, empty approximate index created without custom ids (and never c
 
 This is the usual way to combine PQ's speed with near-exact ranking. It keeps the original vectors in memory alongside the PQ codes.
 
-### `SparseIndex(*, custom_ids=False)`
+### `InvertedIndex(*, custom_ids=False)`
 
 An exact inverted index over sparse vectors, for keyword-style retrieval: BM25 weights, or learned sparse vectors such as SPLADE, computed by you and passed in as `scipy.sparse` matrices (a column is a term id). It scores by dot product, so results come largest first with distance `-(q . d)`, as with `Metric.InnerProduct`.
 
 ```python
 import scipy.sparse as sp
 
-index = qann.SparseIndex()
+index = qann.InvertedIndex()
 index.add(doc_matrix, metadata={"lang": langs})             # (n_docs, vocab) CSR
 ids, dists = index.batch_query(query_matrix, 10, where="lang = 'en'")
 ids, dists = index.query(query_matrix[[0]], 10)             # one row
@@ -192,13 +201,13 @@ ids, dists = index.query(query_matrix[[0]], 10)             # one row
 
 - **Input:** any `scipy.sparse` matrix or array (CSR is used directly, other formats go through `tocsr()`). Column indices must be in `[0, 2^32)`; values become float32. Repeated entries in a row are summed and zeros are dropped. There is no fixed dimension.
 - **Results:** exact. A query reads only its own terms' posting lists and returns only documents sharing at least one nonzero term with it, so fewer than `k` can come back. Rows are padded with `-1` / `inf` as for the dense indexes.
-- **Shared with the dense indexes:** custom ids, `remove` / `compact`, metadata and `where=`, `allowed=`, `get_metadata`, `save` / `qann.load`. `SparseIndex` derives from `qann.IndexBase`, not `qann.Index`, since it has no `dim` or metric.
+- **Shared with the dense indexes:** custom ids, `remove` / `compact`, metadata and `where=`, `allowed=`, `get_metadata`, `save` / `qann.load`. It is a `qann.SparseIndex` (the sparse family), not a `qann.DenseIndex`, since it has no `dim` or metric.
 - **Size:** `terms` and `postings` report the distinct terms and stored (term, document) pairs. Each posting takes 8 bytes.
 - **Cost:** about proportional to the postings a query's terms have. With `pruning` on (the default), once the remaining terms can't lift an unseen document into the top `k`, their lists only add to documents that still could, which mostly helps small `k` on large corpora: 1.6x more queries per second at `k = 10` on BEIR FiQA (58k documents) with BM25, about the same at `k = 1000`. Results are identical either way; `index.pruning = False` turns it off. `benchmarks/sparse_bm25.py` measures it.
 
 ### `make_index(type, dim, opts=IndexOptions())`
 
-Builds an index from a type and an options object, returning a `FlatIndex`, `IVFIndex` or `HNSWIndex`:
+Builds an index from a type and an options object, returning a `FlatIndex`, `IVFIndex`, `HNSWIndex` or `InvertedIndex`:
 
 ```python
 opts = qann.IndexOptions()
@@ -207,7 +216,7 @@ ivf = qann.make_index(qann.IndexType.IVF, 128, opts)
 ivf.train(x)
 ```
 
-`IndexType` is `Flat`, `IVF` or `HNSW`. `IndexOptions` fields and defaults: `metric` (`Metric.L2`), plus `capacity` (Flat initial reserve, 1024), `nlist` (100), `nprobe` (10), `pq_subspaces` (0, meaning no PQ), `pq_centroids` (256) and `ivf_sq_bits` (0; 8 or 4 calls `enable_sq()`) for IVF, and `hnsw_m` (16), `ef_construction` (200), `ef_search` (64) and `hnsw_sq_bits` (0 for floats; 8 or 4 calls `enable_sq()`) for HNSW.
+`IndexType` is `Flat`, `IVF`, `HNSW` or `Inverted` (sparse; `dim` is unused, pass 0). `IndexOptions` fields and defaults: `custom_ids` (`False`) for all, `metric` (`Metric.L2`) for dense, `pruning` (`True`) for `Inverted`, plus `capacity` (Flat initial reserve, 1024), `nlist` (100), `nprobe` (10), `pq_subspaces` (0, meaning no PQ), `pq_centroids` (256) and `ivf_sq_bits` (0; 8 or 4 calls `enable_sq()`) for IVF, and `hnsw_m` (16), `ef_construction` (200), `ef_search` (64) and `hnsw_sq_bits` (0 for floats; 8 or 4 calls `enable_sq()`) for HNSW.
 
 ## Metrics
 
