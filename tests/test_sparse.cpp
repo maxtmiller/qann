@@ -2,11 +2,13 @@
 
 #include "vecengine/index_factory.hpp"
 #include "vecengine/sparse_index.hpp"
+#include "serialize.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <map>
 #include <random>
@@ -243,4 +245,34 @@ TEST_CASE("SparseIndex rejects malformed rows and corrupt files", "[sparse]") {
     corrupt(first_slot + 8, 0);  // slots 0, 0
     std::stringstream truncated(bytes.substr(0, bytes.size() - 3));
     REQUIRE_THROWS_AS(load_index(truncated), std::runtime_error);
+}
+
+TEST_CASE("SparseIndex file saved on macOS (format 9) loads", "[sparse][compat]") {
+    // 1000 docs, custom ids 100, 103, ..., every ninth deleted (not compacted),
+    // int / string / float metadata columns; results are checked in test_sparse.py
+    const std::filesystem::path dir = QANN_TEST_DATA_DIR;
+    std::unique_ptr<IndexBase> loaded = load_index(dir / "v9_sparse.qann");
+    auto* index = dynamic_cast<SparseIndex*>(loaded.get());
+    REQUIRE(index != nullptr);
+    REQUIRE(index->custom_ids());
+    REQUIRE(index->slots() == 1000);
+    REQUIRE(index->size() == 888);
+    REQUIRE(index->terms() == 297);
+    REQUIRE(index->postings() == 11200);
+    REQUIRE(index->metadata_schema().size() == 3);
+
+    const Csr q({{{0, 1.0f}, {7919, 1.0f}}});  // the two commonest terms
+    const auto before = index->query_batch(q.view(), 10)[0];
+    REQUIRE(before.size() == 10);
+    REQUIRE(index->compact() == 112);
+    REQUIRE(index->query_batch(q.view(), 10)[0].size() == 10);
+    for (size_t i = 0; i < before.size(); ++i) REQUIRE(index->query_batch(q.view(), 10)[0][i].distance == before[i].distance);
+
+    std::stringstream s;
+    index->save(s);
+    REQUIRE(detail::read_header(s).version == detail::kFormatVersion);
+    s.seekg(0);
+    std::unique_ptr<IndexBase> again = load_index(s);
+    REQUIRE(again->size() == 888);
+    REQUIRE(again->slots() == 888);
 }

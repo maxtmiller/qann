@@ -1,9 +1,14 @@
+import pathlib
+import threading
+
 import numpy as np
 import pytest
 
 import qann
 
 sp = pytest.importorskip("scipy.sparse")
+
+DATA = pathlib.Path(__file__).parent / "data"
 
 
 def _random_csr(rng, n, vocab, nnz):
@@ -120,3 +125,99 @@ def test_sparse_ids_filters_metadata_and_save(tmp_path):
     assert type(loaded) is qann.SparseIndex
     assert loaded.size() == index.size() and loaded.postings == index.postings
     check(loaded)
+
+
+def test_sparse_metadata_update_add_and_drop():
+    index = qann.SparseIndex(custom_ids=True)
+    docs = sp.csr_array(np.array([[1, 0, 2], [0, 3, 1], [2, 1, 0], [1, 1, 1]], dtype=np.float32))
+    index.add(docs, [10, 20, 30, 40], metadata={"price": [5, 15, None, 25]})
+    q = sp.csr_array(np.array([[1, 1, 1]], dtype=np.float32))
+
+    def match(where):
+        return sorted(index.query(q, 10, where=where)[0].tolist())
+
+    index.update_metadata([30, 10], {"price": [50, None]})
+    assert match("price > 20") == [30, 40]
+    assert match(qann.field("price").is_null()) == [10]
+    index.add_metadata_column("tag", "str", ids=[20, 40], values=["x", None])
+    assert index.metadata_schema == {"price": "int", "tag": "str"}
+    assert match("tag = 'x'") == [20]
+    assert index.get_metadata([40, 20], columns=["tag"]) == {"tag": [None, "x"]}
+    index.add_metadata_column("rank", "float", default=0.5)
+    assert match("rank = 0.5") == [10, 20, 30, 40]
+    index.drop_metadata_column("rank")
+    with pytest.raises(ValueError, match="unknown metadata field"):
+        match("rank = 0.5")
+    with pytest.raises(ValueError, match="id 99 is not in the index"):
+        index.update_metadata([99], {"price": [1]})
+    index.remove([20])
+    index.compact()
+    assert match("tag IS NULL") == [10, 30, 40]
+
+
+def test_sparse_concurrent_adds_removes_and_filtered_queries():
+    # adds and removes (exclusive lock) interleaved with filtered queries
+    # (shared): every result must match the filter and be live at some point
+    rng = np.random.default_rng(8)
+    index = qann.SparseIndex()
+    first = _random_csr(rng, 500, 100, 8)
+    index.add(first, metadata={"group": np.arange(500) % 5})
+    batches = [_random_csr(rng, 100, 100, 8) for _ in range(15)]
+    queries = _random_csr(rng, 50, 100, 4)
+    errors = []
+
+    def run(fn):
+        try:
+            fn()
+        except Exception as e:
+            errors.append(e)
+
+    def writer():
+        for b, batch in enumerate(batches):
+            start = 500 + 100 * b
+            index.add(batch, metadata={"group": np.arange(start, start + 100) % 5})
+            index.remove(np.arange(start - 100, start, 10))
+            if b % 5 == 4:
+                index.compact()
+
+    def querier():
+        for _ in range(30):
+            got, _ = index.batch_query(queries, 10, where="group = 3")
+            got = got[got >= 0]
+            assert (got % 5 == 3).all()
+
+    threads = [threading.Thread(target=run, args=(fn,)) for fn in (writer, querier, querier)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+    assert index.size() == 500 + 100 * len(batches) - 10 * len(batches)
+    got, _ = index.batch_query(queries, 10, where="group = 3")
+    got = got[got >= 0]
+    assert (got % 5 == 3).all() and not np.isin(got, np.arange(400, 1900, 10)).any()
+
+
+def test_sparse_loads_file_saved_on_macos():
+    # Saved on macOS (format version 9): 1000 docs over 300 term ids spread up
+    # to 100,000, custom ids 100, 103, ..., every ninth deleted (not
+    # compacted), int and string columns with nulls and a float column added
+    # by the second of two adds.
+    index = qann.load(DATA / "v9_sparse.qann")
+    assert type(index) is qann.SparseIndex
+    assert index.size() == 888 and index.terms == 297 and index.postings == 11200
+    assert index.metadata_schema == {"price": "int", "tag": "str", "score": "float"}
+    md = index.get_metadata([100 + 3 * 143, 100 + 3 * 601])    # slot 143: price and tag null
+    assert md["price"].mask.tolist() == [True, False] and md["tag"] == [None, "t1"]
+    assert md["score"].mask.tolist() == [True, False]
+
+    queries = sp.load_npz(DATA / "v9_sparse_queries.npz")
+    ids, dists = index.batch_query(queries, 10, where="price < 30 AND tag != 't0'")
+    np.testing.assert_array_equal(ids, np.load(DATA / "v9_sparse_ids.npy"))
+    np.testing.assert_allclose(dists, np.load(DATA / "v9_sparse_dists.npy"), rtol=1e-5, atol=1e-5)
+
+    # compacting and re-saving keeps the results
+    index.compact()
+    assert index.size() == 888
+    again, _ = index.batch_query(queries, 10, where="price < 30 AND tag != 't0'")
+    np.testing.assert_array_equal(again, ids)
