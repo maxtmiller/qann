@@ -431,6 +431,113 @@ The id map (`IdMap::save`, version 2+) is `custom_ids` (u8), the slot count, `ne
 
 ---
 
+## Usage Details
+
+The README keeps to what each feature does and how to call it. This section holds the measurements behind its advice and the finer behavior, in the README's order.
+
+### Choosing an index
+
+- **IVF + fast-scan + `RefineIndex` vs HNSW.** On SIFT1M, `HNSWIndex(M=16, ef_construction=200)` reaches recall@10 0.960 at `ef_search=64` (about 80 µs per query on one thread) and 0.995 at 256 (about 340 µs).
+- **All cores, SIFT1M, busy machine:**
+  - the float graph built in 75 s and reached 0.996 at 11.4k queries/s;
+  - HNSW-SQ8 + `RefineIndex(k_factor=2)` reached 0.996 at 15.8k/s;
+  - IVF + fast-scan + `RefineIndex` reached 0.995 at 16.9k/s and built in 5 s.
+- **Below 0.96 recall HNSW is faster on SIFT1M.** On GloVe-100 (cosine) the order flips: IVF + fast-scan + `RefineIndex` was about twice as fast up to 0.94 recall, and HNSW with `M=16` needed `ef_search=1024` to reach 0.95.
+- **Rule of thumb:** IVF + fast-scan when you can train on representative data and build time matters; HNSW when you can't train up front, or when new vectors keep arriving that IVF's clusters weren't trained on.
+
+### IVF: fast-scan, rotation and SQ
+
+- **Fast-scan** is about 6x faster than regular PQ at scanning codes of the same size: 4-bit codes, scored 32 vectors at a time by one table lookup per subspace (NEON on ARM, AVX2 on x86).
+  - On SIFT1M with `RefineIndex(k_factor=16)`, 64 fast-scan subspaces match 32 regular ones (recall@10 0.931 at `nprobe=16`, 0.995 at 64) and beat 16 regular ones, while scanning several times faster.
+  - Without a `RefineIndex`, recall is lower than regular PQ at the same memory, and distances are approximate: the lookup tables are rounded to 6 bits.
+- **Rotation** (`enable_pq(..., rotate=True)`) learns a PCA rotation that spreads variance evenly over the subspaces.
+  - On SIFT1M with fast-scan, recall@10 at `nprobe=16` goes from 0.635 to 0.718 without re-ranking, and `k_factor=4` reaches what `k_factor=8` did (0.988 vs 0.956 at `nprobe=64`). With re-ranking that is about 5% more queries per second at the same recall, after the cost of rotating each query.
+  - On GloVe (dimensions already uncorrelated) it's within 0.004 either way, and with `k_factor=16` there is little left to gain.
+  - Training takes about 0.4 s longer on SIFT1M, and the index stores one `dim x dim` matrix (64 KB at 128 dimensions).
+- **IVF SQ** on SIFT1M (all cores, busy machine):
+  - 8 bits reached recall@10 0.925 at `nprobe=16` and 0.985 at 64 (floats: 0.932 and 0.995), at 1.3 to 1.4x the queries per second of float lists, in a quarter of the memory;
+  - 4 bits + `RefineIndex(k_factor=8)` matched the floats' recall at the same speed-up;
+  - on one thread the gain mostly disappears: SQ helps because the float scan is limited by memory bandwidth.
+  - When raw vectors fit in memory, fast-scan PQ + `RefineIndex` is still faster, and HNSW-SQ8 is faster at the same recall for about twice the memory.
+- **`precomputed_tables`** exist once PQ is enabled and trained, if `nlist * num_subspaces * centroids_per_subspace * 4` bytes fit in 256 MB. They're always off with `Metric.InnerProduct`, which needs only one table per query.
+
+### HNSW: `M`, deletes and SQ
+
+- **Choosing `M`:** on GloVe-100, `M=48` answered 1.5x more queries per second than `M=16` at 0.90 and 0.95 recall, and only `M=48` reached 0.99. It builds about 5x slower and adds 256 bytes of links per vector.
+- **Deletes** only mark vectors: queries still route through them so the graph stays connected, but never return them. `compact()` rebuilds the graph, which takes about as long as building it again.
+- **SQ** maps each dimension's trained range onto 256 (8-bit) or 16 (4-bit) evenly spaced values. Values outside the training sample's range are clamped, so train on a representative sample.
+- **SQ on SIFT1M,** busy machine, `ef_search=256`:
+  - 8 bits + `RefineIndex(k_factor=2)` matched the float graph's recall (0.996) at 1.4x its queries per second on all cores (15.8k vs 11.4k) and 1.7x on one thread;
+  - 4 bits + `k_factor=4` did nearly the same (0.995, 15.6k);
+  - without re-ranking, 8 bits reaches 0.986 and 4 bits only 0.86.
+  - 4 bits is no faster than 8, because searches wait on memory latency rather than bytes moved; choose it to halve code memory.
+- **SQ on GloVe-100 (cosine):** 8 bits + `k_factor=2` matched the floats exactly; 4 bits alone reached only 0.70 and needed `k_factor=8`.
+
+### Sparse indexes
+
+- **`InvertedIndex` pruning** gives 1.6x more queries per second at `k = 10` on BEIR FiQA (58k documents) with BM25, and about the same at `k = 1000`. Results are identical with it on or off. `benchmarks/sparse_bm25.py` measures it.
+- **`SparseApproxIndex`** on SPLADE vectors of 1M MS MARCO passages (big-ann-benchmarks sparse track), one thread on an M3, against exact search at 118 queries per second:
+
+| `query_terms` / `list_depth` / `k_factor` | recall@10 | queries per second |
+| --- | --- | --- |
+| 10 / 2,000 / 50 | 0.907 | 2,477 (21x) |
+| 10 / 10,000 / 10 (the defaults) | 0.962 | 1,621 (14x) |
+| 10 / 10,000 / 50 | 0.989 | 1,183 (10x) |
+| 20 / 10,000 / 50 | 0.994 | 653 (5.5x) |
+
+  On a 4-CPU x86 VM the defaults gave 0.955 recall at 10.6x exact search on one thread (614 vs 58 queries per second) and 8.0x on all threads (#59). `benchmarks/sparse_bigann.py --approx` measures it.
+
+### Inner product
+
+- **HNSW** links its graph as if every stored vector had one more coordinate, `sqrt(M^2 - |x|^2)` with `M` the largest stored length, which turns inner product search into L2 search for the links. At `ef_search=64`, recall@10 was 0.96 instead of 0.05 on ann-benchmarks' Last.fm factors, and 0.50 instead of 0.05 on VIBE's llama-128-ip, against linking by raw inner product as hnswlib does.
+- **IVF** clusters by L2 and probes the lists whose centroids have the largest `q . c`. With exact lists and `nprobe=64`, recall@10 was 0.98 on Last.fm, 0.88 on VIBE's yi-128-ip and 0.84 on llama-128-ip; with fast-scan PQ (rotated, `dim / 2` subspaces) and `RefineIndex(k_factor=8)`, 0.91, 0.81 and 0.73.
+
+### Filtered search
+
+- **How each index filters:**
+  - `FlatIndex` scores only the allowed vectors.
+  - `IVFIndex` skips the others while scanning, and keeps probing the next nearest lists until it has `k` allowed vectors.
+  - `HNSWIndex` walks its graph through every node but returns only allowed ones.
+  - A `RefineIndex` passes the filter to its base and re-ranks as usual.
+- **Narrow filters are scored directly, which is exact:**
+  - HNSW below about `sqrt(ef_search * M * size)` allowed vectors, about 2% of SIFT1M at `ef_search=64` and 2.5% at 128;
+  - a plain or SQ `IVFIndex` at up to `3 * nlist` allowed vectors;
+  - a `RefineIndex` over IVF at up to `6 * nlist`, from its raw copies.
+  - A PQ `IVFIndex` doesn't do this, so wrap it in a `RefineIndex` for narrow filters.
+- **HNSW `filter_ef_scaling`** narrows the search width to `max(k, ef_search * sqrt(s))` for a fraction `s` allowed. A filtered beam finds more of its true neighbors than an unfiltered one, so at the full `ef_search` it overshoots unfiltered recall at several times the cost.
+  - With the scaling, filtered recall stays near the unfiltered level: SIFT1M at `ef_search=64` gives 0.96 to 0.975 from 2% to 50% allowed (0.953 unfiltered), and GloVe-100 stays within 0.01 of unfiltered.
+  - Queries are 1.3 to 3.7 times faster (10% allowed: 405 to 143 µs).
+- **IVF `filter_probe_scaling`** probes about `0.75 * nprobe * s^(-1/3)` lists for a fraction `s` allowed.
+  - On SIFT1M at `nprobe=16` that keeps recall at 0.92 to 0.96 from 0.2% to 20% allowed (0.93 unfiltered), where stopping at the first 10 allowed vectors gave 0.60 to 0.88. It costs 1.3 to 5.7 times fewer queries per second.
+  - It helps most on hard data (GloVe-100: filtered recall 0.50 to 0.75 off, 0.72 to 0.78 on, 0.81 unfiltered). Where filtered recall is already high (fashion-mnist: 0.98 or more either way), turning it off is safe and up to 1.9 times faster.
+- **Cost of `allowed`:** a pass over the ids per call, plus one bit per vector in the index. The per-selectivity numbers are under [Benchmarks](#benchmarks-benchmarksbench_indexespy).
+
+### Metadata
+
+- **Types:** a column's type is fixed by the first add that has it, or by `add_metadata_column`. Bool arrays become ints. Ints are accepted into a float column (ints beyond 2^53 are rounded to the nearest float); floats into an int column raise `ValueError`.
+- **Long filter chains built in code:** adding terms one `|` at a time copies the chain each step, so it gets slow past a few thousand terms; use `qann.any_of` / `qann.all_of`. For one column against many values, `isin` is one condition, scanned once per query instead of once per value.
+- **SQL strings in detail:**
+  - Keywords are case-insensitive and follow SQL's precedence. Strings are `'...'` (`''` for a quote); quote column names that are keywords or contain non-ASCII characters as `"..."`.
+  - Numbers that overflow, such as `1e400`, raise `ValueError`, and a syntax error raises `ValueError` with its column.
+  - Filters nest up to 256 levels of parentheses or `NOT`; long `AND` / `OR` chains don't count toward that.
+  - A string may have up to 1024 conditions (an `IN` list counts once), so filter strings from users can't make a query scan its columns thousands of times. `qann.set_max_filter_conditions(n)` changes the limit for the process; filters built with `qann.field` aren't limited.
+- **Cost:** each query call scans the columns its filter names once, shared by every row of a `batch_query`: about 0.4 ms per condition per million vectors. Storage:
+  - strings: each distinct value once, plus 4 bytes per vector;
+  - ints and floats: 8 bytes per vector;
+  - every column: 1 byte per vector for its null flag.
+- **`add_metadata_column` details:**
+  - `default` can't be combined with `ids` / `values` (`TypeError`).
+  - Unknown, deleted or repeated ids raise `ValueError`, and a failed call changes nothing.
+  - `compact()` never removes columns, even ones left with no values; it does free strings no vector uses any more.
+  - Re-adding a removed id doesn't bring back its old metadata: pass it again with the `add`.
+
+### Saving and loading
+
+- **Interrupted saves:** the file is written next to the target as `<path>.tmp` and renamed into place when complete, so a failed save never leaves a partial file or destroys an existing one.
+- **Compatibility:** files saved by 0.1.0a4, 0.1.0a6, 0.1.0a7, 0.1.0a10, 0.1.0a11 and 0.1.0a12 onward all still load (see [File Format](#file-format-srcserializehpp)). A file from a newer release than the one loading it raises `RuntimeError` rather than being misread.
+
+---
+
 ## Benchmarks (`benchmarks/bench_indexes.py`)
 
 Recall@10 (overlap of the returned top 10 with the true top 10), QPS on all cores (`query_batch`) and bytes per vector for Flat, IVF, IVF + PQ (ADC and SDC, m ∈ {8, 16, 32}), IVF + fast-scan PQ (m ∈ {32, 64}, 4-bit), IVF + PQ + re-ranking (`k_factor` ∈ {4, 16}), IVF + SQ8, IVF + SQ4 alone and re-ranked (`k_factor = 8`), sweeping `nprobe` from 1 to 128, and HNSW (`M = 16`, `ef_construction = 200`; float, SQ8, SQ4, and each SQ width re-ranked: SQ8 with `k_factor = 2`, SQ4 with 4), sweeping `ef_search` from 10 to 256. Training uses each dataset's `learn` set; `nlist ≈ √N`. Each configuration's QPS is the best of 3 full passes, so cold caches after a build don't distort the first measurement. Writes `benchmarks/results/<dataset>.csv` and a recall-vs-QPS plot.

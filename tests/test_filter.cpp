@@ -225,7 +225,7 @@ TEST_CASE("Filtered search with custom ids and after compaction", "[filter]") {
             const auto got = index->query_batch(queries, nq, k, allowed);
             for (size_t q = 0; q < nq; ++q) {
                 REQUIRE(got[q].size() == k);
-                for (size_t i = 0; i < k; ++i) REQUIRE(got[q][i].index == ids[truth[q][i].index]);
+                for (size_t i = 0; i < k; ++i) REQUIRE(got[q][i].index == static_cast<size_t>(ids[truth[q][i].index]));
             }
         }
     }
