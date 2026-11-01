@@ -83,7 +83,7 @@ int main(int argc, char** argv) {
 
     // Column order follows the slots in src/profile.hpp; "other" is the rest,
     // the rotation when on plus timer overhead.
-    const char* names[] = {"coarse", "ADC", "scan", "raw", "drain", "rerank", "setup", "innerC", "perlist"};
+    const char* names[] = {"coarse", "ADC", "scan", "raw", "drain", "rerank", "setup", "innerC", "perlist", "lutround"};
     std::printf("\n%-3s %7s %7s %8s %9s", "rot", "nprobe", "k_fac", "recall", "total");
     for (const char* name : names) std::printf(" %8s", name);
     std::printf(" %8s\n", "other");

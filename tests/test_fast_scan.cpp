@@ -61,7 +61,7 @@ TEST_CASE("fast_scan_block_scalar sums the picked lut entries", "[fastscan]") {
 }
 
 TEST_CASE("fast_scan_block matches the scalar version", "[fastscan]") {
-    const size_t m = GENERATE(2, 16, 64, 256, 480, 1024);
+    const size_t m = GENERATE(2, 6, 16, 64, 196, 256, 480, 1024);
     CAPTURE(m);
     std::mt19937 rng(static_cast<unsigned>(m));
     std::vector<uint8_t> lut(m * 16), block(fs_block_bytes(m));
@@ -347,7 +347,7 @@ TEST_CASE("fast-scan settings are validated", "[fastscan][ivf]") {
 }
 
 TEST_CASE("quantize_lut matches the scalar version exactly", "[fastscan]") {
-    const size_t m = GENERATE(2, 16, 64, 256, 480, 1024);
+    const size_t m = GENERATE(2, 6, 16, 64, 196, 256, 480, 1024);
     CAPTURE(m);
     std::mt19937 rng(static_cast<unsigned>(m) + 100);
     std::uniform_real_distribution<float> d(-3000.0f, 3000.0f);
@@ -389,7 +389,7 @@ TEST_CASE("quantize_lut rounds halves away from zero like the scalar version", "
 }
 
 TEST_CASE("fast_scan_block_mask flags exactly the sums below the limit", "[fastscan]") {
-    const size_t m = GENERATE(2, 16, 64, 256, 480, 1024);
+    const size_t m = GENERATE(2, 6, 16, 64, 196, 256, 480, 1024);
     CAPTURE(m);
     std::mt19937 rng(static_cast<unsigned>(m) + 200);
     std::vector<uint8_t> lut(m * 16), block(fs_block_bytes(m));

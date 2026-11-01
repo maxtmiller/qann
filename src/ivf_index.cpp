@@ -556,11 +556,15 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
         if (pq_distance_ == PQDistance::ADC) {
             if (!use_pre) pq_->compute_adc_table(residual, table);
             VECENGINE_PROF_STOP(t_table, kProfTable);
+            // fast-scan rounds the table to bytes, then scores 32 vectors per kernel call
+            float scale = 1.0f, offset = 0.0f;
+            if (fast_scan_) {
+                VECENGINE_PROF_START(t_round);
+                detail::quantize_lut(table.data(), m, lut.data(), scale, offset);
+                VECENGINE_PROF_STOP(t_round, kProfLutRound);
+            }
             VECENGINE_PROF_START(t_scan);
             if (fast_scan_) {
-                // round the table to bytes, then score 32 vectors per kernel call
-                float scale, offset;
-                detail::quantize_lut(table.data(), m, lut.data(), scale, offset);
                 scan_fast(list, listSize, scale, offset, push);
             } else {
                 pq_->distances_adc(table, list.codes.data(), listSize, dists.data());
