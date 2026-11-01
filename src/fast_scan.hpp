@@ -43,7 +43,7 @@ inline constexpr uint8_t kLutMax = 63;
 inline constexpr size_t kFsMaxSubspaces = 1024;
 
 // Rounds an m x 16 float ADC table to bytes: lut[s * 16 + j] =
-// round((table[s * 16 + j] - min_s) * scale), with min_s the row's minimum and
+// round((table[s * 16 + j] - min_s) * scale), rounding half to even, with min_s the row's minimum and
 // one scale for all rows chosen so the widest row spans 0..kLutMax. A distance is
 // then recovered as sum / scale + offset, where offset is the sum of the row
 // minimums; the error is at most m / (2 * scale). A table whose rows are all
