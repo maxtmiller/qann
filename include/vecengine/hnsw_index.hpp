@@ -64,6 +64,7 @@ public:
 
     size_t size() const noexcept override { return id_map_.live(); }
     size_t dim() const noexcept override { return dim_; }
+    bool stores_vectors() const noexcept override { return sq_bits_ == 0; }
 
     // Beam width of a query's level-0 search; queries use max(ef_search, k).
     // Higher finds more true neighbors and costs more time.
@@ -105,6 +106,7 @@ private:
     // DenseIndex implementations: vectors already prepared for the metric.
     void add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) override;
     vector<Neighbor> query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const override;
+    const float* stored_vector(uint32_t slot) const override { return data_.data() + size_t{slot} * dim_; }
     const detail::IdMap& id_map() const noexcept override { return id_map_; }
 
     // (distance to the query, slot)

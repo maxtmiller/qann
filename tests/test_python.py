@@ -306,6 +306,56 @@ def test_custom_ids_and_remove(data, kind):
 
 
 @pytest.mark.parametrize("kind", ["flat", "ivf", "refine", "hnsw"])
+def test_ids_and_get_vectors(tmp_path, data, kind):
+    ids = np.arange(len(data))[::-1] * 10 + 7   # descending, so ids() must sort
+    index = make_custom_index(kind, data, ids)
+    index.remove(ids[:3])
+    np.testing.assert_array_equal(index.ids(), np.sort(ids[3:]))
+
+    if kind == "ivf":   # PQ codes only
+        assert not index.stores_vectors
+        with pytest.raises(ValueError, match="PQ or SQ"):
+            index.get_vectors(ids[3:5])
+        return
+    assert index.stores_vectors
+    got = index.get_vectors([ids[10], ids[4]])
+    assert got.dtype == np.float32 and got.shape == (2, 32)
+    np.testing.assert_array_equal(got, data[[10, 4]])
+    for bad in ([ids[0]], [ids[4], ids[4]], [-5]):   # deleted, repeated, unknown
+        with pytest.raises(ValueError):
+            index.get_vectors(bad)
+
+    index.save(tmp_path / "i.qann")
+    loaded = qann.load(tmp_path / "i.qann")
+    np.testing.assert_array_equal(loaded.ids(), index.ids())
+    np.testing.assert_array_equal(loaded.get_vectors(index.ids()), index.get_vectors(index.ids()))
+
+    # Rebuild into another index type, with the same ids and vectors.
+    live = index.ids()
+    rebuilt = qann.FlatIndex(32, custom_ids=True)
+    rebuilt.add(index.get_vectors(live), ids=live)
+    found, _ = rebuilt.batch_query(data[3:23], 1)
+    np.testing.assert_array_equal(found[:, 0], ids[3:23])
+
+
+def test_get_vectors_returns_unit_vectors_for_cosine(data):
+    index = qann.FlatIndex(32, metric=qann.Metric.Cosine)
+    index.add(data[:10] * 3)
+    got = index.get_vectors(index.ids())
+    np.testing.assert_allclose(np.linalg.norm(got, axis=1), 1.0, rtol=1e-5)
+
+
+def test_sparse_index_lists_ids():
+    pytest.importorskip("scipy.sparse")
+    import scipy.sparse as sp
+    index = qann.InvertedIndex(custom_ids=True)
+    index.add(sp.csr_array(np.eye(4, dtype=np.float32)), ids=[40, 10, 30, 20])
+    index.remove([30])
+    np.testing.assert_array_equal(index.ids(), [10, 20, 40])
+    assert not hasattr(index, "get_vectors")
+
+
+@pytest.mark.parametrize("kind", ["flat", "ivf", "refine", "hnsw"])
 def test_filtered_query(data, kind):
     ids = np.arange(len(data)) * 10 + 7
     index = make_custom_index(kind, data, ids)

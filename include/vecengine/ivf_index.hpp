@@ -124,11 +124,16 @@ public:
 
     size_t size() const noexcept override { return id_map_.live(); }
     size_t dim() const noexcept override { return dim_; }
+    bool stores_vectors() const noexcept override { return !pq_enabled() && sq_bits_ == 0; }
 
 private:
     // DenseIndex implementations: vectors already prepared for the metric.
     void add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) override;
     vector<Neighbor> query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const override;
+    // Through slot_list_ / slot_pos_, which float lists always have.
+    const float* stored_vector(uint32_t slot) const override {
+        return data_.at(slot_list_[slot]).vecs.data() + size_t{slot_pos_[slot]} * dim_;
+    }
     vector<vector<Neighbor>> query_batch_impl(span<const float> queries, size_t num_queries, size_t k,
                                               const detail::SlotFilter* filter) const override;
     const detail::IdMap& id_map() const noexcept override { return id_map_; }

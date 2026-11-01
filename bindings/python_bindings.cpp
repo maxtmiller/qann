@@ -680,6 +680,13 @@ NB_MODULE(qann, m) {
                          return out;
                      },
                      "Each metadata column's name and type ('int', 'float' or 'str'), in the order they were added")
+        .def("ids",
+             [](const vecengine::IndexBase& self) {
+                 std::vector<int64_t> ids = read_locked(self, [&] { return self.ids(); });
+                 const std::size_t n = ids.size();
+                 return to_numpy(std::move(ids), {n});
+             },
+             "Every live vector's id (int64), in ascending order")
         .def("size", &index_size, "Get number of indexed vectors");
 
     nb::class_<vecengine::DenseIndex, vecengine::IndexBase>(m, "DenseIndex", "An index of dense float vectors")
@@ -703,6 +710,22 @@ NB_MODULE(qann, m) {
              "-1 / inf. allowed (ids) and where (a filter, SQL string or (string, params)) restrict the results as "
              "in query(), for every row")
         .def_prop_ro("metric", &vecengine::DenseIndex::metric, "How vectors are compared (fixed at construction)")
+        .def_prop_ro("stores_vectors", &vecengine::DenseIndex::stores_vectors,
+                     "Whether get_vectors() works: the index keeps its vectors as floats, not only PQ or SQ codes")
+        .def("get_vectors",
+             [](const vecengine::DenseIndex& self, IdsArg ids) {
+                 IdVector id_array = as_ids(ids);
+                 std::vector<float> out = read_locked(self, [&] {
+                     return self.get_vectors(std::span<const int64_t>(id_array.data(), id_array.shape(0)));
+                 });
+                 const std::size_t n = id_array.shape(0), dim = self.dim();
+                 return to_numpy(std::move(out), {n, dim});
+             },
+             nb::arg("ids"),
+             "A copy of the stored vectors with these ids, as an (n, dim) float32 array in the order given; "
+             "with Metric.Cosine they are the unit-length copies the index stores. Rebuild into another index "
+             "with new.add(old.get_vectors(old.ids())). Raises ValueError on an unknown, deleted or repeated "
+             "id, or if the index stores only PQ or SQ codes (see stores_vectors)")
         .def("dim", &vecengine::DenseIndex::dim, "Get vector dimension");
     m.attr("Index") = m.attr("DenseIndex");  // the name before 0.1.0a24
 

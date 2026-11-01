@@ -50,7 +50,7 @@ Indexes come in two families, with one class per search algorithm:
 | Exact | `FlatIndex` | `InvertedIndex` |
 | Approximate | `IVFIndex`, `HNSWIndex`, `RefineIndex` (exact re-ranking of either) | `SparseApproxIndex` |
 
-- The algorithm is fixed when an index is created. Search settings such as `nprobe` or `ef_search` are properties you can change at any time.
+- The algorithm is fixed when an index is created. Search settings such as `nprobe` or `ef_search` are properties you can change at any time. To switch type, rebuild: `new.add(old.get_vectors(old.ids()), ids=old.ids())` (ids only if `new` uses custom ids).
 - Ids, deletion, metadata, filters and saving work the same in both families (`qann.IndexBase`).
 - `qann.Index` is the old name of `qann.DenseIndex` and still works.
 
@@ -64,6 +64,8 @@ Methods every dense index has (sparse indexes take `scipy.sparse` matrices inste
 | `remove(ids)` | Delete vectors by id. Returns how many were deleted. |
 | `compact()` | Free the memory of deleted vectors. Returns how many were freed. |
 | `size()`, `dim()` | Number of (non-deleted) vectors; vector dimension. |
+| `ids()` | Every live id, ascending (sparse indexes too). |
+| `get_vectors(ids)` | Copies of the stored vectors, `(n, dim)`, in the order given. Not on PQ or SQ indexes, which keep only codes (`stores_vectors` is `False`); a `RefineIndex` over them works. With `Cosine` they come back unit-length. |
 | `save(path)` | Save to a file; see [Saving and loading](#saving-and-loading). |
 | `metadata_schema`, `get_metadata`, `update_metadata`, `add_metadata_column`, `drop_metadata_column` | See [Metadata](#metadata). |
 

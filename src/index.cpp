@@ -7,7 +7,8 @@
 #include <span>
 #include <cassert>
 #include <stdexcept>
-#include <cmath> 
+#include <cmath>
+#include <algorithm>
 
 namespace vecengine {
 
@@ -55,6 +56,26 @@ void IndexBase::update_metadata(span<const int64_t> ids, const Metadata& metadat
 
 Metadata IndexBase::get_metadata(span<const int64_t> ids, const vector<std::string>* columns) const {
     return metadata_.get(id_map().slots_of(ids), columns);
+}
+
+vector<int64_t> IndexBase::ids() const {
+    const detail::IdMap& map = id_map();
+    vector<int64_t> out;
+    out.reserve(map.live());
+    for (uint32_t s = 0; s < map.slots(); ++s)
+        if (!map.is_deleted(s)) out.push_back(map.label(s));
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+vector<float> DenseIndex::get_vectors(span<const int64_t> ids) const {
+    if (!stores_vectors())
+        throw std::invalid_argument("this index stores PQ or SQ codes, not the vectors; a RefineIndex over it keeps them");
+    const vector<uint32_t> slots = id_map().slots_of(ids);
+    const size_t d = dim();
+    vector<float> out(slots.size() * d);
+    for (size_t i = 0; i < slots.size(); ++i) std::copy_n(stored_vector(slots[i]), d, out.data() + i * d);
+    return out;
 }
 
 void IndexBase::add_metadata_column(std::string name, ColumnType type, std::optional<Expr::Value> value) {
