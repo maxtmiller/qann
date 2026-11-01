@@ -56,8 +56,8 @@ void quantize_lut_scalar(const float* table, size_t m, uint8_t* lut, float& scal
 // Sums of the lut entries picked by each of the block's 32 vectors: out[v] =
 // sum over s of lut[s * 16 + code(v, s)]. Needs every entry <= kLutMax
 // (quantize_lut guarantees it) and m <= kFsMaxSubspaces, so the SIMD versions
-// can add bytes and no sum overflows uint16_t. Uses NEON or SSSE3 when the
-// build has them.
+// can add bytes and no sum overflows uint16_t, and an even m (the AVX2 kernel
+// reads two subspaces at a time). Uses NEON, AVX2 or SSSE3 when the build has them.
 void fast_scan_block(const uint8_t* lut, const uint8_t* block, size_t m, uint16_t* out);
 
 // Portable version of fast_scan_block; the SIMD versions must match it exactly.

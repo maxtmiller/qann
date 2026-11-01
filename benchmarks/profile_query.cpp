@@ -63,7 +63,7 @@ static void report(const char* label, const DenseIndex& index, const std::vector
     double total = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 
     const char* names[] = {"coarse search", "ADC table build", "ADC code scan", "raw vector scan", "result drain", "re-rank",
-                           "query setup", "inner table (C)", "per-list setup"};
+                           "query setup", "inner table (C)", "per-list setup", "LUT rounding"};
     double accounted = 0;
     std::printf("\n%s: %.0f us/query (%.0f QPS)\n", label, total / nq * 1e6, nq / total);
     for (int i = 0; i < detail::kProfSlots; ++i) {

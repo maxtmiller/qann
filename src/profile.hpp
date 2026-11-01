@@ -11,7 +11,7 @@
 namespace vecengine::detail {
 
 enum ProfSlot { kProfCoarse, kProfTable, kProfCodeScan, kProfRawScan, kProfDrain, kProfRerank,
-                kProfSetup, kProfInner, kProfListSetup, kProfSlots };
+                kProfSetup, kProfInner, kProfListSetup, kProfLutRound, kProfSlots };
 
 inline thread_local double g_prof[kProfSlots] = {}; // seconds per slot
 inline thread_local unsigned long long g_prof_calls = 0; // clock reads, to estimate the timers' own cost
