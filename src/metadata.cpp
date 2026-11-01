@@ -688,7 +688,10 @@ void MetadataStore::add_column(std::string name, ColumnType type, size_t rows, c
     if (find(name)) throw std::invalid_argument("metadata column '" + name + "' already exists");
     const ColumnType given = value ? static_cast<ColumnType>(value->index()) : type;  // Value's order matches ColumnType
     if (!fits(type, given)) throw wrong_type(name, type, given);
-    Column col{std::move(name), type, vector<uint8_t>(rows, value.has_value()), {}, {}, {}, {}, {}};
+    Column col;
+    col.name = std::move(name);
+    col.type = type;
+    col.valid.assign(rows, value.has_value());
     if (type == ColumnType::Int64) {
         col.ints.assign(rows, value ? std::get<int64_t>(*value) : 0);
     } else if (type == ColumnType::Float64) {
