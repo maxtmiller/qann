@@ -1,0 +1,5 @@
+if(EXISTS "/Users/maxtmiller/Documents/GitHub/qann/build-x86/test_vecengine-b12d07c_tests.cmake")
+  include("/Users/maxtmiller/Documents/GitHub/qann/build-x86/test_vecengine-b12d07c_tests.cmake")
+else()
+  add_test(test_vecengine_NOT_BUILT-b12d07c test_vecengine_NOT_BUILT-b12d07c)
+endif()

@@ -16,6 +16,8 @@ enum class IndexType {
     Flat,
     IVF,
     HNSW,
+    Inverted,      // sparse, exact
+    SparseApprox,  // sparse, approximate
 };
 
 // Per-type construction options. Only the fields relevant to `type` are read.
@@ -31,23 +33,29 @@ struct IndexOptions {
     size_t ef_construction = 200;  // HNSWIndex: beam width while inserting
     size_t ef_search = 64;         // HNSWIndex: beam width per query
     int hnsw_sq_bits = 0;          // HNSWIndex: 4 or 8 stores codes of that many bits (call train() before adding); 0 = floats
+    bool pruning = true;           // InvertedIndex: skip vectors that can't reach the top k
+    size_t query_terms = 10;       // SparseApproxIndex: query terms used (0 = all)
+    size_t list_depth = 10000;     // SparseApproxIndex: heaviest entries read per list (0 = all)
+    size_t k_factor = 10;          // SparseApproxIndex: k * k_factor candidates re-scored
     bool custom_ids = false;   // all: add_batch() takes user ids
-    Metric metric = Metric::L2; // all: how vectors are compared
+    Metric metric = Metric::L2; // dense: how vectors are compared
 };
 
-// Constructs the requested index type. Caller owns the result via unique_ptr
-// and interacts with it entirely through the Index interface.
-std::unique_ptr<Index> make_index(IndexType type, size_t dim, const IndexOptions& opts = {});
+// Constructs the requested index type: a DenseIndex of dim floats per vector,
+// or a SparseIndex (InvertedIndex or SparseApproxIndex; dim is then unused). dynamic_cast the result to reach
+// type-specific calls such as IVFIndex::train().
+std::unique_ptr<IndexBase> make_index(IndexType type, size_t dim, const IndexOptions& opts = {});
 
-// Loads an index from a stream. The stream must have been written by Index::save().
-std::unique_ptr<Index> load_index(std::istream& in);
+// Loads an index from a stream. The stream must have been written by save().
+// Returns the concrete type; dynamic_cast to DenseIndex for a dense one.
+std::unique_ptr<IndexBase> load_index(std::istream& in);
 
 // Saves an index to a file. Writes to path + ".tmp" first and renames it into
 // place, so a failed save never leaves a partial file at `path`.
-void save_index(const Index& index, const std::filesystem::path& path);
+void save_index(const IndexBase& index, const std::filesystem::path& path);
 
 // Loads an index saved by save_index. Every problem with the file's contents
 // is reported as std::runtime_error.
-std::unique_ptr<Index> load_index(const std::filesystem::path& path);
+std::unique_ptr<IndexBase> load_index(const std::filesystem::path& path);
 
 } // namespace vecengine

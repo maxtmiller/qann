@@ -1,5 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include "load_dense.hpp"
+
 #include "vecengine/distance.hpp"
 #include "vecengine/flat_index.hpp"
 #include "vecengine/hnsw_index.hpp"
@@ -229,10 +231,10 @@ TEST_CASE("HNSW: settings are validated", "[hnsw]") {
     REQUIRE(hnsw.ef_search() == 64);
 }
 
-static std::unique_ptr<Index> hnsw_roundtrip(const Index& index) {
+static std::unique_ptr<DenseIndex> hnsw_roundtrip(const DenseIndex& index) {
     std::stringstream s;
     index.save(s);
-    return load_index(s);
+    return load_dense(s);
 }
 
 TEST_CASE("HNSW: save/load returns identical results and keeps adding the same way", "[hnsw][serialize]") {
@@ -292,7 +294,7 @@ TEST_CASE("HNSW: load rejects truncated and corrupt data", "[hnsw][serialize]") 
     SECTION("truncated") {
         for (size_t cut : {size_t{9}, size_t{40}, bytes.size() / 2, bytes.size() - 1}) {
             std::stringstream t(bytes.substr(0, cut));
-            REQUIRE_THROWS_AS(load_index(t), std::runtime_error);
+            REQUIRE_THROWS_AS(load_dense(t), std::runtime_error);
         }
     }
     SECTION("neighbor out of range") {
@@ -312,7 +314,7 @@ TEST_CASE("HNSW: load rejects truncated and corrupt data", "[hnsw][serialize]") 
         const uint32_t out_of_range = static_cast<uint32_t>(n);
         std::memcpy(bad.data() + level0_at + sizeof(uint32_t), &out_of_range, sizeof(uint32_t));
         std::stringstream t(bad);
-        REQUIRE_THROWS_AS(load_index(t), std::runtime_error);
+        REQUIRE_THROWS_AS(load_dense(t), std::runtime_error);
     }
 }
 
@@ -321,7 +323,7 @@ TEST_CASE("HNSW: make_index builds one with the given options", "[hnsw]") {
     opts.hnsw_m = 8;
     opts.ef_construction = 40;
     opts.ef_search = 20;
-    auto index = make_index(IndexType::HNSW, 12, opts);
+    auto index = make_dense(IndexType::HNSW, 12, opts);
     auto* hnsw = dynamic_cast<HNSWIndex*>(index.get());
     REQUIRE(hnsw != nullptr);
     REQUIRE(hnsw->dim() == 12);
@@ -548,10 +550,10 @@ TEST_CASE("HNSW SQ: enable_sq and train are checked", "[hnsw][sq]") {
 
     IndexOptions opts;
     opts.hnsw_sq_bits = 4;
-    auto made = make_index(IndexType::HNSW, 8, opts);
+    auto made = make_dense(IndexType::HNSW, 8, opts);
     REQUIRE(dynamic_cast<HNSWIndex&>(*made).sq_bits() == 4);
     opts.hnsw_sq_bits = 5;
-    REQUIRE_THROWS_AS(make_index(IndexType::HNSW, 8, opts), std::invalid_argument);
+    REQUIRE_THROWS_AS(make_dense(IndexType::HNSW, 8, opts), std::invalid_argument);
 }
 
 TEST_CASE("HNSW SQ: save/load keeps codes, ranges and an untrained index", "[hnsw][sq][serialize]") {
@@ -614,14 +616,14 @@ TEST_CASE("HNSW SQ: load rejects a bad storage byte and a trained-less index wit
         std::string bad = bytes;
         bad[storage_at] = bad_bits;
         std::stringstream t(bad);
-        REQUIRE_THROWS_AS(load_index(t), std::runtime_error);
+        REQUIRE_THROWS_AS(load_dense(t), std::runtime_error);
     }
 
     // 8-bit codes read as 4-bit: twice the code bytes the shape allows
     std::string narrowed = bytes;
     narrowed[storage_at] = 4;
     std::stringstream t(narrowed);
-    REQUIRE_THROWS_AS(load_index(t), std::runtime_error);
+    REQUIRE_THROWS_AS(load_dense(t), std::runtime_error);
 
     // ranges cut to length 0 while slots hold codes
     std::string no_ranges = bytes;
@@ -629,7 +631,7 @@ TEST_CASE("HNSW SQ: load rejects a bad storage byte and a trained-less index wit
     std::memcpy(no_ranges.data() + storage_at + 1, &zero, sizeof(zero));
     no_ranges.erase(storage_at + 1 + 8, dim * sizeof(float));
     std::stringstream u(no_ranges);
-    REQUIRE_THROWS_AS(load_index(u), std::runtime_error);
+    REQUIRE_THROWS_AS(load_dense(u), std::runtime_error);
 }
 
 TEST_CASE("HNSW SQ: compact rebuilds from the codes and keeps ids", "[hnsw][sq][compact]") {

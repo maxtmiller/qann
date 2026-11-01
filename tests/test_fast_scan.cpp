@@ -1,6 +1,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
+#include "load_dense.hpp"
+
 #include "fast_scan.hpp"
 
 #include <algorithm>
@@ -59,7 +61,7 @@ TEST_CASE("fast_scan_block_scalar sums the picked lut entries", "[fastscan]") {
 }
 
 TEST_CASE("fast_scan_block matches the scalar version", "[fastscan]") {
-    const size_t m = GENERATE(2, 16, 64, 256, 480, 1024);
+    const size_t m = GENERATE(2, 6, 16, 64, 196, 256, 480, 1024);
     CAPTURE(m);
     std::mt19937 rng(static_cast<unsigned>(m));
     std::vector<uint8_t> lut(m * 16), block(fs_block_bytes(m));
@@ -138,7 +140,7 @@ TEST_CASE("quantize_lut handles rows of negative values", "[fastscan]") {
     REQUIRE(lut[0] == 0);
     REQUIRE(lut[15] == kLutMax);
     REQUIRE(lut[16 + 15] == 0);                // row 1's minimum is its last entry
-    REQUIRE(lut[16] == std::lround(30.0f * scale));
+    REQUIRE(lut[16] == std::nearbyint(30.0f * scale));
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +245,7 @@ TEST_CASE("fast-scan matches the float ADC scan on the same codes", "[fastscan][
 
     std::stringstream s;
     fast->save(s);
-    require_identical(vecengine::load_index(s)->query_batch(queries, nq, k), rf);
+    require_identical(load_dense(s)->query_batch(queries, nq, k), rf);
 }
 
 TEST_CASE("fast-scan: add and add_batch store the same codes", "[fastscan][ivf]") {
@@ -293,7 +295,7 @@ TEST_CASE("fast-scan: deletions, compaction and save/load", "[fastscan][ivf][com
 
     std::stringstream s;
     index->save(s);
-    auto loaded = vecengine::load_index(s);
+    auto loaded = load_dense(s);
     auto& ivf = dynamic_cast<IVFIndex&>(*loaded);
     REQUIRE(ivf.fast_scan());
     require_identical(ivf.query_batch(queries, nq, k), before);
@@ -345,7 +347,7 @@ TEST_CASE("fast-scan settings are validated", "[fastscan][ivf]") {
 }
 
 TEST_CASE("quantize_lut matches the scalar version exactly", "[fastscan]") {
-    const size_t m = GENERATE(2, 16, 64, 256, 480, 1024);
+    const size_t m = GENERATE(2, 6, 16, 64, 196, 256, 480, 1024);
     CAPTURE(m);
     std::mt19937 rng(static_cast<unsigned>(m) + 100);
     std::uniform_real_distribution<float> d(-3000.0f, 3000.0f);
@@ -367,7 +369,7 @@ TEST_CASE("quantize_lut matches the scalar version exactly", "[fastscan]") {
     REQUIRE(oa == ob);
 }
 
-TEST_CASE("quantize_lut rounds halves away from zero like the scalar version", "[fastscan]") {
+TEST_CASE("quantize_lut rounds halves to even like the scalar version", "[fastscan]") {
     // Row 0 spans 0..kLutMax, so scale is exactly 1 and every entry is its own
     // rounding input: exact halves, and the floats either side of 0.5.
     const size_t m = 2;
@@ -383,11 +385,11 @@ TEST_CASE("quantize_lut rounds halves away from zero like the scalar version", "
     quantize_lut_scalar(table.data(), m, b.data(), sb, ob);
     REQUIRE(sa == 1.0f);
     REQUIRE(a == b);
-    REQUIRE(std::vector<uint8_t>(a.begin() + 17, a.begin() + 26) == std::vector<uint8_t>{1, 2, 3, 63, 0, 1, 1, 0, 3});
+    REQUIRE(std::vector<uint8_t>(a.begin() + 17, a.begin() + 26) == std::vector<uint8_t>{0, 2, 2, 62, 0, 1, 1, 0, 3});
 }
 
 TEST_CASE("fast_scan_block_mask flags exactly the sums below the limit", "[fastscan]") {
-    const size_t m = GENERATE(2, 16, 64, 256, 480, 1024);
+    const size_t m = GENERATE(2, 6, 16, 64, 196, 256, 480, 1024);
     CAPTURE(m);
     std::mt19937 rng(static_cast<unsigned>(m) + 200);
     std::vector<uint8_t> lut(m * 16), block(fs_block_bytes(m));

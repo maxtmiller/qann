@@ -1,5 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include "load_dense.hpp"
+
 #include "vecengine/distance.hpp"
 #include "vecengine/flat_index.hpp"
 #include "vecengine/index_factory.hpp"
@@ -51,10 +53,10 @@ static void sq_require_identical(const std::vector<std::vector<Neighbor>>& a, co
     }
 }
 
-static std::unique_ptr<Index> sq_roundtrip(const Index& index) {
+static std::unique_ptr<DenseIndex> sq_roundtrip(const DenseIndex& index) {
     std::stringstream s;
     index.save(s);
-    return load_index(s);
+    return load_dense(s);
 }
 
 // A trained IVFIndex with SQ codes of `bits` (0 = floats), not yet filled.
@@ -122,10 +124,10 @@ TEST_CASE("IVF SQ: enable_sq is checked", "[ivf][sq]") {
 
     IndexOptions opts;
     opts.ivf_sq_bits = 8;
-    auto made = make_index(IndexType::IVF, 8, opts);
+    auto made = make_dense(IndexType::IVF, 8, opts);
     REQUIRE(dynamic_cast<IVFIndex&>(*made).sq_bits() == 8);
     opts.pq_subspaces = 4;
-    REQUIRE_THROWS_AS(make_index(IndexType::IVF, 8, opts), std::logic_error);
+    REQUIRE_THROWS_AS(make_dense(IndexType::IVF, 8, opts), std::logic_error);
 }
 
 TEST_CASE("IVF SQ: save/load keeps codes, ranges and an untrained index", "[ivf][sq][serialize]") {
@@ -174,14 +176,14 @@ TEST_CASE("IVF SQ: load rejects bad SQ settings", "[ivf][sq][serialize]") {
         std::string b = bytes;
         b[sq_at] = bad;
         std::stringstream t(b);
-        REQUIRE_THROWS_AS(load_index(t), std::runtime_error);
+        REQUIRE_THROWS_AS(load_dense(t), std::runtime_error);
     }
 
     // 8-bit codes read as 4-bit: list lengths no longer match
     std::string narrowed = bytes;
     narrowed[sq_at] = 4;
     std::stringstream t(narrowed);
-    REQUIRE_THROWS_AS(load_index(t), std::runtime_error);
+    REQUIRE_THROWS_AS(load_dense(t), std::runtime_error);
 
     // ranges cut to length 0 on a trained index
     std::string no_ranges = bytes;
@@ -189,12 +191,12 @@ TEST_CASE("IVF SQ: load rejects bad SQ settings", "[ivf][sq][serialize]") {
     std::memcpy(no_ranges.data() + sq_at + 1, &zero, sizeof(zero));
     no_ranges.erase(sq_at + 1 + 8, dim * sizeof(float));
     std::stringstream u(no_ranges);
-    REQUIRE_THROWS_AS(load_index(u), std::runtime_error);
+    REQUIRE_THROWS_AS(load_dense(u), std::runtime_error);
 
     SECTION("truncated") {
         for (size_t cut : {sq_at, sq_at + 5, bytes.size() / 2, bytes.size() - 1}) {
             std::stringstream c(bytes.substr(0, cut));
-            REQUIRE_THROWS_AS(load_index(c), std::runtime_error);
+            REQUIRE_THROWS_AS(load_dense(c), std::runtime_error);
         }
     }
 }

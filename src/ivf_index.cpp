@@ -36,7 +36,7 @@ using std::vector;
 using std::span;
 using std::pair;
 
-IVFIndex::IVFIndex(size_t dim, size_t nlist, size_t nprobe, bool custom_ids, Metric metric): Index(metric), dim_(dim), nlist_(nlist), nprobe_(nprobe), id_map_(custom_ids)  {
+IVFIndex::IVFIndex(size_t dim, size_t nlist, size_t nprobe, bool custom_ids, Metric metric): DenseIndex(metric), dim_(dim), nlist_(nlist), nprobe_(nprobe), id_map_(custom_ids)  {
     if (nlist < 100 || nlist > 65535) throw std::invalid_argument("nlist must be in [100, 65535]");
     if (dim == 0) throw std::invalid_argument("dim must be >= 1");
     set_nprobe(nprobe);
@@ -107,6 +107,11 @@ void IVFIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* i
 
     const uint32_t first_slot = static_cast<uint32_t>(id_map_.slots());
     id_map_.add(n, ids);
+    const bool lookup = !pq_enabled();
+    if (lookup) {
+        slot_list_.resize(first_slot + n);
+        slot_pos_.resize(first_slot + n);
+    }
 
     vector<uint32_t> assign(n);
     detail::assign_nearest(vecs.data(), n, dim_, coarse_centroids_.data(), nlist_, dim_, assign.data());
@@ -135,6 +140,10 @@ void IVFIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* i
     for (size_t i = 0; i < n; ++i) {
         InvertedList& list = data_[static_cast<uint16_t>(assign[i])];
         list.ids.push_back(first_slot + static_cast<uint32_t>(i));
+        if (lookup) {
+            slot_list_[first_slot + i] = static_cast<uint16_t>(assign[i]);
+            slot_pos_[first_slot + i] = static_cast<uint32_t>(list.ids.size() - 1);
+        }
 
         if (sq_bits_) {
             const size_t w = sq_code_bytes();
@@ -164,11 +173,55 @@ vector<Neighbor> IVFIndex::query_impl(span<const float> vec, size_t k, const det
         vec = rot;
     }
 
+    if (use_direct(k, filter)) return direct_scan(vec, k, *filter);
+
     VECENGINE_PROF_START(t_coarse);
     vector<Probe> probes = filter ? coarse_all(vec) : coarse(vec);
     VECENGINE_PROF_STOP(t_coarse, kProfCoarse);
 
     return scan(vec, probes, k, filter);
+}
+
+bool IVFIndex::use_direct(size_t k, const detail::SlotFilter* filter) const {
+    // Scoring every allowed vector is exact for plain IVF, and while few are
+    // allowed it is faster than probing enough lists to find them: on SIFT1M
+    // (nlist 1000, nprobe 16) it ran at 98k QPS against 44k for the scaled
+    // probing in scan() at 2,000 allowed, 33k against 49k at 5,000, a
+    // crossover near 4,000; SQ's direct scoring is somewhat slower, so this
+    // switches at 3 * nlist. PQ isn't switched: each allowed vector needs its
+    // own list's table there, which made it 2-50x slower; a RefineIndex over PQ
+    // makes this switch instead.
+    return filter && k > 0 && !pq_enabled() && filter->count <= 3 * nlist_;
+}
+
+void IVFIndex::rebuild_slot_lookup() {
+    slot_list_.clear();
+    slot_pos_.clear();
+    if (pq_enabled()) return;
+    slot_list_.resize(id_map_.slots());
+    slot_pos_.resize(id_map_.slots());
+    for (const auto& [l, list] : data_)
+        for (size_t j = 0; j < list.ids.size(); ++j) {
+            slot_list_[list.ids[j]] = l;
+            slot_pos_[list.ids[j]] = static_cast<uint32_t>(j);
+        }
+}
+
+vector<Neighbor> IVFIndex::direct_scan(span<const float> vec, size_t k, const detail::SlotFilter& filter) const {
+    detail::TopK top(k);
+    filter.for_each([&](uint32_t slot) {
+        const InvertedList& list = data_.at(slot_list_[slot]);
+        const size_t j = slot_pos_[slot];
+        float dist;
+        if (sq_bits_) {
+            const uint8_t* code = list.codes.data() + j * sq_code_bytes();
+            dist = metric_ == Metric::InnerProduct ? -sq_.inner_product(vec.data(), code) : sq_.distance(vec.data(), code);
+        } else {
+            dist = exact_score(vec.data(), list.vecs.data() + j * dim_, dim_);
+        }
+        if (dist < top.threshold()) top.push(dist, id_map_.label(slot));
+    });
+    return top.take_sorted();
 }
 
 vector<vector<Neighbor>> IVFIndex::query_batch_impl(span<const float> queries, size_t num_queries, size_t k,
@@ -177,10 +230,10 @@ vector<vector<Neighbor>> IVFIndex::query_batch_impl(span<const float> queries, s
     if (!trained_) throw std::logic_error("train() has not be run yet");
 
 #ifndef VECENGINE_USE_BLAS
-    return Index::query_batch_impl(queries, num_queries, k, filter);
+    return DenseIndex::query_batch_impl(queries, num_queries, k, filter);
 #else
     // a filtered query may probe every list, which the batched coarse step doesn't rank
-    if (filter) return Index::query_batch_impl(queries, num_queries, k, filter);
+    if (filter) return DenseIndex::query_batch_impl(queries, num_queries, k, filter);
 
     // after the early returns above, which go through query_impl and rotate there
     vector<float> rot;
@@ -267,8 +320,31 @@ vector<IVFIndex::Probe> IVFIndex::coarse(span<const float> vec) const {
     return probes;
 }
 
+bool IVFIndex::coarse_all_approx() const noexcept {
+#if defined(VECENGINE_USE_BLAS) && defined(__APPLE__)
+    return dim_ >= kBlasCoarseMinDim;
+#else
+    return false;
+#endif
+}
+
 vector<IVFIndex::Probe> IVFIndex::coarse_all(span<const float> vec) const {
     vector<Probe> probes(nlist_);
+#if defined(VECENGINE_USE_BLAS) && defined(__APPLE__)
+    if (coarse_all_approx()) {
+        // as in coarse(): ||c||^2 - 2 q.c (-q.c for InnerProduct) from one sgemv; adding
+        // ||q||^2 keeps the ranking and puts dist on the exact scale, which scan()
+        // restores precisely for the lists it probes
+        const bool ip = metric_ == Metric::InnerProduct;
+        vector<float> score = ip ? vector<float>(nlist_, 0.0f) : centroid_sqnorms_;
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, static_cast<int>(nlist_), static_cast<int>(dim_), ip ? -1.0f : -2.0f,
+                    coarse_centroids_.data(), static_cast<int>(dim_), vec.data(), 1, 1.0f, score.data(), 1);
+        const float qq = ip ? 0.0f : cblas_sdot(static_cast<int>(dim_), vec.data(), 1, vec.data(), 1);
+        for (size_t i = 0; i < nlist_; ++i) probes[i] = {score[i] + qq, static_cast<uint16_t>(i)};
+        std::partial_sort(probes.begin(), probes.begin() + nprobe_, probes.end());
+        return probes;
+    }
+#endif
     for (size_t i = 0; i < nlist_; ++i)
         probes[i] = {exact_score(vec.data(), coarse_centroids_.data() + i * dim_, dim_), static_cast<uint16_t>(i)};
     std::partial_sort(probes.begin(), probes.begin() + nprobe_, probes.end());
@@ -340,6 +416,12 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
         if (fast_scan_) detail::quantize_lut(table.data(), m, lut.data(), ip_scale, ip_offset);
     }
 
+    // A block of 32 is skipped only when none of it passes, (1 - s)^32 of blocks
+    // at selectivity s, while building its mask costs about 12% of the kernel's
+    // time (measured on SIFT1M), so below 1/16 allowed the skips win. Above it,
+    // push() tests the filter as for an unfiltered query's deleted vectors.
+    const bool block_filter = filter && filter->count * 16 < id_map_.slots();
+
     // scores one fast-scan list with lut (scale and offset as quantize_lut set
     // them, plus anything added to every distance in the list)
     auto scan_fast = [&](const InvertedList& list, size_t listSize, float scale, float offset, auto&& push) {
@@ -347,6 +429,15 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
         uint16_t sums[detail::kFsBlock];
 
         for (size_t start = 0; start < listSize; start += detail::kFsBlock) {
+            const size_t count = std::min(detail::kFsBlock, listSize - start);
+            // a selective filter skips blocks it rejects entirely, before the kernel
+            uint32_t allowed = count < detail::kFsBlock ? (1u << count) - 1 : ~0u;
+            if (block_filter) {
+                allowed = 0;
+                for (size_t v = 0; v < count; ++v) allowed |= uint32_t{filter->test(list.ids[start + v])} << v;
+                if (allowed == 0) continue;
+            }
+
             // the current k-th best distance in the table's integer scale, recomputed
             // per block as it shrinks; sums are whole, so sum < limit <=> sum < ceil(limit)
             const float limit = (top.threshold() - offset) * scale;
@@ -357,8 +448,7 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
             // bit v is set when vector v can beat the k-th best; padding bits are dropped
             uint32_t mask = detail::fast_scan_block_mask(
                 lut.data(), list.codes.data() + (start / detail::kFsBlock) * block_bytes, m, limit16, sums);
-            const size_t count = std::min(detail::kFsBlock, listSize - start);
-            if (count < detail::kFsBlock) mask &= (1u << count) - 1;
+            mask &= allowed;    // drops padding bits, and with a filter the vectors it rejects
 
             // visit only the set bits, lowest first
             while (mask != 0) {
@@ -372,15 +462,30 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
     // a filtered query keeps probing past nprobe lists until it has this many results
     const size_t wanted = filter ? std::min(k, filter->count) : 0;
 
+    // With a fraction s of vectors allowed, the filtered top k sit about as deep
+    // as the unfiltered top k / s, so nprobe lists hold fewer of them. Probing
+    // 0.75 * nprobe * s^(-1/3) lists kept recall@10 at 0.92-0.96 from 0.2% to
+    // 20% allowed on SIFT1M (nprobe 16: unfiltered 0.93), where stopping at
+    // the first k allowed vectors gave 0.60-0.88. nprobe / s overshot: recall
+    // 1.0 at many times the cost.
+    size_t min_probes = nprobe_;
+    if (filter && filter_probe_scaling_ && filter->count > 0) {
+        const double want = std::ceil(0.75 * double(nprobe_) * std::cbrt(double(id_map_.live()) / double(filter->count)));
+        min_probes = std::clamp<size_t>(static_cast<size_t>(std::min(want, double(nlist_))), nprobe_, nlist_);
+    }
+
     // find top-k vectors from the inverted lists associated with the nprobe closest coarse centroids
     for (size_t p = 0; p < probes.size(); ++p) {
         if (p >= nprobe_) {
-            if (top.size() >= wanted) break;
+            if (p >= min_probes && top.size() >= wanted) break;
             if (p == nprobe_) std::sort(probes.begin() + p, probes.end());
         }
         const Probe& probe = probes[p];
         VECENGINE_PROF_START(t_list);
-        const float A = probe.dist;
+        // a filtered query's probes may hold coarse_all()'s approximate distances
+        const float A = filter && coarse_all_approx()
+                            ? exact_score(vec.data(), coarse_centroids_.data() + size_t{probe.list} * dim_, dim_)
+                            : probe.dist;
         auto it = data_.find(probe.list);
         if (it == data_.end()) continue;
 
@@ -389,20 +494,25 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
         dists.resize(listSize);
         VECENGINE_PROF_STOP(t_list, kProfListSetup);
 
-        // lamdba function for adding to heap
+        // adds vector j to the top k if it beats the k-th best and may be returned
         auto push = [&](float dist, size_t j) {
             const uint32_t slot = list.ids[j];
             if (dist < top.threshold() && (filter ? filter->test(slot) : !id_map_.is_deleted(slot)))
                 top.push(dist, id_map_.label(slot));
         };
+        // with a filter, whether vector j passes it, checked before scoring so a
+        // rejected vector costs no distance; unfiltered queries score every vector
+        auto passes = [&](size_t j) { return !filter || filter->test(list.ids[j]); };
 
         if (sq_bits_) {
             VECENGINE_PROF_START(t_raw);
             const size_t w = sq_code_bytes();
             if (metric_ == Metric::InnerProduct) {
-                for (size_t j = 0; j < listSize; ++j) push(-sq_.inner_product(vec.data(), list.codes.data() + j * w), j);
+                for (size_t j = 0; j < listSize; ++j)
+                    if (passes(j)) push(-sq_.inner_product(vec.data(), list.codes.data() + j * w), j);
             } else {
-                for (size_t j = 0; j < listSize; ++j) push(sq_.distance(vec.data(), list.codes.data() + j * w), j);
+                for (size_t j = 0; j < listSize; ++j)
+                    if (passes(j)) push(sq_.distance(vec.data(), list.codes.data() + j * w), j);
             }
             VECENGINE_PROF_STOP(t_raw, kProfRawScan);
             continue;
@@ -410,10 +520,8 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
 
         if (!pq_enabled()) {
             VECENGINE_PROF_START(t_raw);
-            for (size_t j = 0; j < listSize; ++j) {
-                const float* start = list.vecs.data() + j * dim_;
-                push(exact_score(vec.data(), start, dim_), j);
-            }
+            for (size_t j = 0; j < listSize; ++j)
+                if (passes(j)) push(exact_score(vec.data(), list.vecs.data() + j * dim_, dim_), j);
             VECENGINE_PROF_STOP(t_raw, kProfRawScan);
             continue;
         }
@@ -448,11 +556,15 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
         if (pq_distance_ == PQDistance::ADC) {
             if (!use_pre) pq_->compute_adc_table(residual, table);
             VECENGINE_PROF_STOP(t_table, kProfTable);
+            // fast-scan rounds the table to bytes, then scores 32 vectors per kernel call
+            float scale = 1.0f, offset = 0.0f;
+            if (fast_scan_) {
+                VECENGINE_PROF_START(t_round);
+                detail::quantize_lut(table.data(), m, lut.data(), scale, offset);
+                VECENGINE_PROF_STOP(t_round, kProfLutRound);
+            }
             VECENGINE_PROF_START(t_scan);
             if (fast_scan_) {
-                // round the table to bytes, then score 32 vectors per kernel call
-                float scale, offset;
-                detail::quantize_lut(table.data(), m, lut.data(), scale, offset);
                 scan_fast(list, listSize, scale, offset, push);
             } else {
                 pq_->distances_adc(table, list.codes.data(), listSize, dists.data());
@@ -487,8 +599,12 @@ size_t IVFIndex::compact_as_base() { return compact_impl(false); }
 
 size_t IVFIndex::compact_impl(bool keep_ids) {
     auto remap = id_map_.compact(keep_ids);
-    if (remap.empty()) return 0;
+    if (remap.empty()) {
+        metadata_.drop_unused_strings();
+        return 0;
+    }
     compact_storage(remap);
+    rebuild_slot_lookup();
     metadata_.compact(remap);
     return remap.size() - id_map_.slots();
 }
@@ -736,6 +852,7 @@ std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version
     if (version >= 5) index->metric_ = read_metric(in);
     if (version >= 9) index->metadata_ = MetadataStore::load(in, n_total);
     index->build_precomputed();
+    index->rebuild_slot_lookup();
 
     return index;
 }

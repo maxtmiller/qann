@@ -17,6 +17,47 @@ def test_version():
     assert isinstance(qann.__version__, str)
 
 
+def test_index_class_layout(tmp_path, data):
+    # what every index shares lives on IndexBase; dense and sparse vectors below it
+    shared = {"save", "remove", "compact", "size", "update_metadata", "get_metadata", "add_metadata_column",
+              "drop_metadata_column", "metadata_schema"}
+    dense = {"add", "query", "batch_query", "dim", "metric"}
+    assert qann.Index is qann.DenseIndex    # the name before 0.1.0a24
+    assert qann.DenseIndex.__mro__[1] is qann.IndexBase and qann.SparseIndex.__mro__[1] is qann.IndexBase
+    assert shared <= set(vars(qann.IndexBase))
+    assert not dense & set(dir(qann.IndexBase))
+    assert dense <= set(vars(qann.DenseIndex))
+    assert {"add", "query", "batch_query"} <= set(vars(qann.SparseIndex))
+    assert not {"dim", "metric"} & set(dir(qann.SparseIndex))
+
+    flat = qann.FlatIndex(32)
+    base = qann.FlatIndex(32)
+    indexes = [flat, qann.IVFIndex(32, 100), qann.HNSWIndex(32), qann.RefineIndex(base, k_factor=2)]
+    for index in indexes:
+        assert isinstance(index, qann.DenseIndex) and isinstance(index, qann.IndexBase)
+        assert not isinstance(index, qann.SparseIndex)
+    for index in (qann.InvertedIndex(), qann.SparseApproxIndex()):
+        assert isinstance(index, qann.SparseIndex) and not isinstance(index, qann.DenseIndex)
+
+    # the methods inherited from IndexBase still work through a subclass
+    flat.add(data[:3], metadata={"tag": ["a", "b", "c"]})
+    assert flat.get_metadata([1]) == {"tag": ["b"]}
+    assert flat.remove([0]) == 1 and flat.compact() == 1 and flat.size() == 2
+    path = tmp_path / "layout.qann"
+    flat.save(path)
+    assert isinstance(qann.load(path), qann.FlatIndex)
+
+    # make_index builds sparse indexes too
+    opts = qann.IndexOptions()
+    opts.custom_ids, opts.pruning = True, False
+    made = qann.make_index(qann.IndexType.Inverted, 0, opts)
+    assert type(made) is qann.InvertedIndex and not made.pruning
+    sp = pytest.importorskip("scipy.sparse")
+    with pytest.raises(ValueError):    # custom_ids reached it: an add needs ids
+        made.add(sp.csr_array(np.ones((1, 3), dtype=np.float32)))
+    assert made.add(sp.csr_array(np.ones((1, 3), dtype=np.float32)), [7]).tolist() == [7]
+
+
 def test_flat_finds_self(data):
     index = qann.FlatIndex(32)
     index.add(data)
@@ -288,6 +329,93 @@ def test_filtered_query(data, kind):
     assert len(found) == 0
     with pytest.raises(TypeError):
         index.query(data[0], 5, allowed=[1.5])
+
+
+def test_refine_over_ivf_narrow_filter_is_exact():
+    rng = np.random.default_rng(3)
+    data = rng.standard_normal((20000, 32), dtype=np.float32)
+    queries = rng.standard_normal((20, 32), dtype=np.float32)
+    ivf = qann.IVFIndex(32, nlist=100, nprobe=1)
+    ivf.enable_pq(8, fast_scan=True)
+    ivf.train(data, seed=1)
+    refine = qann.RefineIndex(ivf, k_factor=4)
+    refine.add(data)
+    flat = qann.FlatIndex(32)
+    flat.add(data)
+    allowed = np.arange(7, 20000, 150)    # 134 allowed, under 2 * nlist: scored directly
+    got, gd = refine.batch_query(queries, 10, allowed=allowed)
+    want, wd = flat.batch_query(queries, 10, allowed=allowed)
+    np.testing.assert_array_equal(got, want)
+    np.testing.assert_allclose(gd, wd, rtol=1e-5)
+    np.testing.assert_array_equal(refine.query(queries[0], 10, allowed=allowed)[0], want[0])
+
+
+def test_bare_ivf_narrow_filter_is_exact():
+    rng = np.random.default_rng(4)
+    data = rng.standard_normal((20000, 32), dtype=np.float32)
+    queries = rng.standard_normal((20, 32), dtype=np.float32)
+    flat = qann.FlatIndex(32)
+    flat.add(data)
+    allowed = np.arange(5, 20000, 250)    # 80 allowed, under nlist: scored directly
+    want, wd = flat.batch_query(queries, 10, allowed=allowed)
+    for metric in ("l2", "ip"):
+        ivf = qann.IVFIndex(32, nlist=100, nprobe=1, metric=qann.Metric.InnerProduct if metric == "ip" else qann.Metric.L2)
+        ivf.train(data, seed=1)
+        ivf.add(data)
+        got, gd = ivf.batch_query(queries, 10, allowed=allowed)
+        if metric == "l2":
+            np.testing.assert_array_equal(got, want)
+            np.testing.assert_allclose(gd, wd, rtol=1e-5)
+        else:
+            ip = qann.FlatIndex(32, metric=qann.Metric.InnerProduct)
+            ip.add(data)
+            np.testing.assert_array_equal(got, ip.batch_query(queries, 10, allowed=allowed)[0])
+
+
+def test_ivf_filter_probe_scaling():
+    rng = np.random.default_rng(5)
+    data = rng.standard_normal((20000, 32), dtype=np.float32)
+    queries = rng.standard_normal((50, 32), dtype=np.float32)
+    flat = qann.FlatIndex(32)
+    flat.add(data)
+    ivf = qann.IVFIndex(32, nlist=100, nprobe=2)
+    ivf.train(data, seed=1)
+    ivf.add(data)
+    assert ivf.filter_probe_scaling is True
+    allowed = np.arange(3, 20000, 20)    # 5%, above 3 * nlist: probed
+    want, _ = flat.batch_query(queries, 10, allowed=allowed)
+
+    def recall(found):
+        return np.mean([len(set(a) & set(b)) / 10 for a, b in zip(found, want)])
+
+    on = recall(ivf.batch_query(queries, 10, allowed=allowed)[0])
+    ivf.filter_probe_scaling = False
+    off_ids, _ = ivf.batch_query(queries, 10, allowed=allowed)
+    assert np.isin(off_ids, allowed).all() and (off_ids >= 0).all()
+    assert on > recall(off_ids)
+    ivf.filter_probe_scaling = True
+    assert recall(ivf.batch_query(queries, 10, allowed=allowed)[0]) == on
+
+
+def test_hnsw_filter_ef_scaling(tmp_path):
+    rng = np.random.default_rng(6)
+    data = rng.standard_normal((20000, 32), dtype=np.float32)
+    queries = rng.standard_normal((50, 32), dtype=np.float32)
+    hnsw = qann.HNSWIndex(32, M=8, ef_construction=64, seed=1)
+    hnsw.add(data)
+    hnsw.ef_search = 100
+    assert hnsw.filter_ef_scaling is True
+    allowed = np.arange(5, 20000, 5)    # 20%, above the direct-scoring cutoff: a graph search
+    on_ids, _ = hnsw.batch_query(queries, 10, allowed=allowed)
+    assert np.isin(on_ids, allowed).all()
+    # the same graph search as the full beam scaled by sqrt(0.2): round(100 * 0.447) = 45
+    hnsw.filter_ef_scaling = False
+    hnsw.ef_search = 45
+    np.testing.assert_array_equal(hnsw.batch_query(queries, 10, allowed=allowed)[0], on_ids)
+
+    hnsw.filter_ef_scaling = False
+    hnsw.save(str(tmp_path / "h.qann"))
+    assert qann.load(str(tmp_path / "h.qann")).filter_ef_scaling is True  # not saved
 
 
 def test_ids_accept_any_integer_sequence(data):
@@ -965,6 +1093,103 @@ def test_metadata_input_and_filter_errors(data):
             misuse()
 
 
+
+def test_metadata_sql_where(data):
+    index = qann.FlatIndex(32)
+    i = np.arange(200)
+    index.add(data[:200], metadata={"price": i % 100, "color": COLORS[i % 4]})
+    index.add(data[200:210])    # no metadata: price and color null
+    f = qann.field
+    queries = data[:20] + 0.01
+
+    def same(where, expr):
+        np.testing.assert_array_equal(index.batch_query(queries, 10, where=where)[0],
+                                      index.batch_query(queries, 10, where=expr)[0])
+
+    same("price < 30 AND color != 'red'", (f("price") < 30) & (f("color") != "red"))
+    same("color IN ('red', 'blue') OR price BETWEEN 10 AND 20",
+         f("color").isin(["red", "blue"]) | ((f("price") >= 10) & (f("price") <= 20)))
+    same(("price < ? AND color = ?", [30, "red"]), (f("price") < 30) & (f("color") == "red"))
+    same(("price >= :lo AND price < :hi", {"lo": 5, "hi": 9.5}), (f("price") >= 5) & (f("price") < 9.5))
+    same(qann.where("price < ?", [30]) & (f("color") == "red"), (f("price") < 30) & (f("color") == "red"))
+    same(f("price").between(10, 20), "price BETWEEN 10 AND 20")
+    same(f("price").between(10, 20), (f("price") >= 10) & (f("price") <= 20))
+    assert repr(f("price").between(1, 2.5)) == "qann.Expr(((price >= 1) & (price <= 2.5)))"
+    ends = index.query(data[0], 210, where=f("price").between(10, 10))[0]
+    assert sorted(ends.tolist()) == [10, 110]    # both ends included; nulls never match
+    assert index.query(data[0], 10, where=f("price").between(20, 10))[0].size == 0
+    assert index.query(queries[0], 10, where="price IS NULL")[0].tolist() == \
+        index.query(queries[0], 10, allowed=np.arange(200, 210))[0].tolist()
+
+    # SQL's NOT excludes nulls; ~ includes them
+    nulls = np.arange(200, 210)
+    assert not np.isin(nulls, index.query(data[200], 210, where="NOT price < 50")[0]).any()
+    assert np.isin(nulls, index.query(data[200], 210, where=~(f("price") < 50))[0]).all()
+    assert repr(qann.where("NOT (price < 5 OR color IS NULL)")) == "qann.Expr(((price >= 5) & ~is_null(color)))"
+
+    # a parameter is one value, whatever it contains
+    assert index.query(queries[0], 10, where=("color = ?", ["red' OR 'a' = 'a"]))[0].size == 0
+
+    with pytest.raises(ValueError, match="unexpected .color. at column 11"):
+        index.query(queries[0], 10, where="price < 5 color = 'red'")
+    with pytest.raises(ValueError, match="no parameter named 'hi'"):
+        qann.where("price < :hi", {"lo": 1})
+    with pytest.raises(ValueError, match="placeholders"):
+        index.query(queries[0], 10, where=("price < ?", [1, 2]))
+    with pytest.raises(ValueError):    # unknown column, found when evaluated
+        index.query(queries[0], 10, where="size = 1")
+
+    # NumPy scalars work as values; bools compare as 0 / 1
+    same(("price < ? AND color = ?", [np.int32(30), np.str_("red")]), "price < 30 AND color = 'red'")
+    same(("price < ?", [np.float32(2.5)]), "price < 2.5")
+    same(f("price") < np.int64(30), "price < 30")
+    same(("price = ?", [True]), "price = 1")
+    same(("price < ?", (30,)), "price < 30")    # params may be any sequence
+    with pytest.raises(TypeError):
+        qann.where("price = ?", [None])
+    for bad in (("price < 5",), ("price < ?", [5], 1), 5, b"price < 5"):
+        with pytest.raises(TypeError):
+            index.query(queries[0], 10, where=bad)
+    with pytest.raises(ValueError, match="number out of range"):
+        qann.where("price < 1e400")
+    with pytest.raises(ValueError, match="non-ASCII characters needs double quotes"):
+        qann.where("prïce < 5")
+
+    # deep nesting raises instead of overflowing the stack; long chains are fine
+    with pytest.raises(ValueError, match="nested more than 256 levels"):
+        index.query(queries[0], 10, where="(" * 100000 + "price = 1" + ")" * 100000)
+    with pytest.raises(ValueError, match="nested more than 256 levels"):
+        e = f("price") == 1
+        for _ in range(300):
+            e = ~e
+    chain = " OR ".join(f"price = {p}" for p in range(100000))
+    with pytest.raises(ValueError, match="more than 1024 conditions"):
+        qann.where(chain)
+    qann.set_max_filter_conditions(100000)
+    try:
+        np.testing.assert_array_equal(index.batch_query(queries, 10, where=chain)[0],
+                                      index.batch_query(queries, 10, where="price IS NOT NULL")[0])
+        assert len(repr(qann.where(chain))) > 100000
+    finally:
+        qann.set_max_filter_conditions(1024)
+
+    # the limit: an IN list counts once, code-built filters are free, and it must be >= 1
+    assert qann.get_max_filter_conditions() == 1024
+    same(("price IN (" + ", ".join(["?"] * 5000) + ")", list(range(5000))), "price IS NOT NULL")
+    assert len(repr(qann.field("price").isin(list(range(5000))))) > 5000
+    qann.set_max_filter_conditions(1)
+    try:
+        qann.where("price < 5")
+        with pytest.raises(ValueError, match="more than 1 conditions"):
+            qann.where("price < 5 AND color = 'red'")
+    finally:
+        qann.set_max_filter_conditions(1024)
+    with pytest.raises(ValueError, match="at least 1"):
+        qann.set_max_filter_conditions(0)
+    with pytest.raises(TypeError):
+        qann.set_max_filter_conditions(-1)
+    assert qann.get_max_filter_conditions() == 1024
+
 def test_metadata_unsigned_overflow_and_empty_adds(data):
     index = qann.FlatIndex(32)
     with pytest.raises(ValueError):    # would wrap to a negative int64
@@ -977,6 +1202,261 @@ def test_metadata_unsigned_overflow_and_empty_adds(data):
     assert "tag" not in index.metadata_schema
     index.add(data[2:3], metadata={"tag": ["x"]})
     assert index.metadata_schema["tag"] == "str"
+
+
+def test_metadata_none_and_update(tmp_path, data):
+    f = qann.field
+    index = qann.FlatIndex(32, custom_ids=True)
+    ids = np.arange(100, 110)
+    index.add(data[:10], ids, metadata={"price": [1, 2, None, 4, 5, 6, 7, 8, 9, 10],
+                                         "color": ["red", None, "blue", "red", "blue", "red", "blue", "red", "blue", "red"]})
+    assert index.metadata_schema == {"price": "int", "color": "str"}
+    q = data[0]
+
+    def match(where):
+        return sorted(index.query(q, 10, where=where)[0].tolist())
+
+    assert match(f("price").is_null()) == [102]
+    assert match("color IS NULL") == [101]
+
+    # only the given ids and columns change; None sets a null
+    index.update_metadata([103, 100], {"price": [40, None]})
+    assert match(f("price") == 40) == [103]
+    assert match(f("price").is_null()) == [100, 102]
+    assert match(f("color") == "red") == [100, 103, 105, 107, 109]
+    index.update_metadata(np.array([101]), {"color": ["green"], "price": np.array([11])})
+    assert match("color = 'green' AND price = 11") == [101]
+
+    # bad calls raise and change nothing
+    before = index.query(q, 10, where=f("price") >= 0)[0].tolist()
+    with pytest.raises(ValueError, match="id 999 is not in the index"):
+        index.update_metadata([999], {"price": [1]})
+    with pytest.raises(ValueError, match="id 100 appears twice"):
+        index.update_metadata([100, 100], {"price": [1, 2]})
+    with pytest.raises(ValueError, match="one value per id"):
+        index.update_metadata([100, 101], {"price": [1]})
+    with pytest.raises(ValueError, match="holds int values; got string"):
+        index.update_metadata([100], {"price": ["x"]})
+    with pytest.raises(ValueError, match="no metadata column 'prcie'; add it with add_metadata_column"):
+        index.update_metadata([100], {"prcie": [1]})
+    with pytest.raises(ValueError):    # the bad second column stops the first
+        index.update_metadata([104], {"price": [77], "color": [1]})
+    with pytest.raises(TypeError, match="mixes strings"):
+        index.update_metadata([104, 105], {"color": ["a", 1]})
+    assert index.query(q, 10, where=f("price") >= 0)[0].tolist() == before
+    index.remove([104])
+    with pytest.raises(ValueError, match="id 104 is not in the index"):
+        index.update_metadata([104], {"price": [1]})
+
+    # add_metadata_column adds a typed column, null for every vector, to fill with updates
+    index.add_metadata_column("year", "int")
+    assert index.metadata_schema["year"] == "int"
+    index.update_metadata([105, 106], {"year": [2024, 2025]})
+    assert match(f("year").is_null()) == [100, 101, 102, 103, 107, 108, 109]
+    with pytest.raises(ValueError, match="already exists"):
+        index.add_metadata_column("year", "float")
+    with pytest.raises(ValueError, match="'int', 'float' or 'str'"):
+        index.add_metadata_column("score", "double")
+    with pytest.raises(ValueError, match="only nulls"):    # add() still infers a new column's type
+        index.add(data[10:11], [200], metadata={"tag": [None]})
+    index.update_metadata([], {"year": []})    # no ids: nothing happens
+    with pytest.raises(ValueError, match="no metadata column 'never'"):
+        index.update_metadata([], {"never": []})
+
+    # survives save / load
+    path = tmp_path / "updated.qann"
+    index.save(path)
+    loaded = qann.load(path)
+    assert sorted(loaded.query(q, 10, where="year = 2025")[0].tolist()) == [106]
+    assert sorted(loaded.query(q, 10, where="color = 'green'")[0].tolist()) == [101]
+
+    # the base of a RefineIndex is updated through the RefineIndex
+    ivf = qann.FlatIndex(32)
+    refine = qann.RefineIndex(ivf, k_factor=2)
+    refine.add(data[:3], metadata={"color": ["a", "b", "c"]})
+    refine.update_metadata([1], {"color": ["a"]})
+    assert sorted(refine.query(q, 3, where=f("color") == "a")[0].tolist()) == [0, 1]
+    with pytest.raises(ValueError, match="through the RefineIndex"):
+        ivf.update_metadata([0], {"color": ["z"]})
+    with pytest.raises(ValueError, match="through the RefineIndex"):
+        ivf.add_metadata_column("rank", "float")
+    refine.add_metadata_column("rank", "float")
+    assert refine.metadata_schema["rank"] == "float"
+
+
+def test_get_metadata(tmp_path, data):
+    index = qann.FlatIndex(32, custom_ids=True)
+    index.add(data[:4], [10, 20, 30, 40], metadata={"price": [1, None, 3, 2**62 + 1],
+                                                     "weight": np.array([0.5, 1.5, np.nan, 3.5]),
+                                                     "color": ["red", None, "blue", "red"]})
+    nan = index.get_metadata([30], columns=["weight"])["weight"]
+    assert np.isnan(nan.data[0]) and not nan.mask[0]    # a stored NaN is a value, not a null
+    index.update_metadata([30], {"color": ["green"], "weight": [None]})
+
+    md = index.get_metadata([40, 20, 30])
+    assert list(md) == ["price", "weight", "color"]
+    assert isinstance(md["price"], np.ma.MaskedArray) and md["price"].dtype == np.int64
+    assert md["price"].mask.tolist() == [False, True, False]
+    assert md["price"][0] == 2**62 + 1    # ints stay exact
+    assert md["weight"].dtype == np.float64
+    assert md["weight"].mask.tolist() == [False, False, True]
+    assert md["weight"].compressed().tolist() == [3.5, 1.5]
+    assert md["color"] == ["red", None, "green"]
+    assert md["weight"][2] is np.ma.masked
+
+    picked = index.get_metadata(np.array([10]), columns=["color", "price"])
+    assert list(picked) == ["color", "price"]
+    assert picked["color"] == ["red"] and picked["price"].tolist() == [1]
+    assert index.get_metadata([10], columns=[]) == {}
+    assert index.get_metadata([], columns=["price"])["price"].shape == (0,)
+
+    # read-modify-write
+    stock = index.get_metadata([10, 40], columns=["price"])["price"]
+    index.update_metadata([10, 40], {"price": (stock - 1).tolist()})
+    assert index.get_metadata([10, 40])["price"].tolist() == [0, 2**62]
+
+    with pytest.raises(ValueError, match="id 99 is not in the index"):
+        index.get_metadata([99])
+    with pytest.raises(ValueError, match="id 10 appears twice"):
+        index.get_metadata([10, 10])
+    with pytest.raises(ValueError, match="no metadata column 'size'"):
+        index.get_metadata([10], columns=["size"])
+    with pytest.raises(ValueError, match="'price' appears twice"):
+        index.get_metadata([10], columns=["price", "price"])
+    with pytest.raises(TypeError):    # a bare string isn't a list of columns
+        index.get_metadata([10], columns="price")
+    index.remove([20])
+    with pytest.raises(ValueError, match="id 20 is not in the index"):
+        index.get_metadata([20])
+
+    # follows the vectors through compaction and save / load
+    index.compact()
+    path = tmp_path / "md.qann"
+    index.save(path)
+    assert qann.load(path).get_metadata([30, 10])["color"] == ["green", "red"]
+
+    # a RefineIndex holds the metadata; its base has none
+    base = qann.FlatIndex(32)
+    refine = qann.RefineIndex(base, k_factor=2)
+    refine.add(data[:2], metadata={"color": ["a", "b"]})
+    assert refine.get_metadata([1]) == {"color": ["b"]}
+    assert base.get_metadata([1]) == {}
+
+
+def test_metadata_columns_defaults_values_and_drop(tmp_path, data):
+    f = qann.field
+    index = qann.FlatIndex(32, custom_ids=True)
+    index.add(data[:5], [1, 2, 3, 4, 5], metadata={"price": [0.5, 1.5, 2.5, 3.5, 4.5]})
+    q = data[0]
+
+    def match(where):
+        return sorted(index.query(q, 10, where=where)[0].tolist())
+
+    # whole-number prices are ints to NumPy; they fit a float column
+    index.add(data[5:6], [6], metadata={"price": [10]})
+    index.update_metadata([1], {"price": np.array([20, ], dtype=np.int32)})
+    assert index.metadata_schema["price"] == "float"
+    assert match("price = 10") == [6] and match("price = 20.0") == [1]
+    index.add_metadata_column("year", "int")
+    with pytest.raises(ValueError, match="holds int values; got float"):
+        index.update_metadata([1], {"year": [2024.5]})
+
+    index.add_metadata_column("in_stock", "int", default=1)
+    assert match("in_stock = 1") == [1, 2, 3, 4, 5, 6]
+    index.add_metadata_column("label", "str", default="new")
+    index.add_metadata_column("score", "float", default=np.int64(2))
+    assert match("label = 'new' AND score = 2") == [1, 2, 3, 4, 5, 6]
+    with pytest.raises(ValueError, match="holds str|holds string"):
+        index.add_metadata_column("bad", "str", default=1)
+
+    index.add_metadata_column("tag", "str", ids=[4, 2], values=["d", None])
+    assert match("tag = 'd'") == [4]
+    assert match("tag IS NULL") == [1, 2, 3, 5, 6]
+    index.add_metadata_column("flags", "int", ids=[3], values=[None])    # all null is fine: the type is given
+
+    schema = dict(index.metadata_schema)
+    with pytest.raises(TypeError, match="not both"):
+        index.add_metadata_column("x", "int", default=0, ids=[1], values=[1])
+    with pytest.raises(TypeError, match="together"):
+        index.add_metadata_column("x", "int", ids=[1])
+    with pytest.raises(TypeError, match="together"):
+        index.add_metadata_column("x", "int", values=[1])
+    with pytest.raises(ValueError, match="id 99 is not in the index"):
+        index.add_metadata_column("x", "int", ids=[99], values=[1])
+    with pytest.raises(ValueError, match="one value per id"):
+        index.add_metadata_column("x", "int", ids=[1, 2], values=[1])
+    with pytest.raises(ValueError, match="already exists"):
+        index.add_metadata_column("tag", "str", default="a")
+    assert index.metadata_schema == schema
+
+    index.drop_metadata_column("tag")
+    assert "tag" not in index.metadata_schema
+    with pytest.raises(ValueError, match="no metadata column 'tag'"):
+        index.drop_metadata_column("tag")
+    with pytest.raises(ValueError):
+        index.query(q, 3, where="tag = 'd'")
+    index.add_metadata_column("tag", "int", default=0)    # the name is free again
+
+    # None in a float column, an all-None update to a string column, a negative id
+    index.update_metadata([2], {"price": [None]})
+    assert match("price IS NULL") == [2]
+    index.update_metadata([1, 3], {"label": [None, None]})
+    assert match("label IS NULL") == [1, 3]
+    with pytest.raises(ValueError, match="id -1 is not in the index"):
+        index.update_metadata([-1], {"price": [1.0]})
+    path = tmp_path / "columns.qann"
+    index.save(path)
+    loaded = qann.load(path)
+    assert loaded.metadata_schema == index.metadata_schema
+    assert sorted(loaded.query(q, 10, where="in_stock = 1 AND tag = 0")[0].tolist()) == [1, 2, 3, 4, 5, 6]
+
+
+def test_add_returns_ids(data):
+    index = qann.FlatIndex(32)
+    ids = index.add(data[:10])
+    assert ids.dtype == np.int64 and ids.tolist() == list(range(10))
+    index.remove([2, 5, 8])
+    index.compact()
+    assert index.size() == 7
+    assert index.add(data[10:11]).tolist() == [10]    # not 7: auto ids never repeat
+    assert index.add(data[:0]).tolist() == []
+
+    custom = qann.HNSWIndex(32, custom_ids=True, seed=1)
+    assert custom.add(data[:3], [30, 10, 20]).tolist() == [30, 10, 20]
+    refine = qann.RefineIndex(qann.FlatIndex(32), k_factor=2)
+    assert refine.add(data[:4]).tolist() == [0, 1, 2, 3]
+    assert refine.add(data[4:6]).tolist() == [4, 5]
+
+
+def test_any_of_and_all_of(data):
+    f = qann.field
+    index = qann.FlatIndex(32)
+    index.add(data[:200], metadata={"price": np.arange(200) % 100, "color": COLORS[np.arange(200) % 4]})
+    queries = data[:20] + 0.01
+
+    def same(a, b):
+        np.testing.assert_array_equal(index.batch_query(queries, 10, where=a)[0],
+                                      index.batch_query(queries, 10, where=b)[0])
+
+    same(qann.any_of([f("price") == 1, f("price") == 2, f("color") == "red"]),
+         (f("price") == 1) | (f("price") == 2) | (f("color") == "red"))
+    same(qann.all_of([f("price") < 50, qann.where("color = 'blue'")]), (f("price") < 50) & (f("color") == "blue"))
+    assert repr(qann.any_of([f("price") == 1])) == "qann.Expr((price == 1))"
+    for fn in (qann.any_of, qann.all_of):
+        with pytest.raises(ValueError, match="at least one filter"):
+            fn([])
+        with pytest.raises(TypeError):
+            fn([f("price")])    # a Field, not a filter
+
+    # a long chain is built in one step, and isn't subject to the SQL condition limit
+    chain = qann.any_of([f("price") == p for p in range(100000)])
+    same(chain, "price IS NOT NULL")
+    assert len(repr(chain)) > 100000
+    # nesting is still capped
+    deep = f("price") == 1
+    with pytest.raises(ValueError, match="nested more than 256 levels"):
+        for i in range(300):
+            deep = qann.any_of([qann.all_of([deep, f("price") == i]), f("color") == "red"])
 
 
 def test_concurrent_metadata_adds_and_filtered_queries(data):
@@ -1027,9 +1507,19 @@ def test_loads_metadata_saved_on_macos():
     assert index.metadata_schema == {"price": "int", "weight": "float", "color": "str", "tag": "str"}
     f = qann.field
     where = ((f("price") < 40) & (f("color") != "red")) | (f("tag") == "new")
-    ids, dists = index.batch_query(np.load(DATA / "v9_queries.npy"), 10, where=where)
-    np.testing.assert_array_equal(ids, np.load(DATA / "v9_refine_metadata_ids.npy"))
-    np.testing.assert_allclose(dists, np.load(DATA / "v9_refine_metadata_dists.npy"), rtol=1e-5, atol=1e-5)
+    queries = np.load(DATA / "v9_queries.npy")
+    ids, dists = index.batch_query(queries, 10, where=where)
+    saved_ids, saved_dists = np.load(DATA / "v9_refine_metadata_ids.npy"), np.load(DATA / "v9_refine_metadata_dists.npy")
+    # The filter allows 340 vectors, which a RefineIndex over IVF now scores
+    # directly and exactly (#72), so results can beat the probed ones recorded
+    # at save time but never lose to them. Every id matches the filter (metadata
+    # loaded), and ids in both rows score the same (raw vectors loaded).
+    matching = index.query(queries[0], index.size(), where=where)[0]
+    assert len(matching) == 340 and np.isin(ids, matching).all()
+    assert (dists <= saved_dists + 1e-5).all()
+    for row, saved_row, d, saved_d in zip(ids, saved_ids, dists, saved_dists):
+        for i, j in zip(*np.nonzero(row[:, None] == saved_row[None, :])):
+            np.testing.assert_allclose(d[i], saved_d[j], rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("name", ["flat", "hnsw_sq8", "refine_ivf_fs"])

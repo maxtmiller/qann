@@ -3,6 +3,8 @@
 #include "vecengine/ivf_index.hpp"
 #include "vecengine/hnsw_index.hpp"
 #include "vecengine/refine_index.hpp"
+#include "vecengine/inverted_index.hpp"
+#include "vecengine/sparse_approx_index.hpp"
 #include "serialize.hpp"
 
 #include <fstream>
@@ -12,7 +14,7 @@
 
 namespace vecengine {
 
-std::unique_ptr<Index> make_index(IndexType type, size_t dim, const IndexOptions& opts) {
+std::unique_ptr<IndexBase> make_index(IndexType type, size_t dim, const IndexOptions& opts) {
     switch (type) {
         case IndexType::Flat:
             return std::make_unique<FlatIndex>(dim, opts.capacity, opts.custom_ids, opts.metric);
@@ -29,22 +31,31 @@ std::unique_ptr<Index> make_index(IndexType type, size_t dim, const IndexOptions
             if (opts.hnsw_sq_bits) idx->enable_sq(opts.hnsw_sq_bits);
             return idx;
         }
+        case IndexType::Inverted: {
+            auto idx = std::make_unique<InvertedIndex>(opts.custom_ids);
+            idx->set_pruning(opts.pruning);
+            return idx;
+        }
+        case IndexType::SparseApprox:
+            return std::make_unique<SparseApproxIndex>(opts.custom_ids, opts.query_terms, opts.list_depth, opts.k_factor);
     }
     throw std::invalid_argument("unknown IndexType");
 }
 
-std::unique_ptr<Index> load_index(std::istream& in) {
+std::unique_ptr<IndexBase> load_index(std::istream& in) {
     const detail::Header header = detail::read_header(in);
     switch (header.kind) {
         case detail::IndexKind::Flat:   return FlatIndex::load_body(in, header.version);
         case detail::IndexKind::IVF:    return IVFIndex::load_body(in, header.version);
         case detail::IndexKind::Refine: return RefineIndex::load_body(in, header.version);
         case detail::IndexKind::HNSW:   return HNSWIndex::load_body(in, header.version);
+        case detail::IndexKind::Inverted: return InvertedIndex::load_body(in, header.version);
+        case detail::IndexKind::SparseApprox: return SparseApproxIndex::load_body(in, header.version);
     }
     throw std::runtime_error("unknown index kind");
 }
 
-void save_index(const Index& index, const std::filesystem::path& path) {
+void save_index(const IndexBase& index, const std::filesystem::path& path) {
     std::filesystem::path tmp = path;
     tmp += ".tmp";
 
@@ -62,11 +73,11 @@ void save_index(const Index& index, const std::filesystem::path& path) {
     }
 }
 
-std::unique_ptr<Index> load_index(const std::filesystem::path& path) {
+std::unique_ptr<IndexBase> load_index(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) throw std::runtime_error("cannot open " + path.string() + " for reading");
 
-    std::unique_ptr<Index> index;
+    std::unique_ptr<IndexBase> index;
     try {
         index = load_index(in);
     } catch (const std::invalid_argument& e) {

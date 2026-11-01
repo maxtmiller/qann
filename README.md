@@ -1,6 +1,6 @@
 # QaNN
 
-QaNN (**Q**uantized **N**earest **N**eighbors) is a Python library for fast nearest-neighbor search over float32 vectors. It offers exact search, inverted-file (IVF) search, product quantization (PQ) compression and exact re-ranking, all implemented in multithreaded, SIMD-accelerated C++ and driven from NumPy.
+QaNN (**Q**uantized **N**earest **N**eighbors) is a Python library for fast nearest-neighbor search over dense float32 vectors and sparse vectors. For dense vectors it offers exact search, inverted-file (IVF) and HNSW graph search, product and scalar quantization and exact re-ranking; for sparse vectors (BM25, SPLADE), exact and approximate inverted-index search. Every index supports custom ids, deletion, metadata filters and saving. All of it is implemented in multithreaded, SIMD-accelerated C++ and driven from NumPy and SciPy.
 
 > **Alpha:** under active development. The API may change between releases.
 
@@ -10,7 +10,7 @@ QaNN (**Q**uantized **N**earest **N**eighbors) is a Python library for fast near
 pip install qann
 ```
 
-Wheels are published for Linux (x86_64, aarch64) and macOS (Apple Silicon, Intel) on Python 3.10 to 3.14. x86_64 builds require AVX2 and FMA. To build from source instead, run `pip install .` in a checkout; this needs CMake 3.20+, a C++20 compiler and, on Linux, OpenBLAS (optional but much faster training).
+Wheels are published for Linux (x86_64, aarch64) and macOS (Apple Silicon, Intel) on Python 3.10 to 3.14. x86_64 builds require AVX2 and FMA. The sparse indexes take `scipy.sparse` matrices, so they also need SciPy (`pip install scipy`). To build from source instead, run `pip install .` in a checkout; this needs CMake 3.20+, a C++20 compiler and, on Linux, OpenBLAS (optional but much faster training).
 
 ## Quick start
 
@@ -37,14 +37,27 @@ ids, dists = index.batch_query(x[:5], 10)   # both shaped (5, 10)
 
 ## Indexes
 
-Every index has the same core methods:
+Indexes come in two families, chosen by the kind of vectors they hold, with one class per search algorithm:
+
+| | Dense vectors (`qann.DenseIndex`) | Sparse vectors (`qann.SparseIndex`) |
+| --- | --- | --- |
+| Exact | `FlatIndex` | `InvertedIndex` |
+| Approximate | `IVFIndex`, `HNSWIndex`, `RefineIndex` (exact re-ranking of either) | `SparseApproxIndex` |
+
+The algorithm is fixed when an index is created; search settings such as `nprobe` or `ef_search` are properties that can change at any time. Everything except `add`, `query`, `batch_query`, `dim` and `metric` is shared by both families through `qann.IndexBase`: custom ids, deletion, metadata and filters, saving. `qann.Index` is the old name of `qann.DenseIndex` and still works.
+
+Every dense index has these methods (sparse indexes have the same ones, minus `dim`, taking `scipy.sparse` matrices; see [`InvertedIndex`](#invertedindex-custom_idsfalse)):
 
 | Method | Description |
 | --- | --- |
-| `add(data, ids=None, *, metadata=None)` | Add an `(n, dim)` array of vectors, with `n` ids if the index uses custom ids, and optional metadata columns; see [Metadata](#metadata). |
+| `add(data, ids=None, *, metadata=None)` | Add an `(n, dim)` array of vectors, with `n` ids if the index uses custom ids, and optional metadata columns; see [Metadata](#metadata). Returns the vectors' ids. |
 | `batch_query(queries, k, *, allowed=None, where=None)` | k nearest neighbors for each row of an `(nq, dim)` array, run in parallel. Returns `(ids, dists)`. `allowed` restricts results to those ids and `where` to vectors whose metadata matches; see [Filtered search](#filtered-search). |
 | `query(query, k, *, allowed=None, where=None)` | k nearest neighbors for a single `(dim,)` vector such as `x[i]`. Returns 1D `(ids, dists)`. |
 | `metadata_schema` | Each metadata column's name and type (`'int'`, `'float'` or `'str'`). |
+| `get_metadata(ids, columns=None)` | Read metadata back as `{name: one value per id}`; see [Metadata](#metadata). |
+| `update_metadata(ids, metadata)` | Overwrite metadata columns of existing vectors in place; see [Metadata](#metadata). |
+| `add_metadata_column(name, type, *, default=None, ids=None, values=None)` | Add a metadata column (`'int'`, `'float'` or `'str'`) to the vectors already in the index; see [Metadata](#metadata). |
+| `drop_metadata_column(name)` | Remove a metadata column and its values. |
 | `remove(ids)` | Delete vectors by id; returns how many were deleted. |
 | `compact()` | Free the memory of deleted vectors; returns how many were freed. Ids are unchanged, and so are results, except that `HNSWIndex` rebuilds its graph. |
 | `size()` | Number of vectors in the index (deleted ones excluded). |
@@ -173,9 +186,52 @@ Wraps a trained, empty approximate index created without custom ids (and never c
 
 This is the usual way to combine PQ's speed with near-exact ranking. It keeps the original vectors in memory alongside the PQ codes.
 
+### `InvertedIndex(*, custom_ids=False)`
+
+An exact inverted index over sparse vectors, for keyword-style retrieval: BM25 weights, or learned sparse vectors such as SPLADE, computed by you and passed in as `scipy.sparse` matrices (a column is a term id). It scores by dot product, so results come largest first with distance `-(q . d)`, as with `Metric.InnerProduct`.
+
+```python
+import scipy.sparse as sp
+
+index = qann.InvertedIndex()
+index.add(doc_matrix, metadata={"lang": langs})             # (n_docs, vocab) CSR
+ids, dists = index.batch_query(query_matrix, 10, where="lang = 'en'")
+ids, dists = index.query(query_matrix[[0]], 10)             # one row
+```
+
+- **Input:** any `scipy.sparse` matrix or array (CSR is used directly, other formats go through `tocsr()`). Column indices must be in `[0, 2^32)`; values become float32. Repeated entries in a row are summed and zeros are dropped. There is no fixed dimension.
+- **Results:** exact. A query reads only its own terms' posting lists and returns only documents sharing at least one nonzero term with it, so fewer than `k` can come back. Rows are padded with `-1` / `inf` as for the dense indexes.
+- **Shared with the dense indexes:** custom ids, `remove` / `compact`, metadata and `where=`, `allowed=`, `get_metadata`, `save` / `qann.load`. It is a `qann.SparseIndex` (the sparse family), not a `qann.DenseIndex`, since it has no `dim` or metric.
+- **Size:** `terms` and `postings` report the distinct terms and stored (term, document) pairs. Each posting takes 8 bytes.
+- **Cost:** about proportional to the postings a query's terms have. With `pruning` on (the default), once the remaining terms can't lift an unseen document into the top `k`, their lists only add to documents that still could, which mostly helps small `k` on large corpora: 1.6x more queries per second at `k = 10` on BEIR FiQA (58k documents) with BM25, about the same at `k = 1000`. Results are identical either way; `index.pruning = False` turns it off. `benchmarks/sparse_bm25.py` measures it.
+
+### `SparseApproxIndex(*, custom_ids=False, query_terms=10, list_depth=10000, k_factor=10)`
+
+Approximate search over sparse vectors, for learned sparse vectors such as SPLADE whose queries have dozens of terms, where exact search reads a large share of the index for every query. Same input, results and shared features as `InvertedIndex`.
+
+```python
+index = qann.SparseApproxIndex()            # query_terms=10, list_depth=10000, k_factor=10
+index.add(doc_matrix)
+ids, dists = index.batch_query(query_matrix, 10)
+index.list_depth = 2000                     # faster, lower recall; applies to later queries
+```
+
+- **How it searches:** a query uses only its `query_terms` largest values, reads only the `list_depth` heaviest entries of each of those terms' posting lists, and re-scores the `k * k_factor` best candidates exactly against the whole query. Every result's distance is its exact one (the same as `InvertedIndex` returns); only which documents are found is approximate. `0` for `query_terms` or `list_depth` means all.
+- **Memory:** posting lists kept heaviest first, plus a forward index (each document's own terms) for the re-scoring: about twice `InvertedIndex`.
+- **Speed:** on SPLADE vectors of 1M MS MARCO passages (big-ann-benchmarks sparse track), one thread on an M3, against exact search at 118 queries per second:
+
+| `query_terms` / `list_depth` / `k_factor` | recall@10 | queries per second |
+| --- | --- | --- |
+| 10 / 2,000 / 50 | 0.907 | 2,477 (21x) |
+| 10 / 10,000 / 10 (the defaults) | 0.962 | 1,621 (14x) |
+| 10 / 10,000 / 50 | 0.989 | 1,183 (10x) |
+| 20 / 10,000 / 50 | 0.994 | 653 (5.5x) |
+
+  `benchmarks/sparse_bigann.py --approx` measures it. The settings are properties, saved with the index, and can change at any time.
+
 ### `make_index(type, dim, opts=IndexOptions())`
 
-Builds an index from a type and an options object, returning a `FlatIndex`, `IVFIndex` or `HNSWIndex`:
+Builds an index from a type and an options object, returning a `FlatIndex`, `IVFIndex`, `HNSWIndex`, `InvertedIndex` or `SparseApproxIndex`:
 
 ```python
 opts = qann.IndexOptions()
@@ -184,7 +240,7 @@ ivf = qann.make_index(qann.IndexType.IVF, 128, opts)
 ivf.train(x)
 ```
 
-`IndexType` is `Flat`, `IVF` or `HNSW`. `IndexOptions` fields and defaults: `metric` (`Metric.L2`), plus `capacity` (Flat initial reserve, 1024), `nlist` (100), `nprobe` (10), `pq_subspaces` (0, meaning no PQ), `pq_centroids` (256) and `ivf_sq_bits` (0; 8 or 4 calls `enable_sq()`) for IVF, and `hnsw_m` (16), `ef_construction` (200), `ef_search` (64) and `hnsw_sq_bits` (0 for floats; 8 or 4 calls `enable_sq()`) for HNSW.
+`IndexType` is `Flat`, `IVF`, `HNSW`, `Inverted` or `SparseApprox` (sparse; `dim` is unused, pass 0). `IndexOptions` fields and defaults: `custom_ids` (`False`) for all, `metric` (`Metric.L2`) for dense, `pruning` (`True`) for `Inverted`, `query_terms` (10), `list_depth` (10000) and `k_factor` (10) for `SparseApprox`, plus `capacity` (Flat initial reserve, 1024), `nlist` (100), `nprobe` (10), `pq_subspaces` (0, meaning no PQ), `pq_centroids` (256) and `ivf_sq_bits` (0; 8 or 4 calls `enable_sq()`) for IVF, and `hnsw_m` (16), `ef_construction` (200), `ef_search` (64) and `hnsw_sq_bits` (0 for floats; 8 or 4 calls `enable_sq()`) for HNSW.
 
 ## Metrics
 
@@ -231,7 +287,7 @@ index.remove([doc_ids[0], doc_ids[1]])        # returns 2
 - **Every add must pass ids** on a `custom_ids=True` index, and an index created without it refuses them.
 - **`remove(ids)`** works with or without custom ids. Unknown and already deleted ids are skipped, so deleting twice is harmless. A deleted id can be added again, with a new vector.
 - **Deleted vectors keep their memory until `compact()`**: queries skip them, but they still take space and scan time. `compact()` frees them in one pass, keeping every id and every query result the same, so call it after a large batch of deletes. It doesn't retrain anything. (`HNSWIndex` is the exception: it rebuilds its graph, so ids stay the same but results can shift slightly.)
-- **Default ids never repeat.** New vectors continue after the highest id ever assigned, even after deletes and `compact()` (delete ids 0 to 9, compact, add one more, and it gets id 10).
+- **Default ids never repeat.** New vectors continue after the highest id ever assigned, even after deletes and `compact()` (delete ids 0 to 9, compact, add one more, and it gets id 10). `add()` returns the ids it assigned, so keep those rather than counting. For data that changes (updates, deletes, re-adds), prefer `custom_ids=True` with ids from your own data.
 - For `make_index`, set `IndexOptions.custom_ids`.
 
 ## Filtered search
@@ -247,7 +303,7 @@ ids, dists = index.batch_query(queries, 10, allowed=in_stock)
 - **Unknown and deleted ids in `allowed` are ignored.** An empty set returns no results; fewer than `k` allowed vectors gives fewer results (rows padded with `-1` / `inf`).
 - **Filtering happens during the search,** not after it, so a selective filter still returns `k` results instead of the few that happen to be in an unfiltered top `k`.
 - **Works on every index.** `FlatIndex` scores only the allowed vectors. `IVFIndex` skips the others while scanning, and if its `nprobe` lists hold fewer than `k` allowed vectors it keeps probing the next nearest lists until it has `k`. `HNSWIndex` walks its graph through every node but returns only allowed ones; when few are allowed (below about `sqrt(ef_search * M * size)`, ~3% of SIFT1M), walking the graph would cost more than scoring the allowed vectors directly, so it does that instead, which is also exact. A `RefineIndex` passes the filter to its base and re-ranks as usual.
-- **Recall by index:** `FlatIndex` is exact, and `HNSWIndex` holds or gains recall as the filter narrows. `IVFIndex` loses recall as it narrows (on SIFT1M at `nprobe=16`: 0.93 unfiltered, 0.85 with 5% allowed, 0.52 with 0.1%), because the nearest allowed vectors spread over more lists than `nprobe`; raise `nprobe`, or for very selective filters prefer `HNSWIndex` or `FlatIndex`. Full numbers are in [ARCHITECTURE.md](https://github.com/maxtmiller/qann/blob/main/ARCHITECTURE.md#benchmarks-benchmarksbench_indexespy).
+- **Recall by index:** `FlatIndex` is exact. `HNSWIndex` narrows its search width as the filter narrows (`max(k, ef_search * sqrt(s))` for a fraction `s` allowed): a filtered beam finds more of its true neighbors than an unfiltered one, so at the full `ef_search` it overshoots unfiltered recall at several times the cost. With the scaling, filtered recall stays at about the unfiltered level (SIFT1M at `ef_search=64`: 0.96 to 0.975 from 2% to 50% allowed, 0.953 unfiltered; GloVe-100 within 0.01 of unfiltered) and queries are 1.3 to 3.7 times faster (10% allowed: 405 to 143 us). Set `filter_ef_scaling = False` for the old, slower, higher-recall behavior (not saved with the index). Below about 2% allowed (2.5% at `ef_search=128`) HNSW scores the allowed vectors directly, which is exact. `IVFIndex` probes more lists as the filter narrows (about `0.75 * nprobe * s^(-1/3)` for a fraction `s` allowed), which keeps recall near an unfiltered query's: on SIFT1M at `nprobe=16`, 0.92 to 0.96 from 0.2% to 20% allowed (0.93 unfiltered), where stopping at the first 10 allowed vectors gave 0.60 to 0.88. That costs speed: 1.3 to 5.7 times fewer queries per second than without it; set `filter_probe_scaling = False` for the faster, lower-recall behavior (not saved with the index). It helps most on hard data (GloVe-100: filtered recall 0.50-0.75 off, 0.72-0.78 on, 0.81 unfiltered); if filtered recall is already high on your data (fashion-mnist: 0.98 or more either way), turning it off is safe and up to 1.9 times faster. Under very narrow filters IVF scores the allowed vectors directly instead: a plain or SQ `IVFIndex` at up to `3 * nlist` allowed (exact for plain; a 6-byte-per-vector lookup), and a `RefineIndex` over IVF at up to `6 * nlist` (exact, from its raw copies). A PQ `IVFIndex` doesn't, so wrap it in a `RefineIndex` for narrow filters. Full numbers are in [ARCHITECTURE.md](https://github.com/maxtmiller/qann/blob/main/ARCHITECTURE.md#benchmarks-benchmarksbench_indexespy).
 - **Cost** is a pass over `allowed` per call (to look up each id), plus one bit per vector in the index.
 
 ## Metadata
@@ -260,14 +316,24 @@ index.add(vectors, metadata={"category": categories, "price": prices, "year": ye
 f = qann.field
 ids, dists = index.batch_query(queries, 10, where=(f("category") == "shoes") & (f("price") < 50))
 ids, dists = index.batch_query(queries, 10, where=f("year").isin([2024, 2025]) | f("price").is_null())
+
+# or as a SQL WHERE clause, with values passed separately
+ids, dists = index.batch_query(queries, 10, where="category = 'shoes' AND price < 50")
+ids, dists = index.batch_query(queries, 10, where=("user_id = ? AND year IN (?, ?)", [uid, 2024, 2025]))
 ```
 
-- **Columns** are named and hold ints, floats or strings, one value per vector, as NumPy arrays or lists (bool arrays become ints). A column's type is fixed by the first add that has it.
-- **Missing values:** a column added later is null for the vectors already in the index, and an add that leaves a column out stores null for its vectors. Nulls fail every comparison and `isin`, so `~(f("price") < 50)` includes vectors with no price; use `f("price").is_null()` to select or exclude them.
-- **Filters:** `==`, `!=`, `<`, `<=`, `>`, `>=`, `.isin([...])` and `.is_null()`, combined with `&` (and), `|` (or) and `~` (not). Parenthesize comparisons, since `&` binds tighter than `<`: `(f("a") < 1) & (f("b") == 2)`. Python's `and`, `or`, `not` and chained comparisons such as `0 < f("a") < 5` raise `TypeError` instead of silently dropping part of the filter.
+- **Columns** are named and hold ints, floats or strings, one value per vector, as NumPy arrays or lists (bool arrays become ints). A column's type is fixed by the first add that has it, or by `add_metadata_column`. Ints are accepted into a float column (so whole-number prices work; ints beyond 2^53 are rounded to the nearest float), but floats into an int column raise `ValueError`.
+- **Missing values:** `None` in a column's values is a null. A column added later is null for the vectors already in the index, and an add that leaves a column out stores null for its vectors. Nulls fail every comparison and `isin`, so `~(f("price") < 50)` includes vectors with no price; use `f("price").is_null()` to select or exclude them.
+- **Filters:** `==`, `!=`, `<`, `<=`, `>`, `>=`, `.isin([...])`, `.between(lo, hi)` (both ends included) and `.is_null()`, combined with `&` (and), `|` (or) and `~` (not). Parenthesize comparisons, since `&` binds tighter than `<`: `(f("a") < 1) & (f("b") == 2)`. Python's `and`, `or`, `not` and chained comparisons such as `0 < f("a") < 5` raise `TypeError` instead of silently dropping part of the filter. For a long chain built in code, use `qann.any_of(filters)` / `qann.all_of(filters)`: adding terms one `|` at a time copies the chain each step, so it gets slow past a few thousand terms. For one column against many values, `f("price").isin(values)` is better still: it's one condition, so it's scanned once per query instead of once per value.
+- **SQL strings:** `where` also takes a SQL `WHERE` clause: `=`, `!=` / `<>`, `<`, `<=`, `>`, `>=`, `[NOT] IN (...)`, `IS [NOT] NULL`, `[NOT] BETWEEN x AND y`, `AND`, `OR`, `NOT` and parentheses, with SQL's precedence and case-insensitive keywords. Strings are `'...'` (`''` for a quote); quote column names that are keywords or contain non-ASCII characters as `"..."`. Numbers that overflow, such as `1e400`, raise `ValueError`. `LIKE`, functions, arithmetic and comparing two columns aren't supported. A syntax error raises `ValueError` with its column. Filters can nest up to 256 levels of parentheses or `NOT`; long `AND` / `OR` chains don't count toward that. A string may have up to 1024 conditions (comparisons, `IN`, `IS NULL`, `BETWEEN`; an `IN` list counts once, however many values it has), so filter strings from users can't make a query scan its columns thousands of times; `qann.set_max_filter_conditions(n)` changes the limit for the whole process. Filters built with `qann.field` aren't limited.
+- **Parameters:** pass values as `(sql, [values])` for `?` or `(sql, {name: value})` for `:name` instead of pasting them into the string. They are bound after parsing, so user input can't change the filter (`"1 OR 1 = 1"` is just a value). `qann.where(sql, params)` returns the filter, to reuse it or combine it with `qann.field` filters through `&`, `|` and `~`.
+- **`NOT` vs `~`:** SQL's `NOT` excludes nulls, as in SQL: `NOT price < 50` doesn't match vectors with no price, while `~(f("price") < 50)` does.
 - **Types:** ints and floats compare as numbers; strings compare with strings (`<` is alphabetical). Filtering on a column the index doesn't have, or comparing a number column with a string, raises `ValueError`.
 - **Same search as `allowed`:** a `where` filter becomes the set of matching vectors and runs the [filtered search](#filtered-search) for every index, with the same recall behavior. With both `where` and `allowed`, only vectors passing both are returned.
 - **Cost:** each query call scans the columns its filter names once, shared by every row of a `batch_query`: about 0.4 ms per condition per million vectors. Strings are stored once per distinct value, plus 4 bytes per vector; ints and floats take 8 bytes per vector; each column also takes 1 byte per vector for its null flag.
+- **Reading back:** `index.get_metadata(ids)` returns `{name: values}` with one value per id, for every column in the order they were added; `columns=["price", "color"]` picks and orders them. Int and float columns come back as NumPy masked arrays (`int64` / `float64`, masked where the value is null), so ints stay exact and `.filled(x)` or `.compressed()` handle nulls; string columns come back as lists with `None` for null. Unknown, deleted or repeated ids, and columns the index doesn't have, raise `ValueError`. With `update_metadata` this gives read-modify-write: `stock = index.get_metadata(ids, columns=["stock"])["stock"]`, then `index.update_metadata(ids, {"stock": (stock - 1).tolist()})`.
+- **Updating:** `index.update_metadata(ids, {"price": [10, None]})` overwrites the given columns for those vectors in place (no re-insert), with one value per id; other columns keep their values. A column the index doesn't have raises `ValueError`, so a typo can't create one.
+- **New columns for existing vectors:** `index.add_metadata_column("in_stock", "int", default=1)` gives every vector that value; `index.add_metadata_column("tag", "str", ids=tagged, values=tags)` sets those vectors (one value per id, `None` for null) and leaves the rest null, in one step; with neither, every vector is null. `default` can't be combined with `ids` / `values` (`TypeError`). Later adds that leave the column out store null. `drop_metadata_column(name)` removes a column, freeing its name; `compact()` never removes columns, even ones left with no values. Unknown, deleted or repeated ids raise `ValueError`, and a failed call changes nothing. Strings no vector uses any more are freed by `compact()`. Re-adding a removed id doesn't bring back its old metadata: pass it again with the `add`.
 - **Kept with the index:** `remove` and `compact` keep metadata with its vector, and `save` / `qann.load` store it. A `RefineIndex` holds the metadata itself; add through it as usual.
 
 ## Saving and loading
@@ -277,7 +343,7 @@ Any index can be saved to a file and loaded back, including its training, so it 
 ```python
 index.save("vectors.qann")          # str or pathlib.Path
 
-index = qann.load("vectors.qann")   # returns a FlatIndex, IVFIndex, HNSWIndex or RefineIndex
+index = qann.load("vectors.qann")   # returns the saved class, e.g. IVFIndex or InvertedIndex
 ids, dists = index.batch_query(queries, 10)
 ```
 

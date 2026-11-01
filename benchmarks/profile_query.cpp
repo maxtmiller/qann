@@ -54,7 +54,7 @@ static double clock_read_cost() {
     return (t1 - t0) / n;
 }
 
-static void report(const char* label, const Index& index, const std::vector<float>& queries, size_t nq) {
+static void report(const char* label, const DenseIndex& index, const std::vector<float>& queries, size_t nq) {
     static const double read_cost = clock_read_cost();
     for (double& s : detail::g_prof) s = 0;
     detail::g_prof_calls = 0;
@@ -63,7 +63,7 @@ static void report(const char* label, const Index& index, const std::vector<floa
     double total = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 
     const char* names[] = {"coarse search", "ADC table build", "ADC code scan", "raw vector scan", "result drain", "re-rank",
-                           "query setup", "inner table (C)", "per-list setup"};
+                           "query setup", "inner table (C)", "per-list setup", "LUT rounding"};
     double accounted = 0;
     std::printf("\n%s: %.0f us/query (%.0f QPS)\n", label, total / nq * 1e6, nq / total);
     for (int i = 0; i < detail::kProfSlots; ++i) {

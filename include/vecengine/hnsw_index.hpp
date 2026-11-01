@@ -32,7 +32,7 @@ using std::span;
 // training is needed. With enable_sq() they are stored as 8- or 4-bit codes
 // per dimension (see detail::SQ): 4x or 8x less vector memory and faster
 // searches, with approximate distances that a RefineIndex can make exact again.
-class HNSWIndex : public Index {
+class HNSWIndex : public DenseIndex {
 public:
     // dim floats per vector. M is the neighbors a node keeps per upper level
     // (2 * M on level 0); ef_construction the beam width used while inserting.
@@ -42,7 +42,7 @@ public:
     explicit HNSWIndex(size_t dim, size_t M = 16, size_t ef_construction = 200, bool custom_ids = false,
                        std::optional<uint32_t> seed = std::nullopt, Metric metric = Metric::L2);
 
-    // Index overrides; see Index for the contract of each. add_batch inserts
+    // DenseIndex overrides; see DenseIndex for the contract of each. add_batch inserts
     // the vectors on num_threads() threads.
     // add_batch throws std::logic_error with SQ enabled but not trained.
     size_t remove(span<const int64_t> ids) override;
@@ -70,6 +70,15 @@ public:
     size_t ef_search() const noexcept { return ef_search_; }
     void set_ef_search(size_t ef);
 
+    // Whether a filtered query narrows its beam as the filter narrows, to
+    // max(k, ef * sqrt(s)) for a fraction s allowed: a filtered beam of ef
+    // finds more of its true neighbors than an unfiltered one, so this keeps
+    // recall near an unfiltered query's at a fraction of the cost. On by
+    // default; off, filtered queries use the full ef (slower, higher recall).
+    // Not saved: a loaded index has it on.
+    bool filter_ef_scaling() const noexcept { return filter_ef_scaling_; }
+    void set_filter_ef_scaling(bool enabled) noexcept { filter_ef_scaling_ = enabled; }
+
     size_t M() const noexcept { return M_; }
     size_t ef_construction() const noexcept { return ef_construction_; }
 
@@ -93,7 +102,7 @@ public:
     bool trained() const noexcept { return quant_.dim() > 0; }
 
 private:
-    // Index implementations: vectors already prepared for the metric.
+    // DenseIndex implementations: vectors already prepared for the metric.
     void add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) override;
     vector<Neighbor> query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const override;
     const detail::IdMap& id_map() const noexcept override { return id_map_; }
@@ -225,6 +234,7 @@ private:
     size_t M_, M0_;            // neighbors per node on upper levels / level 0
     size_t ef_construction_;
     size_t ef_search_ = 64;
+    bool filter_ef_scaling_ = true;  // set_filter_ef_scaling() setting
     double level_mult_;        // 1 / ln(M)
 
     // Level draws come from splitmix64, whose whole state is this one number,

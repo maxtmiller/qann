@@ -33,7 +33,7 @@ struct InvertedList {
 // query scans only the nprobe clusters nearest to it. Optionally stores PQ
 // codes of each vector's residual, or SQ codes of each vector, instead of the
 // raw floats.
-class IVFIndex : public Index {
+class IVFIndex : public DenseIndex {
 public:
     // nlist must be in [100, 65535] and nprobe in [1, nlist]; throws
     // std::invalid_argument otherwise. custom_ids makes add_batch() take user
@@ -65,6 +65,7 @@ public:
     // Clusters scanned per query. set_nprobe throws std::invalid_argument
     // unless 1 <= nprobe <= nlist; it can change at any time.
     size_t nprobe() const noexcept { return nprobe_; }
+    size_t nlist() const noexcept { return nlist_; }
     void set_nprobe(size_t nprobe);
 
     // How PQ codes are scored: ADC (default, more accurate) or SDC. Has no
@@ -87,7 +88,15 @@ public:
     bool precomputed_tables() const noexcept { return !precomputed_.empty(); }
     void set_precomputed_tables(bool enabled);
 
-    // Index overrides; see Index for the contract of each. Adds throw
+    // Whether a filtered query probes more lists as its filter narrows, about
+    // 0.75 * nprobe * s^(-1/3) for a fraction s allowed, so its recall stays
+    // near an unfiltered query's. On by default; off, it probes nprobe lists
+    // and then only until it has k allowed vectors (faster, lower recall).
+    // Not saved: a loaded index has it on.
+    bool filter_probe_scaling() const noexcept { return filter_probe_scaling_; }
+    void set_filter_probe_scaling(bool enabled) noexcept { filter_probe_scaling_ = enabled; }
+
+    // DenseIndex overrides; see DenseIndex for the contract of each. Adds throw
     // std::logic_error before train(). query_batch picks every query's nprobe
     // lists with one matrix multiply per block of queries (with BLAS), then
     // scans the lists in parallel; results match query() except that a
@@ -117,7 +126,7 @@ public:
     size_t dim() const noexcept override { return dim_; }
 
 private:
-    // Index implementations: vectors already prepared for the metric.
+    // DenseIndex implementations: vectors already prepared for the metric.
     void add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) override;
     vector<Neighbor> query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const override;
     vector<vector<Neighbor>> query_batch_impl(span<const float> queries, size_t num_queries, size_t k,
@@ -171,8 +180,12 @@ private:
 
     // Every list, for a filtered query: the nprobe nearest to vec first,
     // nearest first, then the rest in any order (scan() sorts them if it
-    // needs them).
+    // needs them). With coarse_all_approx(), dist is ranked from one sgemv and
+    // is only approximate; scan() recomputes it exactly for the lists it probes.
     vector<Probe> coarse_all(span<const float> vec) const;
+
+    // Whether coarse_all() ranks with sgemv (Accelerate, dim >= kBlasCoarseMinDim).
+    bool coarse_all_approx() const noexcept;
 
     // Coarse step for n queries (query i at queries + i * dim_): writes each
     // query's nprobe probes to out + i * nprobe_, in any order.
@@ -183,6 +196,17 @@ private:
     // and lists past the first nprobe are scanned, nearest first, only until
     // min(k, filter->count) allowed vectors have been found.
     vector<Neighbor> scan(span<const float> vec, span<Probe> probes, size_t k, const detail::SlotFilter* filter) const;
+
+    // Whether a filtered query scores the allowed vectors directly instead of
+    // probing lists (see direct_scan).
+    bool use_direct(size_t k, const detail::SlotFilter* filter) const;
+
+    // Top k among the filter's slots, found through slot_list_ / slot_pos_.
+    vector<Neighbor> direct_scan(span<const float> vec, size_t k, const detail::SlotFilter& filter) const;
+
+    // Rebuilds slot_list_ and slot_pos_ from the lists (after compact or load);
+    // leaves them empty with PQ.
+    void rebuild_slot_lookup();
 
     static constexpr size_t kPrecomputedMaxBytes = size_t{256} << 20;
     // With Accelerate, a single query's coarse step uses one sgemv from this dimension up;
@@ -202,12 +226,17 @@ private:
     detail::SQ sq_; // SQ ranges, learned by train() when SQ is enabled
     PQDistance pq_distance_ = PQDistance::ADC; // type of quantization used
     bool use_precomputed_ = true; // set_precomputed_tables() setting
+    bool filter_probe_scaling_ = true; // set_filter_probe_scaling() setting
     vector<float> precomputed_; // term B: nlist * m * K floats, list-major; empty when not in use
     detail::IdMap id_map_;
     bool fast_scan_ = false;
     bool rotate_ = false; // enable_pq(..., rotate) setting
     vector<float> rotation_; // dim_ x dim_, row-major (see src/rotation.hpp); empty until trained
     vector<float> rotation_panels_; // rotation_ in the layout detail::rotate reads
+    // list holding each slot and its position there, for direct_scan; plain and
+    // SQ only (empty with PQ), not saved but rebuilt on load and compact
+    vector<uint16_t> slot_list_;
+    vector<uint32_t> slot_pos_;
 };
 
 } // namespace vecengine

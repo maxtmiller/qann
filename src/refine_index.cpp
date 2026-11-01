@@ -5,6 +5,7 @@
 #include "vecengine/hnsw_index.hpp"
 #include "parallel.hpp"
 #include "profile.hpp"
+#include "topk.hpp"
 #include "serialize.hpp"
 
 #include <cstddef>
@@ -22,7 +23,7 @@ using std::vector;
 using std::span;
 using std::pair;
 
-RefineIndex::RefineIndex(Index& base, size_t k_factor, bool custom_ids) : Index(base.metric()), base_(base), k_factor_(k_factor), id_map_(custom_ids) {
+RefineIndex::RefineIndex(DenseIndex& base, size_t k_factor, bool custom_ids) : DenseIndex(base.metric()), base_(base), k_factor_(k_factor), id_map_(custom_ids) {
     if (base.slots() != 0) throw std::invalid_argument("base index must be empty");
     if (k_factor == 0) throw std::invalid_argument("k_factor must be >= 1");
     if (!base.ids_are_slots()) throw std::invalid_argument("base index must not use custom ids or have been compacted");
@@ -50,9 +51,35 @@ size_t RefineIndex::candidates(size_t k, const detail::SlotFilter* filter) const
     return std::min(k * k_factor_, filter ? filter->count : id_map_.live());
 }
 
+bool RefineIndex::use_direct(const detail::SlotFilter* filter) const {
+    // Scoring every allowed vector from the raw copies here is exact, and while
+    // few are allowed it is faster than the IVF base's filtered probing: on
+    // SIFT1M fast-scan + re-rank 4 (nlist 1000, nprobe 16) it ran at 110k QPS
+    // against 36k at 2,000 allowed, 49k against 37k at 5,000 and 23k against
+    // 36k at 10,000, a crossover near 6,400, so this switches at 6 * nlist.
+    // HNSW bases make the same switch themselves.
+    if (!filter) return false;
+    const auto* ivf = dynamic_cast<const IVFIndex*>(&base_);
+    return ivf && filter->count <= 6 * ivf->nlist();
+}
+
+vector<Neighbor> RefineIndex::direct_scan(span<const float> vec, size_t k, const detail::SlotFilter& filter) const {
+    VECENGINE_PROF_START(t_rerank);
+    detail::TopK top(k);
+    const size_t d = dim();
+    filter.for_each([&](uint32_t slot) {
+        const float dist = exact_score(vec.data(), data_.data() + size_t{slot} * d, d);
+        if (dist < top.threshold()) top.push(dist, id_map_.label(slot));
+    });
+    vector<Neighbor> results = top.take_sorted();
+    VECENGINE_PROF_STOP(t_rerank, kProfRerank);
+    return results;
+}
+
 vector<Neighbor> RefineIndex::query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const {
     assert(vec.size() == dim());
-    if (id_map_.live() == 0) return {};
+    if (id_map_.live() == 0 || k == 0) return {};
+    if (use_direct(filter)) return direct_scan(vec, k, *filter);
 
     return rerank(vec, base_.query_impl(vec, candidates(k, filter), filter), k);
 }
@@ -60,7 +87,14 @@ vector<Neighbor> RefineIndex::query_impl(span<const float> vec, size_t k, const 
 vector<vector<Neighbor>> RefineIndex::query_batch_impl(span<const float> queries, size_t num_queries, size_t k,
                                                        const detail::SlotFilter* filter) const {
     assert(queries.size() == num_queries * dim());
-    if (id_map_.live() == 0) return vector<vector<Neighbor>>(num_queries);
+    if (id_map_.live() == 0 || k == 0) return vector<vector<Neighbor>>(num_queries);
+    if (use_direct(filter)) {
+        vector<vector<Neighbor>> results(num_queries);
+        detail::parallel_for(num_queries, [&](size_t i) {
+            results[i] = direct_scan({queries.data() + i * dim(), dim()}, k, *filter);
+        });
+        return results;
+    }
 
     auto fetched = base_.query_batch_impl(queries, num_queries, candidates(k, filter), filter);
     vector<vector<Neighbor>> results(num_queries);
@@ -110,7 +144,10 @@ size_t RefineIndex::remove(span<const int64_t> ids) {
 
 size_t RefineIndex::compact() {
     auto remap = id_map_.compact(true);
-    if (remap.empty()) return 0;
+    if (remap.empty()) {
+        metadata_.drop_unused_strings();
+        return 0;
+    }
 
     base_.compact_as_base();
     metadata_.compact(remap);
@@ -156,7 +193,7 @@ std::unique_ptr<RefineIndex> RefineIndex::load_body(std::istream& in, uint32_t v
     const auto count = read_pod<uint64_t>(in);
     if (k_factor == 0) throw std::runtime_error("corrupt file: invalid RefineIndex shape");
 
-    std::unique_ptr<Index> base;
+    std::unique_ptr<DenseIndex> base;
 
     const Header header = read_header(in);
     if (header.version != version)
