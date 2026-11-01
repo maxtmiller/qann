@@ -140,7 +140,7 @@ TEST_CASE("quantize_lut handles rows of negative values", "[fastscan]") {
     REQUIRE(lut[0] == 0);
     REQUIRE(lut[15] == kLutMax);
     REQUIRE(lut[16 + 15] == 0);                // row 1's minimum is its last entry
-    REQUIRE(lut[16] == std::lround(30.0f * scale));
+    REQUIRE(lut[16] == std::nearbyint(30.0f * scale));
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +369,7 @@ TEST_CASE("quantize_lut matches the scalar version exactly", "[fastscan]") {
     REQUIRE(oa == ob);
 }
 
-TEST_CASE("quantize_lut rounds halves away from zero like the scalar version", "[fastscan]") {
+TEST_CASE("quantize_lut rounds halves to even like the scalar version", "[fastscan]") {
     // Row 0 spans 0..kLutMax, so scale is exactly 1 and every entry is its own
     // rounding input: exact halves, and the floats either side of 0.5.
     const size_t m = 2;
@@ -385,7 +385,7 @@ TEST_CASE("quantize_lut rounds halves away from zero like the scalar version", "
     quantize_lut_scalar(table.data(), m, b.data(), sb, ob);
     REQUIRE(sa == 1.0f);
     REQUIRE(a == b);
-    REQUIRE(std::vector<uint8_t>(a.begin() + 17, a.begin() + 26) == std::vector<uint8_t>{1, 2, 3, 63, 0, 1, 1, 0, 3});
+    REQUIRE(std::vector<uint8_t>(a.begin() + 17, a.begin() + 26) == std::vector<uint8_t>{0, 2, 2, 62, 0, 1, 1, 0, 3});
 }
 
 TEST_CASE("fast_scan_block_mask flags exactly the sums below the limit", "[fastscan]") {
