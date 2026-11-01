@@ -30,7 +30,9 @@ float:
       base:
         # rotation costs a dim x dim product per query and only helps when dimensions
         # are correlated across subspaces, so each dataset gets both
-        args: [[1024, 2048, 4096], [2, 4], [true, false]]
+        # 256 and 512 for small datasets: on fashion-mnist (60k) lists at 1024+ hold under 60
+        # vectors and fast-scan's per-list cost dominates (issue #62)
+        args: [[256, 512, 1024, 2048, 4096], [2, 4], [true, false]]
         # k_factor up to 64: with 4-bit codes on hard data (gist) the true top 10
         # only make the re-ranked candidates at 32 or 64 (issue #64)
         query_args: [[1, 2, 4, 8, 16, 32, 64, 128, 256], [4, 8, 16, 32, 64]]

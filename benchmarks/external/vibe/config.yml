@@ -37,7 +37,9 @@ float:
       run_groups:
         base:
           args:
-            nlist: [1024, 2048, 4096]
+            # 256 and 512 for small datasets: on fashion-mnist (60k) lists at 1024+ hold under 60
+            # vectors and fast-scan's per-list cost dominates (issue #62)
+            nlist: [256, 512, 1024, 2048, 4096]
             dims_per_subspace: [2, 4]
             # rotation costs a dim x dim product per query and only helps when dimensions
             # are correlated across subspaces, so each dataset gets both
