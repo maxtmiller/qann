@@ -59,6 +59,7 @@ public:
 
     size_t size() const noexcept override { return id_map_.live(); }
     size_t dim() const noexcept override { return base_.dim(); }
+    bool stores_vectors() const noexcept override { return true; }
 
     size_t slots() const noexcept override { return id_map_.slots(); }
     bool custom_ids() const noexcept override { return id_map_.custom_ids(); }
@@ -78,6 +79,7 @@ private:
     // passed to the base's *_impl so they are prepared only once.
     void add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) override;
     vector<Neighbor> query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const override;
+    const float* stored_vector(uint32_t slot) const override { return data_.data() + size_t{slot} * dim(); }
     vector<vector<Neighbor>> query_batch_impl(span<const float> queries, size_t num_queries, size_t k,
                                               const detail::SlotFilter* filter) const override;
     const detail::IdMap& id_map() const noexcept override { return id_map_; }

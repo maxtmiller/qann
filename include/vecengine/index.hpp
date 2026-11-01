@@ -66,6 +66,9 @@ public:
     // that is named twice.
     Metadata get_metadata(span<const int64_t> ids, const vector<std::string>* columns = nullptr) const;
 
+    // Every live vector's id, in ascending order.
+    vector<int64_t> ids() const;
+
     // Adds a metadata column with value for every vector, or null for every
     // vector without one; fill it further with update_metadata() or later
     // adds. Throws std::invalid_argument if the name is empty or taken, or the
@@ -204,6 +207,16 @@ public:
     // Floats per vector.
     virtual size_t dim() const noexcept = 0;
 
+    // Whether the index keeps its vectors as floats, so get_vectors() can read
+    // them back (not when it holds only PQ or SQ codes).
+    virtual bool stores_vectors() const noexcept { return false; }
+
+    // A copy of the stored vectors with these ids, dim() floats each, in the
+    // order given: the vectors as added, except that Metric::Cosine stores
+    // them scaled to unit length. Throws std::invalid_argument on an unknown,
+    // deleted or repeated id, or when stores_vectors() is false.
+    vector<float> get_vectors(span<const int64_t> ids) const;
+
 protected:
     explicit DenseIndex(Metric metric = Metric::L2) : metric_(metric) {}
 
@@ -242,6 +255,9 @@ private:
     // without one, every live slot may.
     virtual void add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) = 0;
     virtual vector<Neighbor> query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const = 0;
+
+    // The dim() stored floats of a live slot. Called only when stores_vectors().
+    virtual const float* stored_vector(uint32_t) const { return nullptr; }
 
     // compact() for the base of a RefineIndex: same storage compaction, but
     // ids become the new slots so they keep matching the RefineIndex's slots.

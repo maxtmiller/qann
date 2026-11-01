@@ -215,11 +215,14 @@ TEST_CASE("IdMap: load rejects corrupt data", "[idmap][serialize]") {
 // ---------------------------------------------------------------------------
 
 #include "vecengine/flat_index.hpp"
+#include "vecengine/hnsw_index.hpp"
 
+#include <algorithm>
 #include <random>
 #include <span>
 
 using vecengine::FlatIndex;
+using vecengine::HNSWIndex;
 
 static std::vector<float> random_matrix(size_t n, size_t dim, unsigned seed) {
     std::mt19937 rng(seed);
@@ -1021,4 +1024,88 @@ TEST_CASE("compact after deleting everything", "[compact]") {
     emptied.compact();
     REQUIRE(emptied.slots() == 0);
     REQUIRE_THROWS_AS(RefineIndex(emptied), std::invalid_argument);
+}
+
+// Removes two vectors, then checks ids() and get_vectors() against data, before
+// and after compaction.
+static void check_read_back(DenseIndex& index, const std::vector<int64_t>& ids, const std::vector<float>& data,
+                            size_t dim) {
+    REQUIRE(index.stores_vectors());
+    const size_t n = ids.size();
+    REQUIRE(index.remove(std::vector<int64_t>{ids[0], ids[5]}) == 2);
+
+    std::vector<int64_t> live(ids.begin() + 1, ids.end());
+    live.erase(live.begin() + 4);
+    std::sort(live.begin(), live.end());
+    REQUIRE(index.ids() == live);
+
+    const std::vector<int64_t> ask{ids[9], ids[1], ids[n - 1]};
+    const std::vector<size_t> rows{9, 1, n - 1};
+    for (int pass = 0; pass < 2; ++pass) {
+        INFO("after compact: " << pass);
+        const auto got = index.get_vectors(ask);
+        REQUIRE(got.size() == ask.size() * dim);
+        for (size_t i = 0; i < ask.size(); ++i)
+            for (size_t d = 0; d < dim; ++d) REQUIRE(got[i * dim + d] == data[rows[i] * dim + d]);
+        REQUIRE_THROWS_AS(index.get_vectors(std::vector<int64_t>{ids[0]}), std::invalid_argument);         // deleted
+        REQUIRE_THROWS_AS(index.get_vectors(std::vector<int64_t>{ids[1], ids[1]}), std::invalid_argument); // repeated
+        REQUIRE_THROWS_AS(index.get_vectors(std::vector<int64_t>{999'999}), std::invalid_argument);       // unknown
+        index.compact();
+    }
+    REQUIRE(index.ids() == live);
+    REQUIRE(index.get_vectors(std::vector<int64_t>{}).empty());
+}
+
+TEST_CASE("ids() and get_vectors() read every stored vector back", "[ids]") {
+    const size_t n = 300, dim = 8;
+    auto data = random_matrix(n, dim, 81);
+    const bool custom = GENERATE(false, true);
+    std::vector<int64_t> ids(n);
+    // custom ids descend, so ids() has to sort them
+    for (size_t i = 0; i < n; ++i) ids[i] = custom ? 50'000 - 7 * static_cast<int64_t>(i) : static_cast<int64_t>(i);
+    const int64_t* add_ids = custom ? ids.data() : nullptr;
+    INFO("custom ids: " << custom);
+
+    SECTION("Flat") {
+        FlatIndex index(dim, 16, custom);
+        index.add_batch(data, n, add_ids);
+        check_read_back(index, ids, data, dim);
+    }
+    SECTION("IVF with float lists") {
+        auto index = make_ivf(IvfMode::Plain, dim, data, n, custom);
+        index->add_batch(data, n, add_ids);
+        check_read_back(*index, ids, data, dim);
+    }
+    SECTION("HNSW") {
+        HNSWIndex index(dim, 8, 40, custom);
+        index.add_batch(data, n, add_ids);
+        check_read_back(index, ids, data, dim);
+    }
+    SECTION("Refine over IVF-PQ") {
+        auto base = make_ivf(IvfMode::ADC, dim, data, n, false);
+        RefineIndex refine(*base, 4, custom);
+        refine.add_batch(data, n, add_ids);
+        REQUIRE_FALSE(base->stores_vectors());
+        check_read_back(refine, ids, data, dim);
+    }
+}
+
+TEST_CASE("get_vectors() refuses indexes that keep only codes", "[ids]") {
+    const size_t n = 300, dim = 8;
+    auto data = random_matrix(n, dim, 82);
+    SECTION("IVF-PQ") {
+        auto index = make_ivf(IvfMode::ADC, dim, data, n, false);
+        index->add_batch(data, n);
+        REQUIRE_FALSE(index->stores_vectors());
+        REQUIRE_THROWS_AS(index->get_vectors(std::vector<int64_t>{0}), std::invalid_argument);
+        REQUIRE(index->ids().size() == n);
+    }
+    SECTION("HNSW with SQ") {
+        HNSWIndex index(dim, 8, 40);
+        index.enable_sq(8);
+        index.train(data, n);
+        index.add_batch(data, n);
+        REQUIRE_FALSE(index.stores_vectors());
+        REQUIRE_THROWS_AS(index.get_vectors(std::vector<int64_t>{}), std::invalid_argument);
+    }
 }
