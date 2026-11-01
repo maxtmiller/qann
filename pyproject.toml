@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "qann"
-version = "0.1.0a23"
+version = "0.1.0a24"
 description = "Fast nearest-neighbor vector search for Python: exact, IVF, HNSW and quantized indexes for dense vectors, inverted indexes for sparse vectors, with metadata filters, implemented in C++"
 readme = "README.md"
 license = { file = "LICENSE" }
