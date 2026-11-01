@@ -1,6 +1,7 @@
 # Build output
 build/
 build-prof/
+build-x86/
 cmake-build-*/
 
 # CMake generated
