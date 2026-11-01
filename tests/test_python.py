@@ -306,7 +306,7 @@ def test_custom_ids_and_remove(data, kind):
 
 
 @pytest.mark.parametrize("kind", ["flat", "ivf", "refine", "hnsw"])
-def test_ids_and_get_vectors(data, kind):
+def test_ids_and_get_vectors(tmp_path, data, kind):
     ids = np.arange(len(data))[::-1] * 10 + 7   # descending, so ids() must sort
     index = make_custom_index(kind, data, ids)
     index.remove(ids[:3])
@@ -324,6 +324,11 @@ def test_ids_and_get_vectors(data, kind):
     for bad in ([ids[0]], [ids[4], ids[4]], [-5]):   # deleted, repeated, unknown
         with pytest.raises(ValueError):
             index.get_vectors(bad)
+
+    index.save(tmp_path / "i.qann")
+    loaded = qann.load(tmp_path / "i.qann")
+    np.testing.assert_array_equal(loaded.ids(), index.ids())
+    np.testing.assert_array_equal(loaded.get_vectors(index.ids()), index.get_vectors(index.ids()))
 
     # Rebuild into another index type, with the same ids and vectors.
     live = index.ids()

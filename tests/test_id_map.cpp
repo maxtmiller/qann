@@ -223,6 +223,7 @@ TEST_CASE("IdMap: load rejects corrupt data", "[idmap][serialize]") {
 
 using vecengine::FlatIndex;
 using vecengine::HNSWIndex;
+using vecengine::Metric;
 
 static std::vector<float> random_matrix(size_t n, size_t dim, unsigned seed) {
     std::mt19937 rng(seed);
@@ -1054,6 +1055,12 @@ static void check_read_back(DenseIndex& index, const std::vector<int64_t>& ids, 
     }
     REQUIRE(index.ids() == live);
     REQUIRE(index.get_vectors(std::vector<int64_t>{}).empty());
+
+    // A loaded copy (IVF rebuilds its slot lookup on load) reads the same.
+    const auto loaded = roundtrip(index);
+    REQUIRE(loaded->stores_vectors());
+    REQUIRE(loaded->ids() == live);
+    REQUIRE(loaded->get_vectors(live) == index.get_vectors(live));
 }
 
 TEST_CASE("ids() and get_vectors() read every stored vector back", "[ids]") {
@@ -1088,6 +1095,33 @@ TEST_CASE("ids() and get_vectors() read every stored vector back", "[ids]") {
         REQUIRE_FALSE(base->stores_vectors());
         check_read_back(refine, ids, data, dim);
     }
+    SECTION("Refine over HNSW-SQ") {
+        HNSWIndex base(dim, 8, 40);
+        base.enable_sq(4);
+        base.train(data, n);
+        RefineIndex refine(base, 4, custom);
+        refine.add_batch(data, n, add_ids);
+        check_read_back(refine, ids, data, dim);
+    }
+}
+
+TEST_CASE("get_vectors() returns inner product vectors unchanged", "[ids][metric]") {
+    const size_t n = 300, dim = 8;
+    auto data = random_matrix(n, dim, 83);
+    for (size_t i = 0; i < n * dim; ++i) data[i] *= static_cast<float>(1 + i % 5);   // varied lengths
+    std::vector<int64_t> ids(n);
+    for (size_t i = 0; i < n; ++i) ids[i] = static_cast<int64_t>(i);
+
+    std::unique_ptr<DenseIndex> index;
+    SECTION("Flat") { index = std::make_unique<FlatIndex>(dim, 16, false, Metric::InnerProduct); }
+    SECTION("HNSW") { index = std::make_unique<HNSWIndex>(dim, 8, 40, false, std::nullopt, Metric::InnerProduct); }
+    SECTION("IVF") {
+        auto ivf = std::make_unique<IVFIndex>(dim, 100, 10, false, Metric::InnerProduct);
+        ivf->train(data, n, 5, 1);
+        index = std::move(ivf);
+    }
+    index->add_batch(data, n);
+    REQUIRE(index->get_vectors(ids) == data);
 }
 
 TEST_CASE("get_vectors() refuses indexes that keep only codes", "[ids]") {
@@ -1099,6 +1133,14 @@ TEST_CASE("get_vectors() refuses indexes that keep only codes", "[ids]") {
         REQUIRE_FALSE(index->stores_vectors());
         REQUIRE_THROWS_AS(index->get_vectors(std::vector<int64_t>{0}), std::invalid_argument);
         REQUIRE(index->ids().size() == n);
+    }
+    SECTION("IVF-SQ") {
+        IVFIndex index(dim, 100, 10);
+        index.enable_sq(8);
+        index.train(data, n, 5, 1);
+        index.add_batch(data, n);
+        REQUIRE_FALSE(index.stores_vectors());
+        REQUIRE_THROWS_AS(index.get_vectors(std::vector<int64_t>{0}), std::invalid_argument);
     }
     SECTION("HNSW with SQ") {
         HNSWIndex index(dim, 8, 40);
