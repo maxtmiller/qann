@@ -1,6 +1,6 @@
 # QaNN
 
-QaNN (**Q**uantized **N**earest **N**eighbors) is a Python library for fast nearest-neighbor search over float32 vectors. It offers exact search, inverted-file (IVF) search, product quantization (PQ) compression and exact re-ranking, all implemented in multithreaded, SIMD-accelerated C++ and driven from NumPy.
+QaNN (**Q**uantized **N**earest **N**eighbors) is a Python library for fast nearest-neighbor search over dense float32 vectors and sparse vectors. For dense vectors it offers exact search, inverted-file (IVF) and HNSW graph search, product and scalar quantization and exact re-ranking; for sparse vectors (BM25, SPLADE), exact and approximate inverted-index search. Every index supports custom ids, deletion, metadata filters and saving. All of it is implemented in multithreaded, SIMD-accelerated C++ and driven from NumPy and SciPy.
 
 > **Alpha:** under active development. The API may change between releases.
 
