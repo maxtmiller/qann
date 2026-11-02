@@ -1140,8 +1140,9 @@ NB_MODULE(qann, m) {
                          const vecengine::FusionMethod m = method_from(name);
                          write_locked(self, [&] { self.set_method(m); });
                      },
-                     "How the two rankings are fused: 'rrf' (default; ranks only, no tuning) or 'linear' (min-max "
-                     "normalized distances, weighted sum; best with weights tuned on labeled queries). Saved")
+                     "How the two rankings are fused: 'linear' (default; min-max normalized distances, weighted sum, "
+                     "best with weights tuned on labeled queries) or 'rrf' (ranks only; safest when both sides are "
+                     "about equally good). Saved")
         .def_prop_rw("weights",
                      [](const vecengine::HybridIndex& self) {
                          const auto w = read_locked(self, [&] { return self.weights(); });

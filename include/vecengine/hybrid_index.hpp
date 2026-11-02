@@ -88,7 +88,8 @@ public:
     const SparseIndex& sparse() const noexcept { return sparse_; }
 
     // Fusion settings, used by every query until changed, and saved with the
-    // index. weights() is {dense, sparse}: each finite and >= 0, not both 0
+    // index. method() defaults to Linear: on BEIR SciFact and FiQA it beat RRF
+    // in every case measured (benchmarks/hybrid_beir.py). weights() is {dense, sparse}: each finite and >= 0, not both 0
     // (default {1, 1}). rrf_k() is RRF's constant, finite and > 0 (default 60).
     // depth_factor() >= 1 (default 5): each side fetches k * depth_factor
     // results; with Linear it also sets which hits normalize to 0. The setters
@@ -117,7 +118,7 @@ private:
     std::unique_ptr<SparseIndex> owned_sparse_;
     DenseIndex& dense_;
     SparseIndex& sparse_;
-    FusionMethod method_ = FusionMethod::RRF;
+    FusionMethod method_ = FusionMethod::Linear;
     std::array<float, 2> weights_{1.0f, 1.0f};
     float rrf_k_ = 60.0f;
     size_t depth_factor_ = 5;

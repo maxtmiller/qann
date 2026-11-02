@@ -257,6 +257,7 @@ TEST_CASE("HybridIndex construction and settings", "[hybrid]") {
         REQUIRE_THROWS_AS(h.set_weights(1.0f, std::numeric_limits<float>::infinity()), std::invalid_argument);
         REQUIRE_THROWS_AS(h.set_rrf_k(0.0f), std::invalid_argument);
         REQUIRE_THROWS_AS(h.set_depth_factor(0), std::invalid_argument);
+        REQUIRE(h.method() == FusionMethod::Linear);
         REQUIRE(h.weights() == std::array<float, 2>{1.0f, 1.0f});
         REQUIRE(h.depth_factor() == 5);
         // an empty index answers every query with nothing

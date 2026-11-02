@@ -420,7 +420,7 @@ An `IndexBase` that owns a dense and a sparse representation of every document, 
 
 - **Adds are all or nothing.** `add_batch` checks the sparse rows (`SparseIndex::check_rows`), that both sides have the same number of rows, the ids and the metadata, and for `Metric::Cosine` normalizes the dense rows (which throws on a zero row), all before changing anything. Then the dense part's `add_batch_impl` (which can still refuse, e.g. an untrained `IVFIndex`, but before it changes anything), the sparse part's `add_batch_impl`, the id map and the metadata.
 - **Queries** search both parts with the same `SlotFilter` (their slots are the `HybridIndex`'s), each for `k * depth_factor` results capped at the vectors that may be returned, through the dense part's `query_prepared` (so Cosine queries are normalized once) and the sparse part's `search`. Each query row's two lists are fused with `fuse()` on slots, and the winners mapped to user ids.
-- **Settings** (`method`, `weights` `{dense, sparse}`, `rrf_k`, `depth_factor`) are setters, saved with the index. With `Linear` the depth also matters to scores: each side's farthest returned hit normalizes to 0.
+- **Settings** (`method`, `weights` `{dense, sparse}`, `rrf_k`, `depth_factor`) are setters, saved with the index. `method` defaults to `Linear` with weights `{1, 1}`: on BEIR it beat RRF on nDCG@10 in all four dataset and model pairs measured (see [Usage Details](#hybrid-search)). With `Linear` the depth also matters to scores: each side's farthest returned hit normalizes to 0.
 - **`remove`** deletes the same slots in both parts; **`compact`** runs its id map's `compact(true)` and both parts' `compact_as_base()`, which compute the same remap from the same deleted set.
 - **File:** kind `Hybrid` = 7 (no version bump). Body: method (`uint8`), the two weights and `rrf_k` (`float32`), `depth_factor` and the slot count (`uint64`), then the dense part's and the sparse part's own headers and bodies, the id map and the metadata. On load the settings are validated, the dense part must be Flat, IVF, HNSW or Refine and the sparse part Inverted or SparseApprox (so files can't nest hybrids), both must be at the same format version, have ids equal to their slots and exactly the saved slot count.
 
@@ -515,6 +515,23 @@ The README keeps to what each feature does and how to call it. This section hold
 | 20 / 10,000 / 50 | 0.994 | 653 (5.5x) |
 
   On a 4-CPU x86 VM the defaults gave 0.955 recall at 10.6x exact search on one thread (614 vs 58 queries per second) and 8.0x on all threads (#59). `benchmarks/sparse_bigann.py --approx` measures it.
+
+### Hybrid search
+
+`benchmarks/hybrid_beir.py` ranks BEIR test queries with BM25 alone, dense alone (exact cosine) and a `HybridIndex`, against the human relevance labels. nDCG@10:
+
+| | SciFact, MiniLM | SciFact, bge-small | FiQA, MiniLM | FiQA, bge-small |
+| --- | --- | --- | --- | --- |
+| BM25 alone | 0.664 | 0.664 | 0.238 | 0.238 |
+| dense alone | 0.645 | 0.720 | 0.369 | 0.385 |
+| `HybridIndex`, `"rrf"` | 0.685 | 0.715 | 0.352 | 0.350 |
+| `HybridIndex`, `"linear"` (1, 1), the default | 0.710 | 0.732 | 0.375 | 0.374 |
+| `"linear"`, best of a weight sweep | 0.710 (0.5, 1) | 0.740 (1, 0.5) | 0.402 (1, 0.5) | 0.402 (1, 0.5) |
+
+- **Setup:** SciFact (5,183 abstracts, 300 queries) and FiQA (57,638 forum answers, 648 queries); models `all-MiniLM-L6-v2` and `bge-small-en-v1.5` (fastembed's quantized ONNX build); default `depth_factor` 5. BM25 and dense match published BEIR figures.
+- **Hybrid helps when fused well.** Equal-weight linear fusion beat the better single retriever in 3 of 4 cases, and tuned weights by up to +0.05 nDCG@10. Recall@100 on SciFact rose from 0.886 (BM25) and 0.925 (MiniLM) to about 0.965.
+- **RRF trusts a weak retriever's ranks as much as a strong one's.** Where BM25 is much weaker (FiQA), RRF fell below dense alone, by up to 0.035. It is safest when both sides are about equally good.
+- **The sweep is tuned on the test queries,** so its row is optimistic, and its best weights differ by dataset. A stronger dense model leaves less for BM25 to add.
 
 ### Inner product
 

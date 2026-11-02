@@ -156,7 +156,7 @@ def test_bad_input_adds_nothing(docs):
 
 def test_settings_and_query_errors(docs):
     h = make(docs)
-    assert (h.method, h.weights, h.rrf_k, h.depth_factor) == ("rrf", (1.0, 1.0), 60.0, 5)
+    assert (h.method, h.weights, h.rrf_k, h.depth_factor) == ("linear", (1.0, 1.0), 60.0, 5)
     for setting, value in (("method", "borda"), ("weights", (0, 0)), ("weights", (-1, 1)), ("rrf_k", 0), ("depth_factor", 0)):
         with pytest.raises(ValueError):
             setattr(h, setting, value)

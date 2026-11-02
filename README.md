@@ -346,11 +346,28 @@ ids, scores = hybrid.batch_query(q_embeddings, q_bm25, 10, where="lang = 'en'") 
 - **One index, one set of ids.** The `HybridIndex` keeps the ids and metadata, and both parts stay aligned because only it changes them. `add` checks both representations first, so a bad row adds nothing anywhere. `remove`, `compact`, `save` and `qann.load` cover both parts.
 - **Parts:** any empty dense index (trained, if it needs it; a `RefineIndex` works too) and any empty sparse index, neither with custom ids. Tune them through `hybrid.dense` and `hybrid.sparse` (e.g. `hybrid.dense.ef_search = 128`). Adding to them directly raises `ValueError`.
 - **Fusion settings,** saved with the index:
-  - `method`: `"rrf"` (default) or `"linear"`, as in `qann.fuse` below.
+  - `method`: `"linear"` (default) or `"rrf"`, as in `qann.fuse` below.
   - `weights`: `(dense, sparse)`, default `(1, 1)`.
   - `rrf_k`: default 60.
   - `depth_factor`: each side fetches `k * depth_factor` results before fusing, default 5.
 - **Results** are `(ids, scores)`: fusion scores, higher is better, padded with `-1` / `0`. `query` takes one `(dim,)` vector and a one-row sparse matrix.
+- **Measured on BEIR,** the default (linear, equal weights) beat RRF on every dataset and model tried, and beat the better single retriever in most; tuned weights added up to +0.05 nDCG@10. [Results](https://github.com/maxtmiller/qann/blob/main/ARCHITECTURE.md#hybrid-search).
+
+**Tuning the weights.** The best `(dense, sparse)` weights depend on your data and models: when one side is much weaker, give it less weight. With a few dozen queries whose relevant documents you know, try a few settings and keep the best:
+
+```python
+def hit_rate(hybrid, q_dense, q_sparse, relevant, k=10):    # relevant: one set of doc ids per query
+    ids, _ = hybrid.batch_query(q_dense, q_sparse, k)
+    return np.mean([len(set(row) & rel) > 0 for row, rel in zip(ids, relevant)])
+
+scores = {}
+for w in [(1, 0.25), (1, 0.5), (1, 1), (0.5, 1)]:
+    hybrid.weights = w
+    scores[w] = hit_rate(hybrid, q_dense, q_sparse, relevant)
+hybrid.weights = max(scores, key=scores.get)               # saved with the index
+```
+
+Any ranking metric works (hit rate, recall, nDCG); hold back some labeled queries to check the choice. `benchmarks/hybrid_beir.py` does this on BEIR.
 
 **Fusing results yourself:** `qann.fuse(results, *, method="rrf", k=60, weights=None, limit=10)` merges any ranked lists, for example several dense models or results from another search engine:
 
