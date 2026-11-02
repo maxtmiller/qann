@@ -36,6 +36,7 @@ qann/
 │   ├── sparse_index.hpp            # SparseIndex: base of the sparse indexes, SparseRows input
 │   ├── inverted_index.hpp          # InvertedIndex: exact search over sparse vectors
 │   ├── sparse_approx_index.hpp     # SparseApproxIndex: approximate search over sparse vectors
+│   ├── fusion.hpp                  # fuse: reciprocal rank or linear fusion of ranked results (hybrid search)
 │   └── index_factory.hpp           # make_index() + IndexOptions, save_index() / load_index()
 ├── src/
 │   ├── distance.cpp                # scalar / AVX2 / NEON kernels
@@ -56,6 +57,7 @@ qann/
 │   ├── sparse_index.cpp            # SparseIndex::add_batch / query_batch, canonical rows
 │   ├── inverted_index.cpp
 │   ├── sparse_approx_index.cpp
+│   ├── fusion.cpp
 │   └── index_factory.cpp
 ├── tests/
 │   ├── test_distance.cpp           # Catch2 v3 tests for every layer
@@ -71,6 +73,7 @@ qann/
 │   ├── test_inner_product.cpp      # inner product: kernels, exact ranking on every index type, HNSW vs explicit L2 transform, PQ, save/load
 │   ├── test_python.py              # pytest smoke, save/load, ids and threading tests
 │   ├── test_sparse.cpp / .py       # InvertedIndex and SparseApproxIndex against brute-force dot products, input forms, ids, filters, compaction, save/load, corrupt files
+│   ├── test_fusion.cpp / .py       # RRF and linear scores, weights, ties, padding, batches; qann.fuse input forms and a dense + sparse hybrid
 │   ├── load_dense.hpp              # test helpers: load_index() / make_index() checked to give a DenseIndex
 │   └── data/                       # index files saved by 0.1.0a4 (v1), 0.1.0a6 (v2), 0.1.0a7 (v3), 0.1.0a10 (v4), 0.1.0a11 (v5), macOS-made SQ8 / SQ4 files (v6), IVF SQ (v7), rotated IVF (v8), inner product, metadata and sparse files (v9) + their results
 ├── benchmarks/
@@ -396,6 +399,17 @@ Approximate search for learned sparse vectors (issue #59), whose ~49-term querie
 - **Storage:** like `InvertedIndex`, a `List` per term with the extremes of its weights, but in weight order: `postings[0, sorted)` heaviest first (ties by slot), then the entries added since in slot order. `settle()` runs at the end of an add for each list it touched: once more than 64 entries, and more than an eighth of the sorted ones (at most 4,096), are new, they are sorted and `inplace_merge`d in, O(list) per merge. Plus a forward index (each slot's terms, increasing, and weights, CSR by slot), appended on add and rebuilt from the lists on compaction and load, not saved: about twice `InvertedIndex`'s memory.
 - **Query (`query_impl`):** takes the `query_terms` largest values (`nth_element`), reads `postings[0, min(list_depth, sorted))` and `postings[sorted, end)` of each of their lists into a per-thread dense scratch, keeps the `k * k_factor` best allowed partial scores, and re-scores each by merging its forward row with the query's terms in term order, then adding the per-list weights with `std::fma` in the order `InvertedIndex::query_impl` adds its lists (largest bound first, ties to the shorter list). So each result's distance is bit-identical to `InvertedIndex`'s, which the tests check.
 - **Measured** (big-ann sparse track 1M, M3, one thread): `10:2000:50` 2,477 QPS at recall@10 0.907, `10:10000:10` (the defaults) 1,621 at 0.962, `10:10000:50` 1,183 at 0.989, against `InvertedIndex`'s 118. Re-scoring by merge was about 1.5x faster than a binary search per query term. The approach was first built into one sparse class, with lists split into a weight-ordered head of 16,384 entries and a slot-ordered rest so exact search kept its sequential access (fully weight-ordered lists made exact search 20-25% slower at 1M); as its own class, the lists can be fully weight-ordered with no cap.
+
+### `fusion.hpp`: `fuse` (issue #60)
+
+Merges ranked results from several retrievers, typically a dense and a sparse index holding the same documents under the same ids. `FusionMethod` picks the score, summed over the lists that hold an id, each list with weight `w_i`:
+
+- **`RRF`** (reciprocal rank fusion, Cormack et al. [10]): `w_i / (k + rank_i)`, `k = 60` by default, rank counting from 1. Positions only, so retrievers whose scores aren't comparable (BM25 is unbounded, cosine distance is in [0, 2]) combine without normalization, and nothing needs tuning beyond `k`. A document ranked well by several lists beats one ranked first by a single list (5th in two lists: 2/65 > 1/61).
+- **`Linear`** (convex combination): `w_i · (max_i − d) / (max_i − min_i)`, each list's distances min-max normalized per query over the hits it returned, so its nearest hit scores 1 and its farthest 0 (all 1 when they're equal). A document missing from a list gets 0 from it. Bruch et al. [11] found this beats RRF once the weights are tuned on a small labeled sample; untuned, RRF is the safer default. The normalization depends on how deep each list was fetched, since the farthest returned hit defines 0.
+
+Implementation: per query, an `unordered_map` from id to (score, last list that added to it). Scores accumulate in `double`. Negative ids (padding) and, for `Linear`, non-finite distances are skipped (also when finding min and max); an id repeated within one list counts only at its first position; lists with weight 0 are skipped entirely, so their ids don't appear with score 0. A `partial_sort` keeps `limit` hits by score, then smaller id, so equal scores come out in a fixed order; scores are rounded to `float` only on output. `fuse_batch` fuses row `q` of every list into result `q`, rows in parallel through `parallel_for`; `qann.fuse` calls it with the GIL released, for one query (1D inputs) or a `batch_query`-shaped batch (2D), and pads to `limit` with `-1` / 0.
+
+**Ids must mean the same document in every list.** `fuse` can only match equal integers, so callers keep the indexes in step (custom ids from their own data; `ids()` checks the sets agree). A `HybridIndex` owning both indexes is planned to make that automatic.
 
 ### `index_factory.hpp`: `make_index`
 
@@ -775,3 +789,5 @@ Methods qann implements, and the benchmarks it is measured with. Numbers match t
 7. Y. Bachrach, Y. Finkelstein, R. Gilad-Bachrach, L. Katzir, N. Koenigstein, N. Nice, U. Paquet. **Speeding up the Xbox recommender system using a euclidean transformation for inner-product spaces.** RecSys 2014, 257-264. [doi:10.1145/2645710.2645741](https://doi.org/10.1145/2645710.2645741). The extra coordinate that lets HNSW link by L2 for `Metric::InnerProduct`.
 8. M. Aumüller, E. Bernhardsson, A. Faithfull. **ANN-Benchmarks: A benchmarking tool for approximate nearest neighbor algorithms.** Information Systems 87:101374, 2020. [doi:10.1016/j.is.2019.02.006](https://doi.org/10.1016/j.is.2019.02.006). External benchmark suite (`benchmarks/external`, branch `external-benchmarks`).
 9. E. Jääsaari, V. Hyvönen, M. Ceccarello, T. Roos, M. Aumüller. **VIBE: Vector Index Benchmark for Embeddings.** arXiv:2505.17810, 2025. [arxiv.org/abs/2505.17810](https://arxiv.org/abs/2505.17810). External benchmark suite with embedding and inner product datasets (`benchmarks/external`).
+10. G. V. Cormack, C. L. A. Clarke, S. Büttcher. **Reciprocal rank fusion outperforms Condorcet and individual rank learning methods.** SIGIR 2009, 758-759. [doi:10.1145/1571941.1572114](https://doi.org/10.1145/1571941.1572114). `FusionMethod::RRF`.
+11. S. Bruch, S. Gai, A. Ingber. **An Analysis of Fusion Functions for Hybrid Retrieval.** ACM Transactions on Information Systems 42(1), 2023. [doi:10.1145/3596512](https://doi.org/10.1145/3596512). Convex combination vs RRF: `FusionMethod::Linear`.
