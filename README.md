@@ -329,6 +329,27 @@ Reading and changing metadata:
 
 Unknown, deleted or repeated ids raise `ValueError`. Metadata stays with its vector through `remove`, `compact`, `save` and `load`. [Types, SQL limits and costs](https://github.com/maxtmiller/qann/blob/main/ARCHITECTURE.md#metadata).
 
+## Hybrid search
+
+Dense and sparse retrievers miss different things: embeddings find paraphrases, keyword weights (BM25, SPLADE) find exact rare terms. To get both, index the same documents twice under the same ids, query both, and merge with `qann.fuse`:
+
+```python
+dense = qann.HNSWIndex(384, metric=qann.Metric.Cosine, custom_ids=True)
+sparse = qann.InvertedIndex(custom_ids=True)
+dense.add(embeddings, ids=doc_ids)           # from an embedding model
+sparse.add(bm25_matrix, ids=doc_ids)         # same documents, same ids
+
+d = dense.batch_query(q_embeddings, 50)      # fetch several times what you need
+s = sparse.batch_query(q_bm25, 50)
+ids, scores = qann.fuse([d, s], limit=10)    # top 10, highest score first
+```
+
+- **`qann.fuse(results, *, k=60, weights=None, limit=10)`** uses reciprocal rank fusion: each id scores `weight / (k + rank)` in every list that has it. Only ranks count, so BM25 scores and cosine distances never need putting on one scale. Documents several retrievers agree on rise to the top.
+- **Inputs:** `query` or `batch_query` results, or plain id arrays, all 1D or all 2D. `-1` padding is skipped, and the output is padded with `-1` / `0`.
+- **Fetch deep:** about 5x the final count from each retriever, or documents one retriever ranks low never reach the fusion.
+- **Ids must mean the same document in both indexes:** use `custom_ids=True` with your own document ids, and add and remove in both. `np.array_equal(dense.ids(), sparse.ids())` checks they hold the same documents.
+- **Filters:** pass the same `where=` to both queries.
+
 ## Saving and loading
 
 ```python
@@ -372,6 +393,7 @@ dists = [pq.distance_adc(table, c) for c in codes]
 | `cosine_distance(a, b)` | Row-wise cosine distance between two `(m, dim)` arrays. |
 | `set_num_threads(n)` | Threads for batch queries, adds and training. `0` (default) uses every core. |
 | `num_threads()` | Thread count in effect. |
+| `fuse(results, *, k=60, weights=None, limit=10)` | Merge ranked results from several retrievers; see [Hybrid search](#hybrid-search). |
 | `__version__` | Installed version. |
 
 ## Threads and type hints

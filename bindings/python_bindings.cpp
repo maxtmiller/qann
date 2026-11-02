@@ -18,6 +18,7 @@
 
 #include "vecengine/distance.hpp"
 #include "vecengine/flat_index.hpp"
+#include "vecengine/fusion.hpp"
 #include "vecengine/ivf_index.hpp"
 #include "vecengine/hnsw_index.hpp"
 #include "vecengine/metadata.hpp"
@@ -127,6 +128,60 @@ static IdVector as_ids(nb::handle obj) {
     }
     if (nb::cast<std::size_t>(arr.attr("ndim")) != 1) throw nb::type_error("ids must be one-dimensional");
     return nb::cast<IdVector>(np.attr("ascontiguousarray")(arr, nb::arg("dtype") = "int64"));
+}
+
+using IdMatrix = nb::ndarray<int64_t, nb::c_contig, nb::device::cpu>;
+
+// qann.fuse: each result is (ids, dists) as query / batch_query return it, or
+// ids alone. All must be 1D (one query) or all 2D with the same row count.
+// Returns (ids, scores) shaped like one query's or batch_query's results, with
+// up to limit hits per row, padded with -1 / 0.
+static nb::tuple fuse(nb::sequence results, float k, std::optional<std::vector<float>> weights, std::size_t limit) {
+    if (limit == 0) throw std::invalid_argument("limit must be at least 1");
+    nb::module_ np = nb::module_::import_("numpy");
+    std::vector<IdMatrix> arrays;
+    for (nb::handle item : results) {
+        nb::object ids = nb::borrow(item);
+        // (ids, dists): a pair whose first element is itself a sequence or array
+        if (nb::isinstance<nb::tuple>(item) && nb::len(item) == 2 &&
+            nb::cast<std::size_t>(np.attr("ndim")(item[0])) > 0)
+            ids = item[0];
+        nb::object arr = np.attr("asarray")(ids);
+        if (nb::cast<std::size_t>(arr.attr("size")) > 0) {
+            const auto kind = nb::cast<std::string>(arr.attr("dtype").attr("kind"));
+            if (kind != "i" && kind != "u") throw nb::type_error("result ids must be integers");
+        }
+        arrays.push_back(nb::cast<IdMatrix>(np.attr("ascontiguousarray")(arr, nb::arg("dtype") = "int64")));
+    }
+    if (arrays.empty()) throw std::invalid_argument("fuse needs at least one result list");
+    const std::size_t ndim = arrays[0].ndim();
+    if (ndim != 1 && ndim != 2) throw std::invalid_argument("results must be 1D (one query) or 2D (one row per query)");
+    const std::size_t rows = ndim == 1 ? 1 : arrays[0].shape(0);
+    std::vector<std::span<const int64_t>> lists;
+    std::vector<std::size_t> widths;
+    for (const IdMatrix& a : arrays) {
+        if (a.ndim() != ndim) throw std::invalid_argument("results must all be 1D or all be 2D");
+        if (ndim == 2 && a.shape(0) != rows)
+            throw std::invalid_argument("2D results must all have the same number of rows (queries)");
+        widths.push_back(ndim == 1 ? a.shape(0) : a.shape(1));
+        lists.emplace_back(a.data(), rows * widths.back());
+    }
+    const std::vector<float> w = weights.value_or(std::vector<float>{});
+
+    std::vector<std::vector<vecengine::FusedHit>> fused;
+    {
+        nb::gil_scoped_release release;
+        fused = vecengine::rrf_fuse_batch(lists, widths, rows, w, k, limit);
+    }
+    std::vector<int64_t> ids(rows * limit, -1);
+    std::vector<float> scores(rows * limit, 0.0f);
+    for (std::size_t q = 0; q < rows; ++q)
+        for (std::size_t j = 0; j < fused[q].size(); ++j) {
+            ids[q * limit + j] = fused[q][j].id;
+            scores[q * limit + j] = fused[q][j].score;
+        }
+    if (ndim == 1) return nb::make_tuple(to_numpy(std::move(ids), {limit}), to_numpy(std::move(scores), {limit}));
+    return nb::make_tuple(to_numpy(std::move(ids), {rows, limit}), to_numpy(std::move(scores), {rows, limit}));
 }
 
 // Changing a RefineIndex's base directly would misalign the two (an add would
@@ -560,6 +615,15 @@ NB_MODULE(qann, m) {
           "Does not limit BLAS's own threads (VECLIB_MAXIMUM_THREADS / OPENBLAS_NUM_THREADS).");
     m.def("num_threads", &vecengine::num_threads,
           "Thread count parallel work will use (resolves the 0 default to the core count).");
+    m.def("fuse", &fuse, nb::arg("results"), nb::kw_only(), nb::arg("k") = 60.0f,
+          nb::arg("weights").none() = nb::none(), nb::arg("limit") = 10,
+          "Merge ranked results from several retrievers with reciprocal rank fusion: score(id) = sum of "
+          "weight / (k + rank) over the lists holding id, rank counting from 1. results is a list of "
+          "(ids, dists) as query / batch_query return them, or of id arrays; only the order is used. All 1D "
+          "(one query) or all 2D with one row per query; row q of each is fused into row q. -1 padding is "
+          "skipped and lists with weight 0 are ignored. Returns (ids, scores), highest score first (ties: "
+          "smaller id first), up to limit per row, padded with -1 / 0. Fetch several times limit from each "
+          "retriever, or good results never reach the fusion");
 
     // Methods bound on DenseIndex are inherited by FlatIndex, IVFIndex and RefineIndex,
     // and give type checkers the right methods for what load() and make_index() return.
