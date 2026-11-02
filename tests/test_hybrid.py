@@ -232,3 +232,45 @@ def test_loads_file_saved_on_macos():
 
     h.compact()
     assert h.size() == 360 and h.dense.size() == 360 and h.sparse.size() == 360
+
+
+def test_every_allowed_wrapper_combination_saves_and_loads(tmp_path, docs):
+    # Whatever a wrapper accepts must also load back: load_index only takes
+    # Flat / IVF / HNSW bases under a RefineIndex, and Flat / IVF / HNSW /
+    # Refine plus Inverted / SparseApprox parts under a HybridIndex.
+    x, s = docs["dense"][:300], docs["sparse"][:300]
+
+    def ivfpq():
+        i = qann.IVFIndex(DIM, nlist=100, nprobe=100)
+        i.enable_pq(4)
+        i.train(x, seed=1)
+        return i
+
+    def hnsw_sq():
+        i = qann.HNSWIndex(DIM)
+        i.enable_sq(8)
+        i.train(x)
+        return i
+
+    dense_parts = [lambda: qann.FlatIndex(DIM), ivfpq, lambda: qann.HNSWIndex(DIM), hnsw_sq]
+    for make_base in dense_parts:
+        r = qann.RefineIndex(make_base())
+        r.add(x)
+        r.save(tmp_path / "r.qann")
+        np.testing.assert_array_equal(qann.load(tmp_path / "r.qann").batch_query(x[:5], 3)[0], r.batch_query(x[:5], 3)[0])
+    for make_dense in dense_parts + [lambda: qann.RefineIndex(ivfpq())]:
+        for make_sparse in (qann.InvertedIndex, qann.SparseApproxIndex):
+            h = qann.HybridIndex(make_dense(), make_sparse())
+            h.add(x, s)
+            h.save(tmp_path / "h.qann")
+            got = qann.load(tmp_path / "h.qann").batch_query(x[:5], s[:5], 3)
+            np.testing.assert_array_equal(got[0], h.batch_query(x[:5], s[:5], 3)[0])
+
+    # and what can't load is refused up front
+    with pytest.raises(ValueError):
+        qann.RefineIndex(qann.RefineIndex(qann.FlatIndex(DIM)))
+    hybrid = qann.HybridIndex(qann.FlatIndex(DIM), qann.InvertedIndex())
+    for bad in (lambda: qann.RefineIndex(hybrid), lambda: qann.HybridIndex(hybrid, qann.InvertedIndex()),
+                lambda: qann.HybridIndex(qann.FlatIndex(DIM), hybrid)):
+        with pytest.raises(TypeError):
+            bad()
