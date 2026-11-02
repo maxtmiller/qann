@@ -62,6 +62,35 @@ def test_fuse_errors():
         qann.fuse([np.array([1.5, 2.0])])                                     # ids must be integers
 
 
+def test_fuse_linear():
+    a = (np.array([1, 2, 3]), np.array([0.0, 5.0, 10.0], np.float32))
+    b = (np.array([3, 1]), np.array([-4.0, -2.0], np.float32))
+    ids, scores = qann.fuse([a, b], method="linear", limit=4)
+    np.testing.assert_array_equal(ids, [1, 3, 2, -1])
+    np.testing.assert_allclose(scores, [1.0, 1.0, 0.5, 0.0], rtol=1e-6)
+    ids, _ = qann.fuse([a, b], method="linear", weights=[0.25, 1.0], limit=3)
+    np.testing.assert_array_equal(ids, [3, 1, 2])
+
+    # batch rows match single queries, float64 distances are accepted
+    rng = np.random.default_rng(3)
+    ia, da = rng.integers(0, 30, (40, 10)), rng.normal(size=(40, 10))
+    ib, db = rng.integers(0, 30, (40, 6)), rng.normal(size=(40, 6))
+    ids, scores = qann.fuse([(ia, da), (ib, db)], method="linear", weights=[0.6, 0.4], limit=5)
+    for q in range(40):
+        one = qann.fuse([(ia[q], da[q]), (ib[q], db[q])], method="linear", weights=[0.6, 0.4], limit=5)
+        np.testing.assert_array_equal(ids[q], one[0])
+        np.testing.assert_array_equal(scores[q], one[1])
+
+
+def test_fuse_linear_errors():
+    with pytest.raises(ValueError, match="dists"):
+        qann.fuse([np.array([1, 2])], method="linear")                      # ids alone
+    with pytest.raises(ValueError, match="shape"):
+        qann.fuse([(np.array([1, 2]), np.array([0.5]))], method="linear")
+    with pytest.raises(ValueError, match="method"):
+        qann.fuse([[1]], method="borda")
+
+
 def test_hybrid_dense_and_sparse_with_shared_ids():
     sp = pytest.importorskip("scipy.sparse")
     rng = np.random.default_rng(2)
@@ -76,6 +105,10 @@ def test_hybrid_dense_and_sparse_with_shared_ids():
     q_sparse = sp.random(20, 300, density=0.05, format="csr", dtype=np.float32, random_state=4)
     d = dense.batch_query(q_dense, 50)
     s = sparse.batch_query(q_sparse, 50)
+    lin_ids, lin_scores = qann.fuse([d, s], method="linear", limit=10)
+    assert np.isin(lin_ids[lin_ids >= 0], doc_ids).all()
+    assert (np.diff(lin_scores, axis=1) <= 0).all()
+
     ids, scores = qann.fuse([d, s], limit=10)
     assert ids.shape == (20, 10)
     assert np.isin(ids[ids >= 0], doc_ids).all()

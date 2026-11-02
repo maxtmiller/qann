@@ -344,8 +344,10 @@ s = sparse.batch_query(q_bm25, 50)
 ids, scores = qann.fuse([d, s], limit=10)    # top 10, highest score first
 ```
 
-- **`qann.fuse(results, *, k=60, weights=None, limit=10)`** uses reciprocal rank fusion: each id scores `weight / (k + rank)` in every list that has it. Only ranks count, so BM25 scores and cosine distances never need putting on one scale. Documents several retrievers agree on rise to the top.
-- **Inputs:** `query` or `batch_query` results, or plain id arrays, all 1D or all 2D. `-1` padding is skipped, and the output is padded with `-1` / `0`.
+- **`qann.fuse(results, *, method="rrf", k=60, weights=None, limit=10)`** merges the lists. Documents several retrievers agree on rise to the top. Two methods:
+  - `"rrf"` (reciprocal rank fusion, the default): each id scores `weight / (k + rank)` in every list that has it. Only ranks count, so it needs no tuning: the safe choice.
+  - `"linear"`: each list's distances are rescaled per query to 1 (nearest) down to 0 (farthest returned), then summed with `weights`. With weights tuned on a few labeled queries it usually beats `"rrf"`.
+- **Inputs:** `query` or `batch_query` results, all 1D or all 2D (`"rrf"` also takes plain id arrays). `-1` padding is skipped, and the output is padded with `-1` / `0`.
 - **Fetch deep:** about 5x the final count from each retriever, or documents one retriever ranks low never reach the fusion.
 - **Ids must mean the same document in both indexes:** use `custom_ids=True` with your own document ids, and add and remove in both. `np.array_equal(dense.ids(), sparse.ids())` checks they hold the same documents.
 - **Filters:** pass the same `where=` to both queries.
@@ -393,7 +395,7 @@ dists = [pq.distance_adc(table, c) for c in codes]
 | `cosine_distance(a, b)` | Row-wise cosine distance between two `(m, dim)` arrays. |
 | `set_num_threads(n)` | Threads for batch queries, adds and training. `0` (default) uses every core. |
 | `num_threads()` | Thread count in effect. |
-| `fuse(results, *, k=60, weights=None, limit=10)` | Merge ranked results from several retrievers; see [Hybrid search](#hybrid-search). |
+| `fuse(results, *, method="rrf", k=60, weights=None, limit=10)` | Merge ranked results from several retrievers; see [Hybrid search](#hybrid-search). |
 | `__version__` | Installed version. |
 
 ## Threads and type hints
