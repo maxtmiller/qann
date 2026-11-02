@@ -537,6 +537,12 @@ TEST_CASE("RefineIndex: constructor rejects misaligned bases", "[refine][ids]") 
     used_base.remove(all);
     REQUIRE(used_base.size() == 0);
     REQUIRE_THROWS_AS(RefineIndex(used_base), std::invalid_argument);
+
+    // A RefineIndex base: the file it would save could never be loaded.
+    FlatIndex flat(dim);
+    RefineIndex inner(flat);
+    REQUIRE_THROWS_AS(RefineIndex(inner, 10), std::invalid_argument);   // k_factor given: RefineIndex(inner) would be a copy
+    REQUIRE_FALSE(inner.wrapped());   // the failed constructor leaves it as it was
 }
 
 TEST_CASE("RefineIndex: query after deleting everything returns nothing", "[refine][ids]") {
