@@ -573,6 +573,12 @@ def test_base_of_refine_index_is_protected(data):
         qann.RefineIndex(base)
     assert base.size() == refine.size() == 100
 
+    # a RefineIndex can't be a base: the file it would save could never be loaded
+    inner = qann.RefineIndex(qann.FlatIndex(32))
+    with pytest.raises(ValueError, match="must not be a RefineIndex"):
+        qann.RefineIndex(inner)
+    inner.add(data[:3])   # still usable: the failed wrap didn't mark it
+
     # Tuning the base is still allowed, and changes through the RefineIndex reach it.
     base.nprobe = 16
     assert refine.remove([0, 1]) == 2

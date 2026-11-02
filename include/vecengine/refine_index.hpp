@@ -28,8 +28,8 @@ using std::span;
 // index's slot i are always the same vector.
 class RefineIndex : public DenseIndex {
 public:
-    // base must have no slots yet, ids equal to its slots (no custom ids, never compacted), and not already be wrapped by
-    // another RefineIndex, so its slots line up with this index's raw storage.
+    // base must have no slots yet, ids equal to its slots (no custom ids, never compacted), not already be wrapped
+    // by another index, so its slots line up with this index's raw storage, and not be a RefineIndex itself.
     // k_factor >= 1. custom_ids makes add_batch() take user ids. Marks base as
     // wrapped (see IndexBase::wrapped()).
     explicit RefineIndex(DenseIndex& base, size_t k_factor = 10, bool custom_ids = false);
