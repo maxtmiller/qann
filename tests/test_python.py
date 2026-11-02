@@ -565,9 +565,9 @@ def test_base_of_refine_index_is_protected(data):
     refine = qann.RefineIndex(base, k_factor=4)
     refine.add(data[:100])
 
-    with pytest.raises(ValueError, match="through the RefineIndex"):
+    with pytest.raises(ValueError, match="through the wrapper"):
         base.add(data[:5])
-    with pytest.raises(ValueError, match="through the RefineIndex"):
+    with pytest.raises(ValueError, match="through the wrapper"):
         base.remove([0])
     with pytest.raises(ValueError):
         qann.RefineIndex(base)
@@ -589,7 +589,7 @@ def test_base_of_loaded_refine_index_is_protected(tmp_path, refine_index, data):
     path = tmp_path / "refine.qann"
     refine_index.save(path)
     loaded = qann.load(path)
-    with pytest.raises(ValueError, match="through the RefineIndex"):
+    with pytest.raises(ValueError, match="through the wrapper"):
         loaded.base.add(data[:2])
 
 
@@ -1326,9 +1326,9 @@ def test_metadata_none_and_update(tmp_path, data):
     refine.add(data[:3], metadata={"color": ["a", "b", "c"]})
     refine.update_metadata([1], {"color": ["a"]})
     assert sorted(refine.query(q, 3, where=f("color") == "a")[0].tolist()) == [0, 1]
-    with pytest.raises(ValueError, match="through the RefineIndex"):
+    with pytest.raises(ValueError, match="through the wrapper"):
         ivf.update_metadata([0], {"color": ["z"]})
-    with pytest.raises(ValueError, match="through the RefineIndex"):
+    with pytest.raises(ValueError, match="through the wrapper"):
         ivf.add_metadata_column("rank", "float")
     refine.add_metadata_column("rank", "float")
     assert refine.metadata_schema["rank"] == "float"

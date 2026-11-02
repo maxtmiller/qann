@@ -70,6 +70,15 @@ private:
     virtual void add_batch_impl(const SparseRows& rows, const int64_t* ids) = 0;
     virtual vector<Neighbor> query_impl(const Terms& terms, size_t k, const detail::SlotFilter* filter) const = 0;
 
+    // compact() for an index a HybridIndex wraps: same storage compaction, but
+    // ids become the new slots so they keep matching the HybridIndex's slots.
+    virtual size_t compact_as_base() = 0;
+
+    friend class HybridIndex;  // calls compact_as_base(), check_rows(), search() and add_batch_impl()
+
+    // Throws std::invalid_argument unless rows is well-formed CSR (see SparseRows).
+    static void check_rows(const SparseRows& rows);
+
     // query_batch() for every overload; filter is nullptr for an unfiltered query.
     vector<vector<Neighbor>> search(const SparseRows& queries, size_t k, const detail::SlotFilter* filter) const;
 };

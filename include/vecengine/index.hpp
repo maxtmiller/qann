@@ -146,6 +146,7 @@ protected:
 
 private:
     friend class RefineIndex;  // sets and clears wrapped_; reads its base's id_map()
+    friend class HybridIndex;  // the same for the two indexes it wraps
 
     mutable std::shared_mutex mutex_;
     std::atomic<bool> wrapped_{false};
@@ -240,6 +241,7 @@ protected:
 
 private:
     friend class RefineIndex;  // calls compact_as_base() and the *_impl methods
+    friend class HybridIndex;  // calls compact_as_base(), add_batch_impl(), normalize_rows() and query_prepared()
 
     // Shared by the public query() and query_batch() overloads: prepares the
     // queries for the metric, calls query_impl() (one query, batch false) or

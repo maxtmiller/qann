@@ -150,8 +150,10 @@ vector<Neighbor> SparseApproxIndex::query_impl(const Terms& terms, size_t k, con
     return top.take_sorted();
 }
 
-size_t SparseApproxIndex::compact() {
-    const vector<uint32_t> remap = id_map_.compact(true);
+size_t SparseApproxIndex::compact() { return compact_impl(true); }
+
+size_t SparseApproxIndex::compact_impl(bool keep_ids) {
+    const vector<uint32_t> remap = id_map_.compact(keep_ids);
     if (remap.empty()) {
         metadata_.drop_unused_strings();
         return 0;

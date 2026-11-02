@@ -88,8 +88,12 @@ private:
     // at the vectors that may be returned.
     size_t candidates(size_t k, const detail::SlotFilter* filter) const;
 
-    // A RefineIndex is never a base; throws std::logic_error.
+    // compact() for a RefineIndex that is the dense side of a HybridIndex:
+    // ids become the new slots.
     size_t compact_as_base() override;
+
+    // compact() and compact_as_base(): keep_ids as in IdMap::compact.
+    size_t compact_impl(bool keep_ids);
 
     // Exact top k of the base's candidates for vec (candidate ids are base slots).
     vector<Neighbor> rerank(span<const float> vec, const vector<Neighbor>& candidates, size_t k) const;

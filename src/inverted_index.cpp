@@ -208,8 +208,10 @@ vector<Neighbor> InvertedIndex::query_impl(const Terms& terms, size_t k, const d
     return top.take_sorted();
 }
 
-size_t InvertedIndex::compact() {
-    const vector<uint32_t> remap = id_map_.compact(true);
+size_t InvertedIndex::compact() { return compact_impl(true); }
+
+size_t InvertedIndex::compact_impl(bool keep_ids) {
+    const vector<uint32_t> remap = id_map_.compact(keep_ids);
     if (remap.empty()) {
         metadata_.drop_unused_strings();
         return 0;

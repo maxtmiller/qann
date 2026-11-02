@@ -142,8 +142,12 @@ size_t RefineIndex::remove(span<const int64_t> ids) {
     return removed;
 }
 
-size_t RefineIndex::compact() {
-    auto remap = id_map_.compact(true);
+size_t RefineIndex::compact() { return compact_impl(true); }
+
+size_t RefineIndex::compact_as_base() { return compact_impl(false); }
+
+size_t RefineIndex::compact_impl(bool keep_ids) {
+    auto remap = id_map_.compact(keep_ids);
     if (remap.empty()) {
         metadata_.drop_unused_strings();
         return 0;
@@ -167,11 +171,6 @@ size_t RefineIndex::compact() {
     data_.shrink_to_fit();
 
     return remap.size() - id_map_.slots();
-}
-
-size_t RefineIndex::compact_as_base() {
-    assert(base_.slots() == id_map_.slots());
-    throw std::logic_error("a RefineIndex cannot be the base of another RefineIndex");
 }
 
 void RefineIndex::save(std::ostream& out) const {
