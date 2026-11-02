@@ -91,6 +91,7 @@ qann/
 │   ├── where_cost.py               # single-query where= cost: filter evaluation vs search (issue #72)
 │   ├── sparse_bm25.py              # InvertedIndex BM25 on BEIR: QPS and nDCG@10, pruning off and on (issue #59)
 │   ├── sparse_bigann.py            # InvertedIndex and SparseApproxIndex on the big-ann sparse track (SPLADE, issue #59)
+│   ├── hybrid_beir.py              # BM25, dense and HybridIndex nDCG@10 / recall@100 on BEIR (fastembed embeddings, issue #60)
 │   ├── fastscan_recall.py          # recall of 4-bit codes and uint8 tables on SIFT1M (fast-scan study)
 │   ├── fastscan_bench.cpp          # NEON fast-scan kernel vs the scalar ADC scan (ARM only)
 │   ├── baseline_siftsmall.json     # recall baseline for the CI gate
