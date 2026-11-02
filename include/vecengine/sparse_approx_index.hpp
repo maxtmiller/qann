@@ -94,6 +94,10 @@ private:
 
     // SparseIndex implementations.
     void add_batch_impl(const SparseRows& rows, const int64_t* ids) override;
+    size_t compact_as_base() override { return compact_impl(false); }
+
+    // compact() and compact_as_base(): keep_ids as in IdMap::compact.
+    size_t compact_impl(bool keep_ids);
     vector<Neighbor> query_impl(const Terms& terms, size_t k, const detail::SlotFilter* filter) const override;
 
     // Fills the forward index from lists_, for load_body() and compact().

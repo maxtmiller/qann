@@ -72,6 +72,10 @@ private:
 
     // SparseIndex implementations.
     void add_batch_impl(const SparseRows& rows, const int64_t* ids) override;
+    size_t compact_as_base() override { return compact_impl(false); }
+
+    // compact() and compact_as_base(): keep_ids as in IdMap::compact.
+    size_t compact_impl(bool keep_ids);
 
     // One query, term at a time, its lists taken
     // from the largest possible contribution down. With pruning_, once the

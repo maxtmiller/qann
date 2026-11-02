@@ -19,6 +19,7 @@
 #include "vecengine/distance.hpp"
 #include "vecengine/flat_index.hpp"
 #include "vecengine/fusion.hpp"
+#include "vecengine/hybrid_index.hpp"
 #include "vecengine/ivf_index.hpp"
 #include "vecengine/hnsw_index.hpp"
 #include "vecengine/metadata.hpp"
@@ -89,13 +90,20 @@ static NumpyArray<float> batch_cosine(FloatMatrix a, FloatMatrix b) {
 // base is also reachable from Python, e.g. ivf.add() on a wrapped IVFIndex).
 // Always taken outermost index first, so lock order is consistent.
 template <class Lock>
+static void lock_into(std::vector<Lock>& locks, const vecengine::IndexBase& index) {
+    locks.emplace_back(index.mutex());
+    if (auto* refine = dynamic_cast<const vecengine::RefineIndex*>(&index)) {
+        lock_into(locks, refine->base());
+    } else if (auto* hybrid = dynamic_cast<const vecengine::HybridIndex*>(&index)) {
+        lock_into(locks, hybrid->dense());
+        lock_into(locks, hybrid->sparse());
+    }
+}
+
+template <class Lock>
 static std::vector<Lock> lock_chain(const vecengine::IndexBase& index) {
     std::vector<Lock> locks;
-    for (const vecengine::IndexBase* p = &index; p != nullptr;) {
-        locks.emplace_back(p->mutex());
-        auto* refine = dynamic_cast<const vecengine::RefineIndex*>(p);
-        p = refine ? &refine->base() : nullptr;
-    }
+    lock_into(locks, index);
     return locks;
 }
 
@@ -130,6 +138,15 @@ static IdVector as_ids(nb::handle obj) {
     return nb::cast<IdVector>(np.attr("ascontiguousarray")(arr, nb::arg("dtype") = "int64"));
 }
 
+// A FusionMethod as Python names it, and back.
+static const char* method_name(vecengine::FusionMethod m) { return m == vecengine::FusionMethod::RRF ? "rrf" : "linear"; }
+
+static vecengine::FusionMethod method_from(const std::string& name) {
+    if (name == "rrf") return vecengine::FusionMethod::RRF;
+    if (name == "linear") return vecengine::FusionMethod::Linear;
+    throw std::invalid_argument("method must be 'rrf' or 'linear'; got '" + name + "'");
+}
+
 using IdMatrix = nb::ndarray<int64_t, nb::c_contig, nb::device::cpu>;
 using DistMatrix = nb::ndarray<float, nb::c_contig, nb::device::cpu>;
 
@@ -139,10 +156,7 @@ using DistMatrix = nb::ndarray<float, nb::c_contig, nb::device::cpu>;
 // results, with up to limit hits per row, padded with -1 / 0.
 static nb::tuple fuse(nb::sequence results, const std::string& method_name, float k,
                       std::optional<std::vector<float>> weights, std::size_t limit) {
-    vecengine::FusionMethod method;
-    if (method_name == "rrf") method = vecengine::FusionMethod::RRF;
-    else if (method_name == "linear") method = vecengine::FusionMethod::Linear;
-    else throw std::invalid_argument("method must be 'rrf' or 'linear'; got '" + method_name + "'");
+    const vecengine::FusionMethod method = method_from(method_name);
     const bool linear = method == vecengine::FusionMethod::Linear;
     if (limit == 0) throw std::invalid_argument("limit must be at least 1");
 
@@ -208,13 +222,14 @@ static nb::tuple fuse(nb::sequence results, const std::string& method_name, floa
     return nb::make_tuple(to_numpy(std::move(ids), {rows, limit}), to_numpy(std::move(scores), {rows, limit}));
 }
 
-// Changing a RefineIndex's base directly would misalign the two (an add would
-// give the base a vector the RefineIndex has no copy of), so it is refused.
-// Called with the index locked, since a RefineIndex sets the flag under it.
+// Changing an index a RefineIndex or HybridIndex wraps directly would
+// misalign the two (an add would give it a vector the wrapper has no slot
+// for), so it is refused. Called with the index locked, since a wrapper sets
+// the flag under it.
 static void refuse_if_wrapped(const vecengine::IndexBase& self, const char* what) {
     if (self.wrapped())
-        throw std::invalid_argument(std::string("cannot ") + what + " on the base of a RefineIndex; " + what +
-                                    " through the RefineIndex instead");
+        throw std::invalid_argument(std::string("cannot ") + what + " on an index wrapped by a RefineIndex or "
+                                    "HybridIndex; " + what + " through the wrapper instead");
 }
 
 // qann.field(name): a column to compare; its operators build Expr filters.
@@ -553,6 +568,7 @@ static NumpyArray<int64_t> sparse_add(vecengine::SparseIndex& self, nb::handle d
     }
     const vecengine::Metadata md = metadata ? as_metadata(*metadata, rows.view().rows(), "row of data") : vecengine::Metadata{};
     std::vector<int64_t> added = write_locked(self, [&] {
+        refuse_if_wrapped(self, "add");
         return self.add_batch(rows.view(), id_array ? id_array->data() : nullptr, md);
     });
     const std::size_t n = added.size();
@@ -573,6 +589,23 @@ sparse_search(const vecengine::SparseIndex& self, const OwnedRows& rows, std::si
         if (!where) return self.query_batch(rows.view(), k, ids);
         if (!allowed_ids) return self.query_batch(rows.view(), k, *where);
         return self.query_batch(rows.view(), k, *where, ids);
+    });
+}
+
+// HybridIndex.query_batch with whichever of allowed and where are given.
+static std::vector<std::vector<vecengine::FusedHit>>
+hybrid_search(const vecengine::HybridIndex& self, std::span<const float> q, const OwnedRows& sparse, std::size_t k,
+              std::optional<IdsArg> allowed, std::optional<WhereArg> where_arg) {
+    const std::optional<vecengine::Expr> where = to_expr(where_arg);
+    std::optional<IdVector> allowed_ids;
+    if (allowed) allowed_ids = as_ids(*allowed);
+    return read_locked(self, [&] {
+        if (!allowed_ids && !where) return self.query_batch(q, sparse.view(), k);
+        const std::span<const int64_t> ids = allowed_ids ? std::span<const int64_t>(allowed_ids->data(), allowed_ids->shape(0))
+                                                         : std::span<const int64_t>();
+        if (!where) return self.query_batch(q, sparse.view(), k, ids);
+        if (!allowed_ids) return self.query_batch(q, sparse.view(), k, *where);
+        return self.query_batch(q, sparse.view(), k, *where, ids);
     });
 }
 
@@ -1014,6 +1047,124 @@ NB_MODULE(qann, m) {
         .def_prop_ro("postings",
                      [](const vecengine::SparseApproxIndex& self) { return read_locked(self, [&] { return self.postings(); }); },
                      "Stored (term, vector) pairs, including deleted vectors' until compact()");
+
+    // Holds dense and sparse by reference; keep_alive ties their lifetimes to
+    // the HybridIndex's, as for RefineIndex's base.
+    nb::class_<vecengine::HybridIndex, vecengine::IndexBase>(
+        m, "HybridIndex",
+        "Hybrid search: a dense and a sparse representation of every document, searched together and fused")
+        .def("__init__",
+             [](vecengine::HybridIndex* self, vecengine::DenseIndex& dense, vecengine::SparseIndex& sparse, bool custom_ids) {
+                 // the constructor checks both are empty; lock them so a concurrent add can't race that check
+                 nb::gil_scoped_release release;
+                 std::vector<std::unique_lock<std::shared_mutex>> locks;
+                 lock_into(locks, dense);
+                 lock_into(locks, sparse);
+                 new (self) vecengine::HybridIndex(dense, sparse, custom_ids);
+             },
+             nb::arg("dense"), nb::arg("sparse"), nb::kw_only(), nb::arg("custom_ids") = false,
+             nb::keep_alive<1, 2>(), nb::keep_alive<1, 3>(),
+             "Wrap an empty dense index (trained, if it needs training) and an empty sparse index, neither with "
+             "custom ids; give the HybridIndex custom_ids instead. Add, remove and compact through the HybridIndex; "
+             "tune either side through .dense and .sparse")
+        .def("add",
+             [](vecengine::HybridIndex& self, FloatMatrix dense, nb::handle sparse, std::optional<IdsArg> ids,
+                std::optional<nb::dict> metadata) {
+                 if (dense.shape(1) != self.dim()) throw std::invalid_argument("dense vector dimension does not match index dimension");
+                 const OwnedRows rows = as_sparse_rows(sparse, "sparse");
+                 const std::size_t n = dense.shape(0);
+                 if (rows.view().rows() != n)
+                     throw std::invalid_argument("dense and sparse must have one row per document, the same number of rows");
+                 std::optional<IdVector> id_array;
+                 if (ids) {
+                     id_array = as_ids(*ids);
+                     if (id_array->shape(0) != n) throw std::invalid_argument("ids must have one entry per document");
+                 }
+                 const vecengine::Metadata md = metadata ? as_metadata(*metadata, n, "document") : vecengine::Metadata{};
+                 std::vector<int64_t> added = write_locked(self, [&] {
+                     return self.add_batch(std::span<const float>(dense.data(), dense.size()), rows.view(),
+                                           id_array ? id_array->data() : nullptr, md);
+                 });
+                 const std::size_t count = added.size();
+                 return to_numpy(std::move(added), {count});
+             },
+             nb::arg("dense"), nb::arg("sparse"), nb::arg("ids").none() = nb::none(), nb::kw_only(),
+             nb::arg("metadata").none() = nb::none(),
+             "Add documents: row i of dense (an (n, dim) array) and row i of sparse (a scipy.sparse matrix with n rows) "
+             "are the same document. ids and metadata as in DenseIndex.add. Both representations, ids and metadata "
+             "are checked first, so a bad row anywhere adds nothing. Returns the documents' ids")
+        .def("query",
+             [](const vecengine::HybridIndex& self, FloatVector dense, nb::handle sparse, std::size_t k,
+                std::optional<IdsArg> allowed, std::optional<WhereArg> where) {
+                 if (dense.shape(0) != self.dim()) throw std::invalid_argument("dense query dimension does not match index dimension");
+                 const OwnedRows rows = as_sparse_rows(sparse, "sparse");
+                 if (rows.view().rows() != 1) throw std::invalid_argument("sparse must be one row; use batch_query for more");
+                 const auto hits = hybrid_search(self, as_span(dense), rows, k, std::move(allowed), std::move(where))[0];
+                 std::vector<int64_t> ids;
+                 std::vector<float> scores;
+                 for (const auto& h : hits) ids.push_back(h.id), scores.push_back(h.score);
+                 const std::size_t n = ids.size();
+                 return std::make_pair(to_numpy(std::move(ids), {n}), to_numpy(std::move(scores), {n}));
+             },
+             nb::arg("dense"), nb::arg("sparse"), nb::arg("k"), nb::kw_only(), nb::arg("allowed").none() = nb::none(),
+             nb::arg("where").none() = nb::none(),
+             "The k best documents for one query: a (dim,) dense vector and a one-row sparse matrix. Returns 1D "
+             "(ids, scores), highest score first; scores come from the fusion (see method), not distances. "
+             "allowed and where filter both sides as in DenseIndex.query")
+        .def("batch_query",
+             [](const vecengine::HybridIndex& self, FloatMatrix dense, nb::handle sparse, std::size_t k,
+                std::optional<IdsArg> allowed, std::optional<WhereArg> where) {
+                 if (dense.shape(1) != self.dim()) throw std::invalid_argument("dense query dimension does not match index dimension");
+                 const OwnedRows rows = as_sparse_rows(sparse, "sparse");
+                 const std::size_t nq = dense.shape(0);
+                 if (rows.view().rows() != nq)
+                     throw std::invalid_argument("dense and sparse must have one row per query, the same number of rows");
+                 const auto hits = hybrid_search(self, std::span<const float>(dense.data(), dense.size()), rows, k,
+                                                 std::move(allowed), std::move(where));
+                 std::vector<int64_t> ids(nq * k, -1);
+                 std::vector<float> scores(nq * k, 0.0f);
+                 for (std::size_t q = 0; q < nq; ++q)
+                     for (std::size_t j = 0; j < hits[q].size(); ++j) {
+                         ids[q * k + j] = hits[q][j].id;
+                         scores[q * k + j] = hits[q][j].score;
+                     }
+                 return std::make_pair(to_numpy(std::move(ids), {nq, k}), to_numpy(std::move(scores), {nq, k}));
+             },
+             nb::arg("dense"), nb::arg("sparse"), nb::arg("k"), nb::kw_only(), nb::arg("allowed").none() = nb::none(),
+             nb::arg("where").none() = nb::none(),
+             "The k best documents for each query: row q of dense (nq, dim) and of sparse (nq rows) is one query, "
+             "run in parallel. Returns (ids, scores) of shape (nq, k), highest score first, padded with -1 / 0")
+        .def_prop_rw("method",
+                     [](const vecengine::HybridIndex& self) { return std::string(method_name(read_locked(self, [&] { return self.method(); }))); },
+                     [](vecengine::HybridIndex& self, const std::string& name) {
+                         const vecengine::FusionMethod m = method_from(name);
+                         write_locked(self, [&] { self.set_method(m); });
+                     },
+                     "How the two rankings are fused: 'rrf' (default; ranks only, no tuning) or 'linear' (min-max "
+                     "normalized distances, weighted sum; best with weights tuned on labeled queries). Saved")
+        .def_prop_rw("weights",
+                     [](const vecengine::HybridIndex& self) {
+                         const auto w = read_locked(self, [&] { return self.weights(); });
+                         return std::make_pair(w[0], w[1]);
+                     },
+                     [](vecengine::HybridIndex& self, std::pair<float, float> w) {
+                         write_locked(self, [&] { self.set_weights(w.first, w.second); });
+                     },
+                     "(dense, sparse) weights of the fusion, each >= 0 and not both 0 (default (1, 1)). Saved")
+        .def_prop_rw("rrf_k",
+                     [](const vecengine::HybridIndex& self) { return read_locked(self, [&] { return self.rrf_k(); }); },
+                     [](vecengine::HybridIndex& self, float k) { write_locked(self, [&] { self.set_rrf_k(k); }); },
+                     "RRF's constant k in weight / (k + rank), > 0 (default 60). Saved")
+        .def_prop_rw("depth_factor",
+                     [](const vecengine::HybridIndex& self) { return read_locked(self, [&] { return self.depth_factor(); }); },
+                     [](vecengine::HybridIndex& self, std::size_t f) { write_locked(self, [&] { self.set_depth_factor(f); }); },
+                     "Each side fetches k * depth_factor results before fusing (default 5); with 'linear' it also sets "
+                     "which hits normalize to 0. Saved")
+        .def_prop_ro("dense", [](vecengine::HybridIndex& self) -> vecengine::DenseIndex& { return self.dense(); },
+                     nb::rv_policy::reference_internal, "The wrapped dense index, e.g. to change ef_search or nprobe")
+        .def_prop_ro("sparse", [](vecengine::HybridIndex& self) -> vecengine::SparseIndex& { return self.sparse(); },
+                     nb::rv_policy::reference_internal, "The wrapped sparse index, e.g. to change pruning")
+        .def("dim", &vecengine::HybridIndex::dim, "Dense vector dimension");
 
     nb::enum_<vecengine::IndexType>(m, "IndexType")
         .value("Flat", vecengine::IndexType::Flat)
