@@ -5,6 +5,7 @@
 #include "vecengine/refine_index.hpp"
 #include "vecengine/inverted_index.hpp"
 #include "vecengine/sparse_approx_index.hpp"
+#include "vecengine/hybrid_index.hpp"
 #include "serialize.hpp"
 
 #include <fstream>
@@ -51,6 +52,7 @@ std::unique_ptr<IndexBase> load_index(std::istream& in) {
         case detail::IndexKind::HNSW:   return HNSWIndex::load_body(in, header.version);
         case detail::IndexKind::Inverted: return InvertedIndex::load_body(in, header.version);
         case detail::IndexKind::SparseApprox: return SparseApproxIndex::load_body(in, header.version);
+        case detail::IndexKind::Hybrid: return HybridIndex::load_body(in, header.version);
     }
     throw std::runtime_error("unknown index kind");
 }

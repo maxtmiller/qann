@@ -53,6 +53,7 @@ Indexes come in two families, with one class per search algorithm:
 - The algorithm is fixed when an index is created. Search settings such as `nprobe` or `ef_search` are properties you can change at any time. To switch type, rebuild: `new.add(old.get_vectors(old.ids()), ids=old.ids())` (ids only if `new` uses custom ids).
 - Ids, deletion, metadata, filters and saving work the same in both families (`qann.IndexBase`).
 - `qann.Index` is the old name of `qann.DenseIndex` and still works.
+- `HybridIndex` combines a dense and a sparse index over the same documents; see [Hybrid search](#hybrid-search).
 
 Methods every dense index has (sparse indexes take `scipy.sparse` matrices instead and have no `dim`):
 
@@ -331,26 +332,37 @@ Unknown, deleted or repeated ids raise `ValueError`. Metadata stays with its vec
 
 ## Hybrid search
 
-Dense and sparse retrievers miss different things: embeddings find paraphrases, keyword weights (BM25, SPLADE) find exact rare terms. To get both, index the same documents twice under the same ids, query both, and merge with `qann.fuse`:
+Dense and sparse retrievers miss different things: embeddings find paraphrases, keyword weights (BM25, SPLADE) find exact rare terms. A `HybridIndex` holds both representations of every document, searches both and fuses the rankings:
 
 ```python
-dense = qann.HNSWIndex(384, metric=qann.Metric.Cosine, custom_ids=True)
-sparse = qann.InvertedIndex(custom_ids=True)
-dense.add(embeddings, ids=doc_ids)           # from an embedding model
-sparse.add(bm25_matrix, ids=doc_ids)         # same documents, same ids
+dense = qann.HNSWIndex(384, metric=qann.Metric.Cosine)
+sparse = qann.InvertedIndex()
+hybrid = qann.HybridIndex(dense, sparse, custom_ids=True)
 
-d = dense.batch_query(q_embeddings, 50)      # fetch several times what you need
-s = sparse.batch_query(q_bm25, 50)
-ids, scores = qann.fuse([d, s], limit=10)    # top 10, highest score first
+hybrid.add(embeddings, bm25_matrix, ids=doc_ids)          # row i of each is document doc_ids[i]
+ids, scores = hybrid.batch_query(q_embeddings, q_bm25, 10, where="lang = 'en'")   # highest score first
 ```
 
-- **`qann.fuse(results, *, method="rrf", k=60, weights=None, limit=10)`** merges the lists. Documents several retrievers agree on rise to the top. Two methods:
-  - `"rrf"` (reciprocal rank fusion, the default): each id scores `weight / (k + rank)` in every list that has it. Only ranks count, so it needs no tuning: the safe choice.
-  - `"linear"`: each list's distances are rescaled per query to 1 (nearest) down to 0 (farthest returned), then summed with `weights`. With weights tuned on a few labeled queries it usually beats `"rrf"`.
-- **Inputs:** `query` or `batch_query` results, all 1D or all 2D (`"rrf"` also takes plain id arrays). `-1` padding is skipped, and the output is padded with `-1` / `0`.
-- **Fetch deep:** about 5x the final count from each retriever, or documents one retriever ranks low never reach the fusion.
-- **Ids must mean the same document in both indexes:** use `custom_ids=True` with your own document ids, and add and remove in both. `np.array_equal(dense.ids(), sparse.ids())` checks they hold the same documents.
-- **Filters:** pass the same `where=` to both queries.
+- **One index, one set of ids.** The `HybridIndex` keeps the ids and metadata, and both parts stay aligned because only it changes them. `add` checks both representations first, so a bad row adds nothing anywhere. `remove`, `compact`, `save` and `qann.load` cover both parts.
+- **Parts:** any empty dense index (trained, if it needs it; a `RefineIndex` works too) and any empty sparse index, neither with custom ids. Tune them through `hybrid.dense` and `hybrid.sparse` (e.g. `hybrid.dense.ef_search = 128`). Adding to them directly raises `ValueError`.
+- **Fusion settings,** saved with the index:
+  - `method`: `"rrf"` (default) or `"linear"`, as in `qann.fuse` below.
+  - `weights`: `(dense, sparse)`, default `(1, 1)`.
+  - `rrf_k`: default 60.
+  - `depth_factor`: each side fetches `k * depth_factor` results before fusing, default 5.
+- **Results** are `(ids, scores)`: fusion scores, higher is better, padded with `-1` / `0`. `query` takes one `(dim,)` vector and a one-row sparse matrix.
+
+**Fusing results yourself:** `qann.fuse(results, *, method="rrf", k=60, weights=None, limit=10)` merges any ranked lists, for example several dense models or results from another search engine:
+
+```python
+d = dense_a.batch_query(q_a, 50)              # fetch several times what you need
+s = dense_b.batch_query(q_b, 50)
+ids, scores = qann.fuse([d, s], limit=10)
+```
+
+- `"rrf"` (reciprocal rank fusion, the default): each id scores `weight / (k + rank)` in every list that has it. Only ranks count, so scores on different scales never need comparing: the safe choice.
+- `"linear"`: each list's distances are rescaled per query to 1 (nearest) down to 0 (farthest returned), then summed with `weights`. With weights tuned on a few labeled queries it usually beats `"rrf"`.
+- Inputs are `query` or `batch_query` results, all 1D or all 2D (`"rrf"` also takes plain id arrays). Ids must mean the same document in every list.
 
 ## Saving and loading
 

@@ -7,10 +7,7 @@
 
 namespace vecengine {
 
-namespace {
-
-// Throws std::invalid_argument unless rows is well-formed CSR (see SparseRows).
-void check_rows(const SparseRows& rows) {
+void SparseIndex::check_rows(const SparseRows& rows) {
     if (rows.indptr.empty()) throw std::invalid_argument("sparse rows need indptr with at least one entry");
     if (rows.indptr[0] != 0) throw std::invalid_argument("sparse indptr must start at 0");
     for (size_t i = 0; i < rows.rows(); ++i)
@@ -18,8 +15,6 @@ void check_rows(const SparseRows& rows) {
     if (rows.indptr.back() != rows.indices.size() || rows.values.size() != rows.indices.size())
         throw std::invalid_argument("sparse indptr, indices and values must agree in length");
 }
-
-} // namespace
 
 void SparseIndex::canonical_row(const SparseRows& rows, size_t i, Terms& out) {
     out.clear();
