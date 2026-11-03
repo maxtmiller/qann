@@ -599,7 +599,7 @@ The README keeps to what each feature does and how to call it. This section hold
 ### Saving and loading
 
 - **Interrupted saves:** the file is written next to the target as `<path>.tmp` and renamed into place when complete, so a failed save never leaves a partial file or destroys an existing one.
-- **Memory-mapped loading:** `qann.load(path, mmap=True)` leaves a RefineIndex's raw vectors (the largest part of the file, `dim * 4` bytes per vector) in the file and reads them through the page cache as queries need them, so loading is quick and memory holds only the base, ids and metadata. Results are identical. It needs a file saved in format 10 (0.1.0a26 onward); older files load without `mmap` and can be saved again. The file must stay in place while the index is open; saving over it is safe. Removed vectors stay in the file after `compact()` until the next `save`.
+- **Memory-mapped loading:** `qann.load(path, mmap=True)` leaves a RefineIndex's raw vectors (the largest part of the file, `dim * 4` bytes per vector) in the file and reads them through the page cache as queries need them, so loading is quick and memory holds only the base, ids and metadata. Results are identical. It needs a file saved in format 10 (0.1.0a25 onward); older files load without `mmap` and can be saved again. The file must stay in place while the index is open; saving over it is safe. Removed vectors stay in the file after `compact()` until the next `save`.
 - **Compatibility:** files saved by 0.1.0a4, 0.1.0a6, 0.1.0a7, 0.1.0a10, 0.1.0a11 and 0.1.0a12 onward all still load (see [File Format](#file-format-srcserializehpp)). A file from a newer release than the one loading it raises `RuntimeError` rather than being misread.
 
 ---
