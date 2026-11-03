@@ -540,11 +540,11 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
 
         VECENGINE_PROF_START(t_table);
         vector<float> residual(use_pre ? 0 : dim_);
-        if (use_pre) {
-            const float* B = precomputed_.data() + it->first * m * K;
+        const float* B = use_pre ? precomputed_.data() + it->first * m * K : nullptr;
+        if (use_pre && !fast_scan_) {
             for (size_t t = 0; t < m * K; ++t) table[t] = B[t] + C[t];
             for (size_t j = 0; j < K; ++j) table[j] += A;
-        } else {
+        } else if (!use_pre) {
             // calculates residuals 
             const float* centroid_ptr = coarse_centroids_.data() + it->first * dim_;
             for (size_t l = 0; l < dim_; ++l) {
@@ -559,8 +559,10 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
             // fast-scan rounds the table to bytes, then scores 32 vectors per kernel call
             float scale = 1.0f, offset = 0.0f;
             if (fast_scan_) {
+                // with precomputed tables the sum is built during rounding, so it is timed as rounding
                 VECENGINE_PROF_START(t_round);
-                detail::quantize_lut(table.data(), m, lut.data(), scale, offset);
+                if (use_pre) detail::build_quantize_lut(B, C.data(), A, m, table.data(), lut.data(), scale, offset);
+                else detail::quantize_lut(table.data(), m, lut.data(), scale, offset);
                 VECENGINE_PROF_STOP(t_round, kProfLutRound);
             }
             VECENGINE_PROF_START(t_scan);
