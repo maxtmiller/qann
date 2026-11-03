@@ -46,8 +46,44 @@ MappedFile::MappedFile(const std::filesystem::path& path) {
     void* p = ::mmap(nullptr, size_, PROT_READ, MAP_SHARED, fd, 0);
     ::close(fd);
     if (p == MAP_FAILED) throw sys_error("map", path);
-    ::madvise(p, size_, MADV_RANDOM);
     data_ = static_cast<const char*>(p);
+}
+
+void MappedFile::advise_random(const char* begin, size_t bytes) const {
+    static const uintptr_t page = static_cast<uintptr_t>(::sysconf(_SC_PAGESIZE));
+    const uintptr_t start = reinterpret_cast<uintptr_t>(begin) & ~(page - 1);
+    ::madvise(reinterpret_cast<void*>(start), reinterpret_cast<uintptr_t>(begin) + bytes - start, MADV_RANDOM);
+}
+
+void write_pad(std::ostream& out, uint64_t align) {
+    // The pad is computed from the stream position, which is the file offset when
+    // saving to a file; a stream that can't report it (-1) gets no padding.
+    const auto pos = static_cast<int64_t>(out.tellp());
+    const uint64_t after = pos < 0 ? 0 : static_cast<uint64_t>(pos) + sizeof(uint32_t);
+    const auto pad = static_cast<uint32_t>(pos < 0 ? 0 : (align - after % align) % align);
+    write_pod(out, pad);
+    static const char zeros[4096] = {};
+    for (uint32_t left = pad; left > 0;) {
+        const uint32_t chunk = std::min<uint32_t>(left, sizeof(zeros));
+        out.write(zeros, chunk);
+        left -= chunk;
+    }
+}
+
+void read_pad(std::istream& in, uint64_t align) {
+    const auto pad = read_pod<uint32_t>(in);
+    if (pad >= align) throw std::runtime_error("corrupt file: invalid padding");
+    in.ignore(pad);
+    if (!in || in.gcount() != static_cast<std::streamsize>(pad)) throw std::runtime_error("truncated file");
+}
+
+const char* map_next(std::istream& in, const MappedFile& file, uint64_t bytes, size_t align) {
+    const auto offset = static_cast<int64_t>(in.tellg());
+    if (offset < 0 || static_cast<uint64_t>(offset) > file.size() || bytes > file.size() - static_cast<uint64_t>(offset))
+        throw std::runtime_error("truncated file");
+    if (static_cast<uint64_t>(offset) % align != 0) throw std::runtime_error("corrupt file: misaligned data");
+    in.seekg(static_cast<std::streamoff>(offset + static_cast<int64_t>(bytes)));
+    return file.data() + offset;
 }
 
 MappedFile::~MappedFile() {
@@ -89,19 +125,7 @@ void VectorStore::compact(span<const uint32_t> remap, size_t new_slots) {
 void VectorStore::save(std::ostream& out) const {
     const size_t n = slots();
     write_pod(out, static_cast<uint64_t>(n * dim_));
-
-    // The pad is computed from the stream position, which is the file offset when
-    // saving to a file; a stream that can't report it (-1) gets no padding.
-    const auto pos = static_cast<int64_t>(out.tellp());
-    const uint64_t after = pos < 0 ? 0 : static_cast<uint64_t>(pos) + sizeof(uint32_t);
-    const auto pad = static_cast<uint32_t>(pos < 0 ? 0 : (kRowAlign - after % kRowAlign) % kRowAlign);
-    write_pod(out, pad);
-    static const char zeros[4096] = {};
-    for (uint32_t left = pad; left > 0;) {
-        const uint32_t chunk = std::min<uint32_t>(left, sizeof(zeros));
-        out.write(zeros, chunk);
-        left -= chunk;
-    }
+    write_pad(out, kRowAlign);
 
     if (!mapped()) {
         out.write(reinterpret_cast<const char*>(owned_.data()), static_cast<std::streamsize>(n * dim_ * sizeof(float)));
@@ -117,27 +141,19 @@ VectorStore VectorStore::load(std::istream& in, uint32_t version, uint64_t slots
     const uint64_t len = read_pod<uint64_t>(in);
     if (len != slots * dim) throw std::runtime_error("corrupt file: unexpected number of vectors");
 
-    if (version >= 10) {
-        const auto pad = read_pod<uint32_t>(in);
-        if (pad >= kRowAlign) throw std::runtime_error("corrupt file: invalid vector padding");
-        in.ignore(pad);
-        if (!in || in.gcount() != static_cast<std::streamsize>(pad)) throw std::runtime_error("truncated file");
-    }
+    if (version >= 10) read_pad(in, kRowAlign);
 
     const bool map = ctx && ctx->file;
     if (map && version < 10)
         throw std::runtime_error("mmap needs a file saved in format 10 or later; load this one without mmap and save it again");
     if (map && len > 0) {
-        const auto offset = static_cast<int64_t>(in.tellg());
-        const MappedFile& file = *ctx->file;
-        if (offset < 0 || static_cast<uint64_t>(offset) > file.size() ||
-            len > (file.size() - static_cast<uint64_t>(offset)) / sizeof(float))
-            throw std::runtime_error("truncated file");
-        if (offset % alignof(float) != 0) throw std::runtime_error("corrupt file: misaligned vectors");
+        const uint64_t bytes = len * sizeof(float);
+        const char* rows = map_next(in, *ctx->file, bytes, alignof(float));
+        // re-ranking reads scattered rows, so readahead would only fetch rows nobody asked for
+        ctx->file->advise_random(rows, bytes);
         store.file_ = ctx->file;
-        store.mapped_ = reinterpret_cast<const float*>(file.data() + offset);
+        store.mapped_ = reinterpret_cast<const float*>(rows);
         store.mapped_rows_ = slots;
-        in.seekg(static_cast<std::streamoff>(offset + static_cast<int64_t>(len * sizeof(float))));
         return store;
     }
 

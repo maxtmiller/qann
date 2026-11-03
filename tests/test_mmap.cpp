@@ -1,4 +1,5 @@
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
 
 #include "vecengine/flat_index.hpp"
 #include "vecengine/hnsw_index.hpp"
@@ -11,6 +12,8 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -63,7 +66,13 @@ void require_same(const DenseIndex& a, const DenseIndex& b, const std::vector<fl
     }
     const auto ids = a.ids();
     REQUIRE(b.ids() == ids);
-    REQUIRE(b.get_vectors(ids) == a.get_vectors(ids));
+    if (a.stores_vectors()) REQUIRE(b.get_vectors(ids) == a.get_vectors(ids));
+}
+
+std::unique_ptr<IVFIndex> load_ivf(const fs::path& file, bool mmap) {
+    auto loaded = load_index(file, mmap);
+    REQUIRE(dynamic_cast<IVFIndex*>(loaded.get()) != nullptr);
+    return std::unique_ptr<IVFIndex>(static_cast<IVFIndex*>(loaded.release()));
 }
 
 } // namespace
@@ -184,4 +193,103 @@ TEST_CASE("VectorStore: rows start at a 64 KB file offset", "[mmap][serialize]")
         auto loaded = detail::VectorStore::load(in, detail::kFormatVersion, 5, 3, nullptr);
         REQUIRE(std::memcmp(loaded.row(4), rows.data() + 12, 3 * sizeof(float)) == 0);
     }
+}
+
+TEST_CASE("mmap: IVF float and SQ lists mapped match ones read into RAM", "[mmap][ivf][file]") {
+    TempDir dir;
+    const size_t n = 3000, more = 400, dim = 13, nq = 30, k = 10;   // odd dim: SQ4 rows end in half a byte
+    const auto data = random_vectors(n + more, dim, 41);
+    const auto queries = random_vectors(nq, dim, 42);
+    const fs::path file = dir.path / "ivf.qann";
+    const int bits = GENERATE(0, 8, 4);
+    CAPTURE(bits);
+    {
+        IVFIndex ivf(dim, 100, 12);
+        if (bits) ivf.enable_sq(bits);
+        ivf.train(std::span<const float>(data.data(), n * dim), n, 5, 1);
+        ivf.add_batch(std::span<const float>(data.data(), n * dim), n);
+        save_index(ivf, file);
+    }
+    auto in_ram = load_ivf(file, false);
+    auto mapped = load_ivf(file, true);
+    REQUIRE_FALSE(in_ram->mapped());
+    REQUIRE(mapped->mapped());
+    require_same(*in_ram, *mapped, queries, nq, k);
+
+    // rows added to the RAM tails, removals across mapped and added rows, compaction twice
+    auto apply = [&](IVFIndex& index) {
+        index.add_batch(std::span<const float>(data.data() + n * dim, more * dim), more);
+        std::vector<int64_t> gone;
+        for (int64_t id = 0; id < static_cast<int64_t>(n + more); id += 3) gone.push_back(id);
+        index.remove(gone);
+        index.compact();
+        index.add_batch(std::span<const float>(data.data(), 50 * dim), 50);
+        index.remove(std::vector<int64_t>{1, 2, 4, 5, 3200});
+        index.compact();
+    };
+    apply(*in_ram);
+    apply(*mapped);
+    REQUIRE(mapped->mapped());
+    require_same(*in_ram, *mapped, queries, nq, k);
+
+    SECTION("saving over the mapped file writes only live rows") {
+        save_index(*in_ram, dir.path / "compacted.qann");
+        save_index(*mapped, file);
+        auto bytes = [](const fs::path& p) {
+            std::ifstream f(p, std::ios::binary);
+            return std::string(std::istreambuf_iterator<char>(f), {});
+        };
+        REQUIRE(bytes(file) == bytes(dir.path / "compacted.qann"));   // identical to compacting in RAM
+        require_same(*in_ram, *mapped, queries, nq, k);
+        require_same(*in_ram, *load_ivf(file, true), queries, nq, k);
+        require_same(*in_ram, *load_ivf(file, false), queries, nq, k);
+    }
+
+    SECTION("compacting away every vector, then adding again") {
+        auto all = mapped->ids();
+        mapped->remove(all);
+        in_ram->remove(all);
+        mapped->compact();
+        in_ram->compact();
+        mapped->add_batch(std::span<const float>(data.data(), 200 * dim), 200);
+        in_ram->add_batch(std::span<const float>(data.data(), 200 * dim), 200);
+        require_same(*in_ram, *mapped, queries, nq, k);
+    }
+}
+
+TEST_CASE("mmap: an IVF float base under a RefineIndex maps both", "[mmap][ivf][refine][file]") {
+    TempDir dir;
+    const size_t n = 2000, dim = 16, nq = 20, k = 10;
+    const auto data = random_vectors(n, dim, 43);
+    const auto queries = random_vectors(nq, dim, 44);
+    const fs::path file = dir.path / "refine.qann";
+    {
+        IVFIndex ivf(dim, 100, 8);
+        ivf.train(data, n, 5, 1);
+        RefineIndex refine(ivf, 3);
+        refine.add_batch(data, n);
+        save_index(refine, file);
+    }
+    auto in_ram = load_refine(file, false);
+    auto mapped = load_refine(file, true);
+    REQUIRE(mapped->mapped());
+    REQUIRE(dynamic_cast<const IVFIndex&>(mapped->base()).mapped());
+    require_same(*in_ram, *mapped, queries, nq, k);
+}
+
+TEST_CASE("mmap: IVF lists the file can't map are read into RAM", "[mmap][ivf][file]") {
+    TempDir dir;
+    const size_t n = 1000, dim = 8;
+    const auto data = random_vectors(n, dim, 45);
+    const fs::path file = dir.path / "pq.qann";
+    IVFIndex ivf(dim, 100, 8);
+    ivf.enable_pq(4);
+    ivf.train(data, n, 5, 1);
+    ivf.add_batch(data, n);
+    save_index(ivf, file);
+    REQUIRE_FALSE(load_ivf(file, true)->mapped());   // PQ codes always stay in RAM
+
+    // before format 11 float lists had no padding; a pre-11 IVF file loads read in
+    const fs::path v1 = fs::path(QANN_TEST_DATA_DIR) / "v1_ivf_pq.qann";
+    REQUIRE_FALSE(load_ivf(v1, true)->mapped());
 }

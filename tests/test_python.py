@@ -183,6 +183,36 @@ def test_load_mmap(tmp_path, data):
     assert_same_results(index, qann.load(path, mmap=True), data[:50])
 
 
+@pytest.mark.parametrize("sq", [0, 8])
+def test_load_mmap_ivf_lists(tmp_path, data, sq):
+    index = qann.IVFIndex(32, nlist=100, nprobe=10)
+    if sq:
+        index.enable_sq(sq)
+    index.train(data, seed=1)
+    index.add(data, metadata={"group": np.arange(len(data)) % 3})
+    path = tmp_path / "ivf.qann"
+    index.save(path)
+
+    mapped = qann.load(path, mmap=True)
+    assert mapped.mapped and not index.mapped and not qann.load(path).mapped
+    assert_same_results(index, mapped, data[:50])
+    for i in range(3):
+        # a broad filter probes lists; a narrow one scores the allowed vectors directly
+        for kw in ({"where": "group = 1"}, {"allowed": np.arange(40)}):
+            np.testing.assert_array_equal(mapped.query(data[i], 10, **kw)[0], index.query(data[i], 10, **kw)[0])
+    if not sq:
+        np.testing.assert_array_equal(mapped.get_vectors([7, 3]), data[[7, 3]])
+
+    for i in (index, mapped):
+        i.add(data[:100])
+        i.remove(np.arange(0, len(data), 2))
+        i.compact()
+    assert mapped.mapped
+    assert_same_results(index, mapped, data[:50])
+    mapped.save(path)
+    assert_same_results(index, qann.load(path, mmap=True), data[:50])
+
+
 def test_load_mmap_needs_format_10():
     path = pathlib.Path(__file__).parent / "data" / "v9_refine_metadata.qann"
     assert qann.load(path).size() > 0
@@ -1626,6 +1656,19 @@ def test_loads_v10_refine_saved_on_macos(mmap):
     ids, dists = index.batch_query(np.load(DATA / "v10_queries.npy"), 10)
     np.testing.assert_array_equal(ids, np.load(DATA / "v10_refine_ids.npy"))
     np.testing.assert_allclose(dists, np.load(DATA / "v10_refine_dists.npy"), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mmap", [False, True])
+@pytest.mark.parametrize("name", ["ivf_float", "ivf_sq8"])
+def test_loads_v11_ivf_saved_on_macos(name, mmap):
+    # Saved on macOS (format version 11): IVF float and SQ8 lists (odd dim) with custom
+    # ids, compacted deletions, a second add and uncompacted deletions, each list's rows
+    # at a 64-byte offset, so Linux maps a file written on another platform.
+    index = qann.load(DATA / f"v11_{name}.qann", mmap=mmap)
+    assert index.mapped == mmap and index.size() == 1185
+    ids, dists = index.batch_query(np.load(DATA / "v11_queries.npy"), 10)
+    np.testing.assert_array_equal(ids, np.load(DATA / f"v11_{name}_ids.npy"))
+    np.testing.assert_allclose(dists, np.load(DATA / f"v11_{name}_dists.npy"), rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("name", ["flat", "hnsw_sq8", "refine_ivf_fs"])

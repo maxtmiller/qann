@@ -55,10 +55,11 @@ std::unique_ptr<IndexBase> load_index(std::istream& in);
 void save_index(const IndexBase& index, const std::filesystem::path& path);
 
 // Loads an index saved by save_index. Every problem with the file's contents
-// is reported as std::runtime_error. With mmap, a RefineIndex's raw vectors
-// (also inside a HybridIndex) stay in the file and are paged in as queries
-// touch them; the file must then stay in place, untruncated, while the index
-// lives, and must have been saved in format 10 or later.
+// is reported as std::runtime_error. With mmap, a RefineIndex's raw vectors and
+// an IVFIndex's float and SQ lists (also nested in a RefineIndex or HybridIndex)
+// stay in the file and are paged in as queries touch them; the file must then
+// stay in place, untruncated, while the index lives. A RefineIndex needs format
+// 10 or later to map; IVF lists from before format 11 are read into RAM.
 std::unique_ptr<IndexBase> load_index(const std::filesystem::path& path, bool mmap = false);
 
 } // namespace vecengine

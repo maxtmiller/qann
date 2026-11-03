@@ -4,6 +4,7 @@
 #include "vecengine/pq.hpp"
 #include "vecengine/id_map.hpp"
 #include "vecengine/sq.hpp"
+#include "vecengine/vector_store.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -23,10 +24,23 @@ using std::span;
 
 // The vectors assigned to one coarse cluster.
 struct InvertedList {
-    vector<uint32_t> ids; // slot of each vector; id_map_ maps slots to user ids
+    vector<uint32_t> ids; // slot of each vector; id_map_ maps slots to user ids. In a mapped list,
+                          // compaction marks removed vectors detail::IdMap::kRemoved instead of moving rows.
     vector<float> vecs; // populated without PQ or SQ
     vector<uint8_t> codes; // with PQ: num_subspaces bytes per vector, encoding (vec - its cluster's coarse centroid);
                            // with SQ: each vector's SQ codes (detail::SQ::code_bytes() per vector)
+    // Float or SQ lists loaded with mmap: rows [0, mapped_rows) are in the mapped file
+    // here, and vecs / codes hold only the rows added since.
+    const char* mapped = nullptr;
+    size_t mapped_rows = 0;
+
+    // Row j of a float list (dim floats) or of an SQ list (w bytes), wherever it lives.
+    const float* vec(size_t j, size_t dim) const noexcept {
+        return j < mapped_rows ? reinterpret_cast<const float*>(mapped) + j * dim : vecs.data() + (j - mapped_rows) * dim;
+    }
+    const uint8_t* code(size_t j, size_t w) const noexcept {
+        return j < mapped_rows ? reinterpret_cast<const uint8_t*>(mapped) + j * w : codes.data() + (j - mapped_rows) * w;
+    }
 };
 
 // Inverted-file index: k-means splits vectors into nlist clusters, and a
@@ -114,8 +128,13 @@ public:
     void save(std::ostream& out) const override;
 
     // Rebuilds an IVFIndex from the body save() wrote, after load_index() has
-    // read the header. Throws std::runtime_error on corrupt data.
-    static std::unique_ptr<IVFIndex> load_body(std::istream& in, uint32_t version);
+    // read the header. With ctx->file set, float and SQ lists are mapped from that
+    // file instead of read (PQ codes are always read). Throws std::runtime_error on corrupt data.
+    static std::unique_ptr<IVFIndex> load_body(std::istream& in, uint32_t version,
+                                               const detail::LoadContext* ctx = nullptr);
+
+    // Whether some lists are read from the loaded file rather than held in RAM.
+    bool mapped() const noexcept { return file_ != nullptr; }
 
     size_t slots() const noexcept override { return id_map_.slots(); }
     bool custom_ids() const noexcept override { return id_map_.custom_ids(); }
@@ -132,7 +151,7 @@ private:
     vector<Neighbor> query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const override;
     // Through slot_list_ / slot_pos_, which float lists always have.
     const float* stored_vector(uint32_t slot) const override {
-        return data_.at(slot_list_[slot]).vecs.data() + size_t{slot_pos_[slot]} * dim_;
+        return data_.at(slot_list_[slot]).vec(slot_pos_[slot], dim_);
     }
     vector<vector<Neighbor>> query_batch_impl(span<const float> queries, size_t num_queries, size_t k,
                                               const detail::SlotFilter* filter) const override;
@@ -242,6 +261,7 @@ private:
     // SQ only (empty with PQ), not saved but rebuilt on load and compact
     vector<uint16_t> slot_list_;
     vector<uint32_t> slot_pos_;
+    std::shared_ptr<const detail::MappedFile> file_; // set when lists were mapped on load
 };
 
 } // namespace vecengine

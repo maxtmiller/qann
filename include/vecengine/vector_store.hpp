@@ -14,8 +14,8 @@ using std::size_t;
 using std::span;
 using std::vector;
 
-// A whole file mapped read-only, with random-access advice (no readahead).
-// Unmapped when the last owner releases it. The file must not be truncated
+// A whole file mapped read-only, with the kernel's default readahead. Unmapped
+// when the last owner releases it. The file must not be truncated
 // while mapped; replacing it by rename (as save_index does) is safe.
 class MappedFile {
 public:
@@ -28,6 +28,9 @@ public:
     const char* data() const noexcept { return data_; }
     size_t size() const noexcept { return size_; }
 
+    // Turns readahead off (MADV_RANDOM) for the pages of [begin, begin + bytes), within the map.
+    void advise_random(const char* begin, size_t bytes) const;
+
 private:
     const char* data_ = nullptr;
     size_t size_ = 0;
@@ -39,6 +42,18 @@ private:
 struct LoadContext {
     std::shared_ptr<const MappedFile> file;
 };
+
+// Writes a u32 pad length and that many zero bytes, so the stream position (the
+// file offset when saving to a file) becomes a multiple of align.
+void write_pad(std::ostream& out, uint64_t align);
+
+// Skips what write_pad wrote; throws std::runtime_error if the pad is >= align or truncated.
+void read_pad(std::istream& in, uint64_t align);
+
+// The next `bytes` of `in`, which must be reading `file`, as a pointer into the map; seeks
+// past them. Throws std::runtime_error if they run past the file or the offset isn't a
+// multiple of align.
+const char* map_next(std::istream& in, const MappedFile& file, uint64_t bytes, size_t align);
 
 // A RefineIndex's raw vectors, one row of dim floats per slot. Rows live in
 // RAM, or, for an index loaded with mmap, in the mapped file plus a RAM tail

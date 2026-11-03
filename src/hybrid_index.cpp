@@ -193,7 +193,7 @@ std::unique_ptr<HybridIndex> HybridIndex::load_body(std::istream& in, uint32_t v
     std::unique_ptr<DenseIndex> dense;
     switch (header.kind) {
         case IndexKind::Flat: dense = FlatIndex::load_body(in, version); break;
-        case IndexKind::IVF: dense = IVFIndex::load_body(in, version); break;
+        case IndexKind::IVF: dense = IVFIndex::load_body(in, version, ctx); break;
         case IndexKind::HNSW: dense = HNSWIndex::load_body(in, version); break;
         case IndexKind::Refine: dense = RefineIndex::load_body(in, version, ctx); break;
         default: throw std::runtime_error("corrupt file: a HybridIndex's dense index must be Flat, IVF, HNSW or Refine");
