@@ -251,6 +251,7 @@ TEST_CASE("mmap: IVF float and SQ lists mapped match ones read into RAM", "[mmap
         in_ram->remove(all);
         mapped->compact();
         in_ram->compact();
+        REQUIRE_FALSE(mapped->mapped());   // no list points into the file any more
         mapped->add_batch(std::span<const float>(data.data(), 200 * dim), 200);
         in_ram->add_batch(std::span<const float>(data.data(), 200 * dim), 200);
         require_same(*in_ram, *mapped, queries, nq, k);

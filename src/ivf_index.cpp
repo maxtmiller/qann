@@ -678,7 +678,8 @@ void IVFIndex::compact_storage(const vector<uint32_t>& remap) {
             list.vecs.shrink_to_fit();
         }
     }
-    
+    if (file_ && std::none_of(data_.begin(), data_.end(), [](const auto& entry) { return entry.second.mapped != nullptr; }))
+        file_.reset();
 }
 
 void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_iters, std::optional<uint32_t> seed) {
@@ -763,12 +764,23 @@ void IVFIndex::save(std::ostream& out) const {
             continue;
         }
         // float and SQ rows (version 11) start at a 64-byte offset, so a load with mmap can point
-        // into the file; a mapped list writes only its live rows, which compacts it
+        // into the file
+        const size_t per_row = sq_bits_ ? row_bytes : dim_;   // elements per row in the stored count
+        if (!list.mapped) {
+            write_vec(out, list.ids);
+            write_pod(out, static_cast<uint64_t>(list.ids.size() * per_row));
+            write_pad(out, kListAlign);
+            const char* rows = sq_bits_ ? reinterpret_cast<const char*>(list.codes.data())
+                                        : reinterpret_cast<const char*>(list.vecs.data());
+            out.write(rows, static_cast<std::streamsize>(list.ids.size() * row_bytes));
+            continue;
+        }
+        // a mapped list writes only its live rows (compaction only marked the removed ones)
         vector<uint32_t> live;
         for (uint32_t slot : list.ids)
             if (slot != IdMap::kRemoved) live.push_back(slot);
         write_vec(out, live);
-        write_pod(out, static_cast<uint64_t>(live.size() * row_bytes / (sq_bits_ ? 1 : sizeof(float))));
+        write_pod(out, static_cast<uint64_t>(live.size() * per_row));
         write_pad(out, kListAlign);
         for (size_t j = 0; j < list.ids.size(); ++j) {
             if (list.ids[j] == IdMap::kRemoved) continue;
