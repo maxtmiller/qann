@@ -9,7 +9,6 @@
 
 #include <algorithm>
 #include <cerrno>
-#include <cstdlib>
 #include <cstring>
 #include <istream>
 #include <ostream>
@@ -65,20 +64,6 @@ void VectorStore::append(span<const float> vecs) {
         for (size_t r = 0; r < vecs.size() / dim_; ++r) table_.push_back(static_cast<uint32_t>(first + r));
     }
     owned_.insert(owned_.end(), vecs.begin(), vecs.end());
-}
-
-void VectorStore::will_need(span<const Neighbor> slots) const {
-    // TEMPORARY (#58 measurement, remove before merging): QANN_NO_WILLNEED turns the hint off.
-    static const bool off = std::getenv("QANN_NO_WILLNEED") != nullptr;
-    if (!mapped() || off) return;
-    static const uintptr_t page = static_cast<uintptr_t>(::sysconf(_SC_PAGESIZE));
-    for (const Neighbor& n : slots) {
-        const size_t r = table_.empty() ? n.index : table_[n.index];
-        if (r >= mapped_rows_) continue;
-        const auto begin = reinterpret_cast<uintptr_t>(mapped_ + r * dim_);
-        const uintptr_t start = begin & ~(page - 1);
-        ::madvise(reinterpret_cast<void*>(start), begin + dim_ * sizeof(float) - start, MADV_WILLNEED);
-    }
 }
 
 void VectorStore::compact(span<const uint32_t> remap, size_t new_slots) {

@@ -392,7 +392,15 @@ It only helps when `base` ranks with approximate distances (IVF + PQ). `k_factor
 **Raw vectors (`VectorStore`, issue #58 phase 1).** The raw copy is what makes IVF + PQ + re-ranking use more memory than plain IVF (30.7 GB at 10M x 768), so `load_index(path, mmap=true)` (`qann.load(path, mmap=True)`) can leave it in the file:
 - **`MappedFile`** maps the whole file read-only with `MADV_RANDOM` (no readahead: candidates are scattered). Everything else is still read through the stream into RAM; only the RefineIndex's rows, also inside a HybridIndex, point into the map (`LoadContext` carries it through `load_body`). The map is shared by the store and unmapped with the index. Rows are paged in from the page cache as queries touch them, so the process's own memory is the base, ids and metadata.
 - **Rows** live in the map for loaded slots and in a RAM tail (`owned_`) for slots added since; `row(slot)` picks one. An index built in RAM has only the tail, so it behaves as before.
-- **Re-ranking** first calls `will_need`: one `MADV_WILLNEED` per mapped candidate row, so a cold query waits for one batch of parallel reads rather than `k * k_factor` faults in a row.
+- **Measured** (`benchmarks/refine_mmap.py`; x86 VM with a network-attached block volume, 1M x 384, IVF fast-scan base, one thread):
+  - Loading takes 0.1 s and 93 MB RSS mapped, against 0.89 s and 1,568 MB read in.
+  - With a warm page cache, mapped queries match RAM: 360 vs 361 µs at `k_factor` 10, 491 vs 498 µs at 50.
+  - From a cold cache each query faults its `k * k_factor` candidate rows in one at a time: 35 ms at `k_factor` 10, 144 ms at 50, about 340 µs per row.
+- **Tried and dropped: `MADV_WILLNEED` on the candidates' pages before re-ranking.** Cold queries were only 1.3x faster (26 and 109 ms), since the kernel overlapped few of the reads. It cost one `madvise` per candidate on every query, so warm queries were 24% slower at `k_factor` 10 and 74% slower at 50 (446 and 853 µs); on the M3 it also cut all-thread batch throughput by about 9x.
+- **Not yet: reading the candidates in parallel (#121).** A cold re-rank is a known set of `k * k_factor` independent rows, so a disk that serves dozens of reads at once could return them all in about one read's time instead of one after another.
+  - Issue them together: `pread` into a per-query buffer from a small thread pool, or one `io_uring` submission on Linux. Only candidates whose pages aren't resident need reading; `mincore` can tell, though it is also a system call per range.
+  - Score from that buffer: the scoring code takes row pointers, so only `VectorStore` changes.
+  - The cost to beat is the warm path's zero system calls: a warm query must not pay for the cold path, which is where `MADV_WILLNEED` failed.
 - **Compaction** can't move mapped rows, so it rewrites a slot -> row table (`table_`, 4 B per slot) instead; removed rows stay in the file, costing disk but not RAM, until the next save, which writes the live rows in slot order and so needs no table on reload. Compacting away every row drops the mapping.
 - **Saving over the mapped file** is safe: `save_index` renames a new file into place and the old one stays mapped until the index goes. Truncating the file in place while it is mapped is not (the next read of a lost page is a `SIGBUS`).
 

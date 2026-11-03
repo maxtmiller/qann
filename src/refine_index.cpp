@@ -113,7 +113,6 @@ vector<Neighbor> RefineIndex::rerank(span<const float> vec, const vector<Neighbo
     vector<pair<float, size_t>> candidates;
     candidates.reserve(candidatesRaw.size());
     const size_t d = dim();
-    data_.will_need(candidatesRaw);
 
     for (size_t i = 0; i < candidatesRaw.size(); ++i) {
         constexpr size_t kAhead = 8;   // how many candidates ahead to prefetch

@@ -1,5 +1,5 @@
 """RefineIndex with mapped raw vectors (qann.load(path, mmap=True), issue #58): cold and warm
-page cache, with and without the MADV_WILLNEED hint, against the index read into RAM.
+page cache, against the index read into RAM.
 
 Linux only: the cold runs evict the file from the page cache with posix_fadvise(DONTNEED),
 which needs no root. Mapped pages can't be evicted, so every cold run starts from a fresh load.
@@ -10,7 +10,6 @@ which needs no root. Mapped pages can't be evicted, so every cold run starts fro
 import argparse
 import os
 import pathlib
-import subprocess
 import sys
 import time
 
@@ -73,7 +72,6 @@ def fmt(us):
 
 
 def measure(args):
-    """One mode (the WILLNEED env var is read once per process, so each mode is its own process)."""
     q = np.load(args.file.with_suffix(".queries.npy"))
     cold_q = q[:args.cold_queries]
     for kf in args.k_factors:
@@ -86,7 +84,7 @@ def measure(args):
             index.k_factor = kf
             qann.set_num_threads(1)
             cold = latencies(index, cold_q, args.k)
-            print(f"{args.mode:>8}  kf {kf:3}  cold #{trial}  {fmt(cold)}   load {load_s:5.2f} s, RSS {rss:6.0f} MB", flush=True)
+            print(f"  mapped  kf {kf:3}  cold #{trial}  {fmt(cold)}   load {load_s:5.2f} s, RSS {rss:6.0f} MB", flush=True)
             del index
 
         evict(args.file)
@@ -95,11 +93,11 @@ def measure(args):
         qann.set_num_threads(0)
         t = time.perf_counter()
         index.batch_query(q, args.k)
-        print(f"{args.mode:>8}  kf {kf:3}  cold batch, all threads: {len(q) / (time.perf_counter() - t):8.0f} QPS", flush=True)
+        print(f"  mapped  kf {kf:3}  cold batch, all threads: {len(q) / (time.perf_counter() - t):8.0f} QPS", flush=True)
         qann.set_num_threads(1)
         latencies(index, q, args.k)
         warm = latencies(index, q, args.k)
-        print(f"{args.mode:>8}  kf {kf:3}  warm     {fmt(warm)}   ({1e6 / warm.mean():.0f} QPS), RSS {rss_mb():6.0f} MB",
+        print(f"  mapped  kf {kf:3}  warm     {fmt(warm)}   ({1e6 / warm.mean():.0f} QPS), RSS {rss_mb():6.0f} MB",
               flush=True)
 
 
@@ -131,23 +129,14 @@ def main():
     ap.add_argument("--trials", type=int, default=3)
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--k-factors", type=int, nargs="+", default=[10, 50])
-    ap.add_argument("--mode", choices=["hint", "no-hint"], help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     if sys.platform != "linux":
         sys.exit("cold runs need Linux (posix_fadvise DONTNEED)")
-    if args.mode:
-        measure(args)
-        return
     if not args.file.exists():
         build(args)
     reference(args)
-    for mode in ("hint", "no-hint"):
-        env = dict(os.environ)
-        env.pop("QANN_NO_WILLNEED", None)
-        if mode == "no-hint":
-            env["QANN_NO_WILLNEED"] = "1"
-        subprocess.run([sys.executable, *sys.argv, "--mode", mode], env=env, check=True)
+    measure(args)
 
 
 if __name__ == "__main__":

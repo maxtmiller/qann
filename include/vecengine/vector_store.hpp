@@ -1,7 +1,5 @@
 #pragma once
 
-#include "vecengine/index.hpp"
-
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -62,11 +60,6 @@ public:
 
     // Appends rows (vecs.size() a multiple of dim) as the next slots.
     void append(span<const float> vecs);
-
-    // Asks the OS to start reading the mapped rows of these slots (MADV_WILLNEED),
-    // so a cold re-rank waits for one batch of parallel reads instead of one per row.
-    // No-op unless mapped.
-    void will_need(span<const Neighbor> slots) const;
 
     // remap as returned by IdMap::compact: each old slot's new slot, or IdMap::kRemoved.
     // In RAM rows are moved down; mapped, only the slot -> row table changes and
