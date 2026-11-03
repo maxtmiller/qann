@@ -92,7 +92,8 @@ static inline float hmax_ps(__m128 v) {
 
 #if defined(__AVX2__)
 // Lane r of the result is op over the 8 lanes of v[r]: a transposing tree of 7
-// ops and 8 shuffles for 8 rows, against 2 ops and 4 shuffles per row one at a time.
+// ops and 14 shuffles (2 of them across 128-bit lanes) for 8 rows, against 3 ops and
+// 3 shuffles per row (one across lanes) reducing each row on its own.
 // min and max are exact, so the grouping doesn't change any result.
 template <class Op>
 static inline __m256 reduce8_ps(const __m256* v, Op op) {
