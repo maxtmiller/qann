@@ -347,7 +347,8 @@ TEST_CASE("fast-scan settings are validated", "[fastscan][ivf]") {
 }
 
 TEST_CASE("quantize_lut matches the scalar version exactly", "[fastscan]") {
-    const size_t m = GENERATE(2, 6, 16, 64, 196, 256, 480, 1024);
+    // 2 and 6 are below one 8-row group of the AVX2 version, 10 and 14 end in a partial group
+    const size_t m = GENERATE(2, 6, 10, 14, 16, 64, 196, 256, 392, 480, 1024);
     CAPTURE(m);
     std::mt19937 rng(static_cast<unsigned>(m) + 100);
     std::uniform_real_distribution<float> d(-3000.0f, 3000.0f);
@@ -364,6 +365,30 @@ TEST_CASE("quantize_lut matches the scalar version exactly", "[fastscan]") {
     float sa = 0, oa = 0, sb = 0, ob = 0;
     quantize_lut(table.data(), m, a.data(), sa, oa);
     quantize_lut_scalar(table.data(), m, b.data(), sb, ob);
+    REQUIRE(a == b);
+    REQUIRE(sa == sb);
+    REQUIRE(oa == ob);
+}
+
+TEST_CASE("build_quantize_lut matches summing the table, then the scalar quantize_lut", "[fastscan]") {
+    const size_t m = GENERATE(2, 6, 10, 14, 64, 196, 392, 1024);
+    CAPTURE(m);
+    std::mt19937 rng(static_cast<unsigned>(m) + 200);
+    std::uniform_real_distribution<float> d(-3000.0f, 3000.0f);
+    std::vector<float> B(m * 16), C(m * 16);
+    for (auto& x : B) x = d(rng);
+    for (auto& x : C) x = d(rng);
+    const float A = GENERATE(0.0f, 1234.5f, -800.25f);
+
+    std::vector<float> want(m * 16);
+    for (size_t t = 0; t < m * 16; ++t) want[t] = B[t] + C[t];
+    for (size_t j = 0; j < 16; ++j) want[j] += A;
+    std::vector<uint8_t> a(m * 16), b(m * 16);
+    std::vector<float> table(m * 16);
+    float sa = 0, oa = 0, sb = 0, ob = 0;
+    build_quantize_lut(B.data(), C.data(), A, m, table.data(), a.data(), sa, oa);
+    quantize_lut_scalar(want.data(), m, b.data(), sb, ob);
+    REQUIRE(table == want);
     REQUIRE(a == b);
     REQUIRE(sa == sb);
     REQUIRE(oa == ob);

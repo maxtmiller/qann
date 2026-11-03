@@ -91,15 +91,49 @@ static inline float hmax_ps(__m128 v) {
 #endif
 
 #if defined(__AVX2__)
-// quantize_lut_scalar's arithmetic, 8 floats per instruction (a row is two
-// registers). cvtps rounds half to even in the default MXCSR mode, like
-// std::nearbyint.
-static void quantize_lut_avx2(const float* table, size_t m, uint8_t* lut, float& scale, float& offset) {
-    float row_min[kFsMaxSubspaces];
-    float widest = 0.0f, part[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    for (size_t i = 0; i < m; ++i) {
-        const float* row = table + i * 16;
-        const __m256 a = _mm256_loadu_ps(row), b = _mm256_loadu_ps(row + 8);
+// Lane r of the result is op over the 8 lanes of v[r]: a transposing tree of 7
+// ops and 8 shuffles for 8 rows, against 2 ops and 4 shuffles per row one at a time.
+// min and max are exact, so the grouping doesn't change any result.
+template <class Op>
+static inline __m256 reduce8_ps(const __m256* v, Op op) {
+    __m256 t[4];
+    for (int k = 0; k < 4; ++k)
+        t[k] = op(_mm256_unpacklo_ps(v[2 * k], v[2 * k + 1]), _mm256_unpackhi_ps(v[2 * k], v[2 * k + 1]));
+    const __m256 u0 = op(_mm256_shuffle_ps(t[0], t[1], _MM_SHUFFLE(1, 0, 1, 0)), _mm256_shuffle_ps(t[0], t[1], _MM_SHUFFLE(3, 2, 3, 2)));
+    const __m256 u1 = op(_mm256_shuffle_ps(t[2], t[3], _MM_SHUFFLE(1, 0, 1, 0)), _mm256_shuffle_ps(t[2], t[3], _MM_SHUFFLE(3, 2, 3, 2)));
+    return op(_mm256_permute2f128_ps(u0, u1, 0x20), _mm256_permute2f128_ps(u0, u1, 0x31));
+}
+
+// quantize_lut_scalar's first pass: each row's minimum, the widest row span and
+// the offset, 8 rows at a time. load(i, a, b) gives row i's two halves. The
+// partial sums take rows in the same order as the scalar version's part[i % 4].
+template <class Load>
+static void lut_ranges_avx2(size_t m, Load load, float* row_min, float& widest, float& offset) {
+    const auto vmin = [](__m256 x, __m256 y) { return _mm256_min_ps(x, y); };
+    const auto vmax = [](__m256 x, __m256 y) { return _mm256_max_ps(x, y); };
+    __m256 wide8 = _mm256_setzero_ps();
+    __m128 part4 = _mm_setzero_ps();
+    size_t i = 0;
+    for (; i + 8 <= m; i += 8) {
+        __m256 lo[8], hi[8];
+        for (size_t r = 0; r < 8; ++r) {
+            __m256 a, b;
+            load(i + r, a, b);
+            lo[r] = _mm256_min_ps(a, b);
+            hi[r] = _mm256_max_ps(a, b);
+        }
+        const __m256 rlo = reduce8_ps(lo, vmin), rhi = reduce8_ps(hi, vmax);
+        _mm256_storeu_ps(row_min + i, rlo);
+        wide8 = _mm256_max_ps(wide8, _mm256_sub_ps(rhi, rlo));
+        part4 = _mm_add_ps(part4, _mm256_castps256_ps128(rlo));
+        part4 = _mm_add_ps(part4, _mm256_extractf128_ps(rlo, 1));
+    }
+    float part[4];
+    _mm_storeu_ps(part, part4);
+    widest = hmax_ps(_mm_max_ps(_mm256_castps256_ps128(wide8), _mm256_extractf128_ps(wide8, 1)));
+    for (; i < m; ++i) {
+        __m256 a, b;
+        load(i, a, b);
         const __m256 lo8 = _mm256_min_ps(a, b), hi8 = _mm256_max_ps(a, b);
         const float lo = hmin_ps(_mm_min_ps(_mm256_castps256_ps128(lo8), _mm256_extractf128_ps(lo8, 1)));
         const float hi = hmax_ps(_mm_max_ps(_mm256_castps256_ps128(hi8), _mm256_extractf128_ps(hi8, 1)));
@@ -108,9 +142,12 @@ static void quantize_lut_avx2(const float* table, size_t m, uint8_t* lut, float&
         widest = std::max(widest, hi - lo);
     }
     offset = sum_partials(part);
-    scale = widest > 0.0f ? kLutMax / widest : 1.0f;
-    const __m256 vscale = _mm256_set1_ps(scale);
+}
 
+// quantize_lut_scalar's second pass, 8 floats per instruction. cvtps rounds half
+// to even in the default MXCSR mode, like std::nearbyint.
+static void lut_round_avx2(const float* table, size_t m, const float* row_min, float scale, uint8_t* lut) {
+    const __m256 vscale = _mm256_set1_ps(scale);
     for (size_t i = 0; i < m; ++i) {
         const float* row = table + i * 16;
         const __m256 vmin = _mm256_set1_ps(row_min[i]);
@@ -121,6 +158,36 @@ static void quantize_lut_avx2(const float* table, size_t m, uint8_t* lut, float&
         const __m128i hi16 = _mm_packs_epi32(_mm256_castsi256_si128(q1), _mm256_extracti128_si256(q1, 1));
         _mm_storeu_si128(reinterpret_cast<__m128i*>(lut + i * 16), _mm_packus_epi16(lo16, hi16));
     }
+}
+
+static void quantize_lut_avx2(const float* table, size_t m, uint8_t* lut, float& scale, float& offset) {
+    float row_min[kFsMaxSubspaces], widest;
+    lut_ranges_avx2(m, [&](size_t i, __m256& a, __m256& b) {
+        a = _mm256_loadu_ps(table + i * 16);
+        b = _mm256_loadu_ps(table + i * 16 + 8);
+    }, row_min, widest, offset);
+    scale = widest > 0.0f ? kLutMax / widest : 1.0f;
+    lut_round_avx2(table, m, row_min, scale, lut);
+}
+
+// Sums each row as the first pass reads it, so the table is read once less.
+static void build_quantize_lut_avx2(const float* B, const float* C, float A, size_t m, float* table, uint8_t* lut,
+                                    float& scale, float& offset) {
+    float row_min[kFsMaxSubspaces], widest;
+    const __m256 vA = _mm256_set1_ps(A);
+    lut_ranges_avx2(m, [&](size_t i, __m256& a, __m256& b) {
+        const size_t t = i * 16;
+        a = _mm256_add_ps(_mm256_loadu_ps(B + t), _mm256_loadu_ps(C + t));
+        b = _mm256_add_ps(_mm256_loadu_ps(B + t + 8), _mm256_loadu_ps(C + t + 8));
+        if (i == 0) {
+            a = _mm256_add_ps(a, vA);
+            b = _mm256_add_ps(b, vA);
+        }
+        _mm256_storeu_ps(table + t, a);
+        _mm256_storeu_ps(table + t + 8, b);
+    }, row_min, widest, offset);
+    scale = widest > 0.0f ? kLutMax / widest : 1.0f;
+    lut_round_avx2(table, m, row_min, scale, lut);
 }
 #elif defined(__SSSE3__)
 // Same arithmetic as quantize_lut_scalar, 4 floats per instruction. cvtps
@@ -170,6 +237,19 @@ void quantize_lut(const float* table, size_t m, uint8_t* lut, float& scale, floa
     }
 #endif
     quantize_lut_scalar(table, m, lut, scale, offset);
+}
+
+void build_quantize_lut(const float* B, const float* C, float A, size_t m, float* table, uint8_t* lut, float& scale,
+                        float& offset) {
+#if defined(__AVX2__)
+    if (m <= kFsMaxSubspaces) {
+        build_quantize_lut_avx2(B, C, A, m, table, lut, scale, offset);
+        return;
+    }
+#endif
+    for (size_t t = 0; t < m * 16; ++t) table[t] = B[t] + C[t];
+    for (size_t j = 0; j < 16; ++j) table[j] += A;
+    quantize_lut(table, m, lut, scale, offset);
 }
 
 void fast_scan_block_scalar(const uint8_t* lut, const uint8_t* block, size_t m, uint16_t* out) {

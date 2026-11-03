@@ -50,6 +50,12 @@ inline constexpr size_t kFsMaxSubspaces = 1024;
 // constant gets scale 1.
 void quantize_lut(const float* table, size_t m, uint8_t* lut, float& scale, float& offset);
 
+// An IVF list's fast-scan table from precomputed parts, rounded: table[t] = B[t] + C[t],
+// plus A on the first row, then quantize_lut(table, ...). Identical results to the two
+// steps; on AVX2 the sum is taken in quantize_lut's first pass, saving a read of the table.
+void build_quantize_lut(const float* B, const float* C, float A, size_t m, float* table, uint8_t* lut, float& scale,
+                        float& offset);
+
 // Portable version of quantize_lut; the NEON and SSE versions must match it exactly.
 void quantize_lut_scalar(const float* table, size_t m, uint8_t* lut, float& scale, float& offset);
 
