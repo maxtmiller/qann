@@ -2,6 +2,7 @@
 
 #include "vecengine/index.hpp"
 #include "vecengine/id_map.hpp"
+#include "vecengine/vector_store.hpp"
 
 #include <cstddef>
 #include <vector>
@@ -53,9 +54,14 @@ public:
     // Writes this index's header and fields with the base nested inside.
     void save(std::ostream& out) const override;
 
-    // Rebuilds a RefineIndex, and the Flat or IVF base nested in it, from the
-    // body save() wrote. Throws std::runtime_error on corrupt data.
-    static std::unique_ptr<RefineIndex> load_body(std::istream& in, uint32_t version);
+    // Rebuilds a RefineIndex, and the Flat, IVF or HNSW base nested in it, from the
+    // body save() wrote. With ctx->file set the raw vectors are mapped from that
+    // file instead of read. Throws std::runtime_error on corrupt data.
+    static std::unique_ptr<RefineIndex> load_body(std::istream& in, uint32_t version,
+                                                  const detail::LoadContext* ctx = nullptr);
+
+    // Whether the raw vectors are mapped from the loaded file rather than held in RAM.
+    bool mapped() const noexcept { return data_.mapped(); }
 
     size_t size() const noexcept override { return id_map_.live(); }
     size_t dim() const noexcept override { return base_.dim(); }
@@ -79,7 +85,7 @@ private:
     // passed to the base's *_impl so they are prepared only once.
     void add_batch_impl(span<const float> vecs, size_t n, const int64_t* ids) override;
     vector<Neighbor> query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const override;
-    const float* stored_vector(uint32_t slot) const override { return data_.data() + size_t{slot} * dim(); }
+    const float* stored_vector(uint32_t slot) const override { return data_.row(slot); }
     vector<vector<Neighbor>> query_batch_impl(span<const float> queries, size_t num_queries, size_t k,
                                               const detail::SlotFilter* filter) const override;
     const detail::IdMap& id_map() const noexcept override { return id_map_; }
@@ -108,14 +114,15 @@ private:
     // Used by load_body(): takes ownership of an already filled base and skips
     // the public constructor's empty-base check.
     RefineIndex(std::unique_ptr<DenseIndex> base, size_t k_factor)
-        : DenseIndex(base->metric()), owned_base_(std::move(base)), base_(*owned_base_), k_factor_(k_factor) {
+        : DenseIndex(base->metric()), owned_base_(std::move(base)), base_(*owned_base_), k_factor_(k_factor),
+          data_(base_.dim()) {
         base_.wrapped_ = true;
     }
 
     std::unique_ptr<DenseIndex> owned_base_; // set on file load; nullptr when wrapping a caller-owned base.
     DenseIndex& base_; // approximate first-stage index
     size_t k_factor_; // candidates fetched per result: k * k_factor
-    vector<float> data_; // raw vectors, row-major: id_map_.slots() * dim
+    detail::VectorStore data_; // raw vectors, one row per slot
     detail::IdMap id_map_;
 };
 

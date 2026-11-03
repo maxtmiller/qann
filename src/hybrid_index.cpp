@@ -177,7 +177,7 @@ void HybridIndex::save(std::ostream& out) const {
     metadata_.save(out);
 }
 
-std::unique_ptr<HybridIndex> HybridIndex::load_body(std::istream& in, uint32_t version) {
+std::unique_ptr<HybridIndex> HybridIndex::load_body(std::istream& in, uint32_t version, const detail::LoadContext* ctx) {
     using namespace detail;
     const auto method = read_pod<uint8_t>(in);
     const auto w_dense = read_pod<float>(in), w_sparse = read_pod<float>(in), rrf_k = read_pod<float>(in);
@@ -195,7 +195,7 @@ std::unique_ptr<HybridIndex> HybridIndex::load_body(std::istream& in, uint32_t v
         case IndexKind::Flat: dense = FlatIndex::load_body(in, version); break;
         case IndexKind::IVF: dense = IVFIndex::load_body(in, version); break;
         case IndexKind::HNSW: dense = HNSWIndex::load_body(in, version); break;
-        case IndexKind::Refine: dense = RefineIndex::load_body(in, version); break;
+        case IndexKind::Refine: dense = RefineIndex::load_body(in, version, ctx); break;
         default: throw std::runtime_error("corrupt file: a HybridIndex's dense index must be Flat, IVF, HNSW or Refine");
     }
     header = read_header(in);

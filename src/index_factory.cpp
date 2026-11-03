@@ -43,19 +43,25 @@ std::unique_ptr<IndexBase> make_index(IndexType type, size_t dim, const IndexOpt
     throw std::invalid_argument("unknown IndexType");
 }
 
-std::unique_ptr<IndexBase> load_index(std::istream& in) {
+namespace {
+
+std::unique_ptr<IndexBase> load_index(std::istream& in, const detail::LoadContext* ctx) {
     const detail::Header header = detail::read_header(in);
     switch (header.kind) {
         case detail::IndexKind::Flat:   return FlatIndex::load_body(in, header.version);
         case detail::IndexKind::IVF:    return IVFIndex::load_body(in, header.version);
-        case detail::IndexKind::Refine: return RefineIndex::load_body(in, header.version);
+        case detail::IndexKind::Refine: return RefineIndex::load_body(in, header.version, ctx);
         case detail::IndexKind::HNSW:   return HNSWIndex::load_body(in, header.version);
         case detail::IndexKind::Inverted: return InvertedIndex::load_body(in, header.version);
         case detail::IndexKind::SparseApprox: return SparseApproxIndex::load_body(in, header.version);
-        case detail::IndexKind::Hybrid: return HybridIndex::load_body(in, header.version);
+        case detail::IndexKind::Hybrid: return HybridIndex::load_body(in, header.version, ctx);
     }
     throw std::runtime_error("unknown index kind");
 }
+
+} // namespace
+
+std::unique_ptr<IndexBase> load_index(std::istream& in) { return load_index(in, nullptr); }
 
 void save_index(const IndexBase& index, const std::filesystem::path& path) {
     std::filesystem::path tmp = path;
@@ -75,13 +81,16 @@ void save_index(const IndexBase& index, const std::filesystem::path& path) {
     }
 }
 
-std::unique_ptr<IndexBase> load_index(const std::filesystem::path& path) {
+std::unique_ptr<IndexBase> load_index(const std::filesystem::path& path, bool mmap) {
     std::ifstream in(path, std::ios::binary);
     if (!in) throw std::runtime_error("cannot open " + path.string() + " for reading");
 
+    detail::LoadContext ctx;
+    if (mmap) ctx.file = std::make_shared<const detail::MappedFile>(path);
+
     std::unique_ptr<IndexBase> index;
     try {
-        index = load_index(in);
+        index = load_index(in, &ctx);
     } catch (const std::invalid_argument& e) {
         // Constructors and setters reject bad sizes (e.g. nlist, nprobe) with
         // invalid_argument; from a file those mean corruption.
