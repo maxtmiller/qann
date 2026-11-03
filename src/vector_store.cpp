@@ -100,8 +100,9 @@ std::shared_ptr<const MappedFile> MappedFile::temporary(const std::filesystem::p
             out.close();
             if (!out) throw std::runtime_error("failed to write " + name);
         }
-        auto file = std::make_shared<const MappedFile>(name);
+        auto file = std::make_shared<MappedFile>(name);
         std::filesystem::remove(name);  // the map keeps the data until it goes
+        file->path_ = near;  // so the next compaction's file goes next to the index again, not named after this one
         return file;
     } catch (...) {
         std::error_code ignored;

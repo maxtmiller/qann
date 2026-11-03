@@ -428,6 +428,18 @@ TEST_CASE("mmap: adds, removes and compaction on mapped sparse lists", "[mmap][s
     REQUIRE(sparse_mapped(*mapped));  // compaction maps a new file
     require_same_sparse(*in_ram, *mapped, queries, 10);
 
+    SECTION("many compactions keep naming their file after the index") {
+        const auto live = mapped->ids();
+        for (size_t i = 0; i < 40; ++i) {
+            REQUIRE(mapped->remove(std::vector<int64_t>{live[i]}) == 1);
+            in_ram->remove(std::vector<int64_t>{live[i]});
+            mapped->compact();   // about 40 deep, past the 255-character name limit had the names nested
+            in_ram->compact();
+        }
+        require_same_sparse(*in_ram, *mapped, queries, 10);
+        REQUIRE(std::distance(fs::directory_iterator(dir.path), fs::directory_iterator()) == 1);  // nothing left behind
+    }
+
     SECTION("saving over the mapped file, then loading it both ways") {
         save_index(*in_ram, dir.path / "compacted.qann");
         save_index(*mapped, file);

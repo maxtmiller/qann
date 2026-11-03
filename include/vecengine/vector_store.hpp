@@ -33,6 +33,7 @@ public:
 
     const char* data() const noexcept { return data_; }
     size_t size() const noexcept { return size_; }
+    // The file mapped, or for a temporary one the file it was made next to.
     const std::filesystem::path& path() const noexcept { return path_; }
 
     // Turns readahead off (MADV_RANDOM) for the pages of [begin, begin + bytes), within the map.
