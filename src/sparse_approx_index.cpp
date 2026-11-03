@@ -1,5 +1,6 @@
 #include "vecengine/sparse_approx_index.hpp"
 #include "serialize.hpp"
+#include "sparse_lists.hpp"
 #include "topk.hpp"
 
 #include <algorithm>
@@ -49,15 +50,14 @@ void SparseApproxIndex::add_batch_impl(const SparseRows& rows, const int64_t* id
         canonical_row(rows, i, terms);
         for (auto [term, value] : terms) {
             List& list = lists_[term];
-            if (list.postings.size() == list.sorted) touched.push_back(&list);
-            if (list.postings.empty()) list.max_weight = list.min_weight = value;
+            if (list.size() == list.sorted) touched.push_back(&list);
+            if (list.size() == 0) list.max_weight = list.min_weight = value;
             list.max_weight = std::max(list.max_weight, value);
             list.min_weight = std::min(list.min_weight, value);
             list.postings.push_back({static_cast<uint32_t>(first + i), value});
-            fwd_terms_.push_back(term);
-            fwd_weights_.push_back(value);
+            fwd_ram_.push_back({term, value});
         }
-        fwd_ptr_.push_back(fwd_terms_.size());
+        fwd_ptr_.push_back(fwd_mapped_.size() + fwd_ram_.size());
     }
     for (List* list : touched) list->settle();
     id_map_.add(n, ids);
@@ -91,8 +91,8 @@ vector<Neighbor> SparseApproxIndex::query_impl(const Terms& terms, size_t k, con
             }
             s.scores[p.slot] = std::fma(value, p.weight, s.scores[p.slot]);
         };
-        std::for_each(list.postings.begin(), list.postings.begin() + depth, read);
-        std::for_each(list.postings.begin() + list.sorted, list.postings.end(), read);
+        list.each(0, depth, read);
+        list.each(list.sorted, list.size(), read);
     }
     auto& best = s.best;
     best.clear();
@@ -123,7 +123,7 @@ vector<Neighbor> SparseApproxIndex::query_impl(const Terms& terms, size_t k, con
         const auto it = lists_.find(term);
         if (it == lists_.end()) continue;
         const double a = double(value) * it->second.max_weight, b = double(value) * it->second.min_weight;
-        lists.push_back({term, value, it->second.postings.size(), std::max({0.0, a, b})});
+        lists.push_back({term, value, it->second.size(), std::max({0.0, a, b})});
     }
     std::stable_sort(lists.begin(), lists.end(), [](const QueryList& x, const QueryList& y) {
         return x.hi != y.hi ? x.hi > y.hi : x.length < y.length;
@@ -137,8 +137,9 @@ vector<Neighbor> SparseApproxIndex::query_impl(const Terms& terms, size_t k, con
         // merge the candidate's terms with the query's, both in term order
         size_t q = 0;
         for (uint64_t r = fwd_ptr_[slot]; r < fwd_ptr_[slot + 1] && q < by_term.size(); ++r) {
-            while (q < by_term.size() && by_term[q].first < fwd_terms_[r]) ++q;
-            if (q < by_term.size() && by_term[q].first == fwd_terms_[r]) weight[by_term[q].second] = fwd_weights_[r];
+            const FwdEntry& e = fwd(r);
+            while (q < by_term.size() && by_term[q].first < e.term) ++q;
+            if (q < by_term.size() && by_term[q].first == e.term) weight[by_term[q].second] = e.weight;
         }
         float score = 0;
         for (size_t j = 0; j < lists.size(); ++j) {
@@ -153,6 +154,17 @@ vector<Neighbor> SparseApproxIndex::query_impl(const Terms& terms, size_t k, con
 size_t SparseApproxIndex::compact() { return compact_impl(true); }
 
 size_t SparseApproxIndex::compact_impl(bool keep_ids) {
+    if (file_) {
+        const vector<uint32_t> remap = id_map_.compact_remap();
+        if (remap.empty()) {
+            metadata_.drop_unused_strings();
+            return 0;
+        }
+        compact_mapped(remap);  // may throw; changes nothing until it has written the new file
+        id_map_.compact(keep_ids);
+        metadata_.compact(remap);
+        return remap.size() - id_map_.slots();
+    }
     const vector<uint32_t> remap = id_map_.compact(keep_ids);
     if (remap.empty()) {
         metadata_.drop_unused_strings();
@@ -181,40 +193,87 @@ size_t SparseApproxIndex::compact_impl(bool keep_ids) {
     return remap.size() - id_map_.slots();
 }
 
+void SparseApproxIndex::compact_mapped(const vector<uint32_t>& remap) {
+    using detail::IdMap;
+    const vector<uint32_t> terms = detail::sorted_terms(lists_);
+    vector<uint64_t> live(terms.size(), 0), live_sorted(terms.size(), 0);
+    uint64_t total = 0;
+    for (size_t i = 0; i < terms.size(); ++i) {
+        const List& list = lists_.at(terms[i]);
+        for (size_t j = 0; j < list.size(); ++j)
+            if (remap[list[j].slot] != IdMap::kRemoved) {
+                ++live[i];
+                if (j < list.sorted) ++live_sorted[i];
+            }
+        total += live[i];
+    }
+    // the forward index keeps each live vector's row; only the row offsets change
+    vector<uint64_t> ptr{0};
+    for (size_t old = 0; old < remap.size(); ++old)
+        if (remap[old] != IdMap::kRemoved) ptr.push_back(ptr.back() + (fwd_ptr_[old + 1] - fwd_ptr_[old]));
+    uint64_t fwd_at = 0;  // file offset of the forward entries
+    std::shared_ptr<const detail::MappedFile> file;
+    if (total > 0) {
+        file = detail::MappedFile::temporary(file_->path(), [&](std::ostream& out) {
+            for (uint32_t term : terms) {
+                const List& list = lists_.at(term);
+                list.each(0, list.size(), [&](const Posting& p) {
+                    if (remap[p.slot] == IdMap::kRemoved) return;
+                    const Posting moved{remap[p.slot], p.weight};
+                    out.write(reinterpret_cast<const char*>(&moved), sizeof moved);
+                });
+            }
+            for (size_t old = 0; old < remap.size(); ++old) {
+                if (remap[old] == IdMap::kRemoved) continue;
+                for (uint64_t r = fwd_ptr_[old]; r < fwd_ptr_[old + 1]; ++r)
+                    out.write(reinterpret_cast<const char*>(&fwd(r)), sizeof(FwdEntry));
+            }
+        });
+        fwd_at = total * sizeof(Posting);
+    }
+    // the new file is written: from here nothing throws
+    const auto* at = file ? reinterpret_cast<const Posting*>(file->data()) : nullptr;
+    for (size_t i = 0; i < terms.size(); ++i) {
+        auto it = lists_.find(terms[i]);
+        if (live[i] == 0) {
+            lists_.erase(it);
+            continue;
+        }
+        List& list = it->second;
+        list.mapped = span<const Posting>(at, live[i]);
+        vector<Posting>().swap(list.postings);
+        list.sorted = live_sorted[i];
+        list.bound();
+        at += live[i];
+    }
+    fwd_ptr_ = std::move(ptr);
+    fwd_mapped_ = file ? span<const FwdEntry>(reinterpret_cast<const FwdEntry*>(file->data() + fwd_at), fwd_ptr_.back())
+                       : span<const FwdEntry>();
+    vector<FwdEntry>().swap(fwd_ram_);
+    if (file) file->advise_random(file->data() + fwd_at, fwd_ptr_.back() * sizeof(FwdEntry));
+    file_ = std::move(file);
+}
+
 void SparseApproxIndex::rebuild_forward() {
     fwd_ptr_.assign(slots() + 1, 0);
     for (const auto& [term, list] : lists_)
-        for (const Posting& p : list.postings) ++fwd_ptr_[p.slot + 1];
+        list.each(0, list.size(), [&](const Posting& p) { ++fwd_ptr_[p.slot + 1]; });
     for (size_t i = 0; i < slots(); ++i) fwd_ptr_[i + 1] += fwd_ptr_[i];
-    fwd_terms_.resize(fwd_ptr_.back());
-    fwd_weights_.resize(fwd_ptr_.back());
-    vector<uint32_t> terms;  // increasing, so each row's terms come out in order
-    for (const auto& [term, list] : lists_) terms.push_back(term);
-    std::sort(terms.begin(), terms.end());
+    fwd_mapped_ = {};
+    fwd_ram_.resize(fwd_ptr_.back());
     vector<uint64_t> at(fwd_ptr_.begin(), fwd_ptr_.end() - 1);
-    for (uint32_t term : terms) {
-        for (const Posting& p : lists_.at(term).postings) {
-            fwd_terms_[at[p.slot]] = term;
-            fwd_weights_[at[p.slot]++] = p.weight;
-        }
-    }
+    for (uint32_t term : detail::sorted_terms(lists_))  // increasing, so each row's terms come out in order
+        lists_.at(term).each(0, lists_.at(term).size(), [&](const Posting& p) { fwd_ram_[at[p.slot]++] = {term, p.weight}; });
 }
 
 size_t SparseApproxIndex::postings() const noexcept {
     size_t total = 0;
-    for (const auto& [term, list] : lists_) total += list.postings.size();
+    for (const auto& [term, list] : lists_) total += list.size();
     return total;
 }
 
-void SparseApproxIndex::List::bound() {
-    max_weight = min_weight = postings.front().weight;
-    for (const Posting& p : postings) {
-        max_weight = std::max(max_weight, p.weight);
-        min_weight = std::min(min_weight, p.weight);
-    }
-}
-
 void SparseApproxIndex::List::settle() {
+    if (!mapped.empty()) return;
     const size_t added = postings.size() - sorted;
     if (added <= std::max<size_t>(64, std::min<size_t>(sorted / 8, 4096))) return;
     const auto heavier = [](const Posting& a, const Posting& b) {
@@ -233,21 +292,18 @@ void SparseApproxIndex::save(std::ostream& out) const {
     write_pod(out, static_cast<uint64_t>(query_terms_));
     write_pod(out, static_cast<uint64_t>(list_depth_));
     write_pod(out, static_cast<uint64_t>(k_factor_));
-    write_pod(out, static_cast<uint64_t>(lists_.size()));
-    vector<uint32_t> terms;  // sorted, so the same index always writes the same bytes
-    terms.reserve(lists_.size());
-    for (const auto& [term, list] : lists_) terms.push_back(term);
-    std::sort(terms.begin(), terms.end());
-    for (uint32_t term : terms) {
-        write_pod(out, term);
-        write_pod(out, static_cast<uint64_t>(lists_.at(term).sorted));
-        write_vec(out, lists_.at(term).postings);
-    }
+    save_posting_lists(out, lists_, [](std::ostream& o, const List& list) { write_pod(o, static_cast<uint64_t>(list.sorted)); });
+    // version 11: the forward index, its entries at a 64-byte offset so a load with mmap can point into it
+    write_vec(out, fwd_ptr_);
+    write_pod(out, static_cast<uint64_t>(fwd_ptr_.back()));
+    write_pad(out, kPostingAlign);
+    write_span(out, fwd_mapped_);
+    write_span(out, span<const FwdEntry>(fwd_ram_));
     id_map_.save(out);
     metadata_.save(out);
 }
 
-std::unique_ptr<SparseApproxIndex> SparseApproxIndex::load_body(std::istream& in, uint32_t version) {
+std::unique_ptr<SparseApproxIndex> SparseApproxIndex::load_body(std::istream& in, uint32_t version, const detail::LoadContext* ctx) {
     using namespace detail;
 
     if (version < 9) throw std::runtime_error("corrupt file: SparseApproxIndex in a format before version 9");
@@ -258,37 +314,80 @@ std::unique_ptr<SparseApproxIndex> SparseApproxIndex::load_body(std::istream& in
     const auto k_factor = read_pod<uint64_t>(in);
     if (k_factor == 0) throw std::runtime_error("corrupt file: SparseApproxIndex k_factor 0");
     auto index = std::make_unique<SparseApproxIndex>(false, query_terms, list_depth, k_factor);
-    const auto nlists = read_pod<uint64_t>(in);
+    if (version >= 11) {
+        load_posting_lists(in, count, ctx, index->lists_, index->file_,
+                           [](std::istream& i, List& list) { list.sorted = read_pod<uint64_t>(i); });
+    } else {  // before 11: each list as its term, sorted and a write_vec, read into RAM
+        const auto nlists = read_pod<uint64_t>(in);
+        for (uint64_t l = 0; l < nlists; ++l) {
+            const auto term = read_pod<uint32_t>(in);
+            const auto sorted = read_pod<uint64_t>(in);
+            vector<Posting> list = read_vec<Posting>(in, count);
+            if (list.empty()) throw std::runtime_error("corrupt file: invalid SparseApproxIndex posting list");
+            auto [it, added] = index->lists_.try_emplace(term);
+            if (!added) throw std::runtime_error("corrupt file: SparseApproxIndex term appears twice");
+            it->second.postings = std::move(list);
+            it->second.sorted = sorted;
+        }
+    }
 
+    // every entry is checked, mapped or not (a mapped load reads the file once here): queries
+    // index arrays by slot, so a slot out of range would be out of bounds
     vector<uint32_t> last_list(count, UINT32_MAX);  // the list a slot last appeared in, to catch repeats
+    vector<uint64_t> per_slot(count, 0);              // entries per slot, which the forward index must match
     const auto heavier = [](const Posting& a, const Posting& b) {
         return a.weight != b.weight ? a.weight > b.weight : a.slot < b.slot;
     };
-    for (uint64_t l = 0; l < nlists; ++l) {
-        const auto term = read_pod<uint32_t>(in);
-        const auto sorted = read_pod<uint64_t>(in);
-        vector<Posting> list = read_vec<Posting>(in, count);
-        if (list.empty() || sorted > list.size())
-            throw std::runtime_error("corrupt file: invalid SparseApproxIndex posting list");
+    uint32_t l = 0;
+    for (auto& [term, list] : index->lists_) {
+        if (list.sorted > list.size()) throw std::runtime_error("corrupt file: invalid SparseApproxIndex posting list");
         for (size_t j = 0; j < list.size(); ++j) {
-            if (list[j].slot >= count || last_list[list[j].slot] == l)
+            const Posting& p = list[j];
+            if (p.slot >= count || last_list[p.slot] == l)
                 throw std::runtime_error("corrupt file: SparseApproxIndex posting list repeats or exceeds a slot");
-            last_list[list[j].slot] = static_cast<uint32_t>(l);
+            last_list[p.slot] = l;
+            ++per_slot[p.slot];
             // heaviest first up to sorted, then slot order
-            const bool ordered = j == 0 || j == sorted ? true
-                               : j < sorted         ? heavier(list[j - 1], list[j])
-                                                    : list[j - 1].slot < list[j].slot;
+            const bool ordered = j == 0 || j == list.sorted ? true
+                               : j < list.sorted         ? heavier(list[j - 1], p)
+                                                         : list[j - 1].slot < p.slot;
             if (!ordered) throw std::runtime_error("corrupt file: SparseApproxIndex posting list out of order");
         }
-        auto [it, added] = index->lists_.try_emplace(term);
-        if (!added) throw std::runtime_error("corrupt file: SparseApproxIndex term appears twice");
-        it->second.postings = std::move(list);
-        it->second.sorted = sorted;
-        it->second.bound();
+        list.bound();
+        ++l;
+    }
+
+    if (version >= 11) {
+        index->fwd_ptr_ = read_vec<uint64_t>(in, count + 1);
+        if (index->fwd_ptr_.size() != count + 1 || index->fwd_ptr_[0] != 0)
+            throw std::runtime_error("corrupt file: invalid SparseApproxIndex forward index");
+        for (uint64_t slot = 0; slot < count; ++slot)
+            if (index->fwd_ptr_[slot + 1] < index->fwd_ptr_[slot] ||
+                index->fwd_ptr_[slot + 1] - index->fwd_ptr_[slot] != per_slot[slot])
+                throw std::runtime_error("corrupt file: SparseApproxIndex forward index doesn't match its lists");
+        const uint64_t entries = index->fwd_ptr_.back();
+        if (read_pod<uint64_t>(in) != entries) throw std::runtime_error("corrupt file: invalid SparseApproxIndex forward index");
+        read_pad(in, kPostingAlign);
+        if (ctx && ctx->file && entries > 0) {
+            const char* at = map_next(in, *ctx->file, entries * sizeof(FwdEntry), alignof(FwdEntry));
+            // re-scoring reads candidates' rows, scattered: readahead would only fetch rows nobody asked for
+            ctx->file->advise_random(at, entries * sizeof(FwdEntry));
+            index->fwd_mapped_ = span<const FwdEntry>(reinterpret_cast<const FwdEntry*>(at), entries);
+            index->file_ = ctx->file;
+        } else {
+            index->fwd_ram_.resize(entries);
+            in.read(reinterpret_cast<char*>(index->fwd_ram_.data()), static_cast<std::streamsize>(entries * sizeof(FwdEntry)));
+            if (!in) throw std::runtime_error("truncated file");
+        }
+        // each row's terms increasing, as the re-scoring merge needs
+        for (uint64_t slot = 0; slot < count; ++slot)
+            for (uint64_t r = index->fwd_ptr_[slot] + 1; r < index->fwd_ptr_[slot + 1]; ++r)
+                if (index->fwd(r).term <= index->fwd(r - 1).term)
+                    throw std::runtime_error("corrupt file: SparseApproxIndex forward index out of order");
     }
     index->id_map_ = IdMap::load(in, count, version);
     index->metadata_ = MetadataStore::load(in, count);
-    index->rebuild_forward();
+    if (version < 11) index->rebuild_forward();
     return index;
 }
 

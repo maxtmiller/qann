@@ -1,5 +1,6 @@
 #include "vecengine/inverted_index.hpp"
 #include "serialize.hpp"
+#include "sparse_lists.hpp"
 #include "topk.hpp"
 
 #include <algorithm>
@@ -51,7 +52,7 @@ void InvertedIndex::add_batch_impl(const SparseRows& rows, const int64_t* ids) {
         canonical_row(rows, i, terms);
         for (auto [term, value] : terms) {
             List& list = lists_[term];
-            if (list.postings.empty()) list.max_weight = list.min_weight = value;
+            if (list.size() == 0) list.max_weight = list.min_weight = value;
             list.max_weight = std::max(list.max_weight, value);
             list.min_weight = std::min(list.min_weight, value);
             list.postings.push_back({static_cast<uint32_t>(first + i), value});
@@ -64,7 +65,7 @@ vector<Neighbor> InvertedIndex::query_impl(const Terms& terms, size_t k, const d
     // the query's lists, by the most each can add to a score (hi), largest
     // first; lo is the least (both bound 0, a vector not in the list)
     struct QueryList {
-        const vector<Posting>* postings;
+        const List* list;
         float value;
         double hi;
         double lo;
@@ -76,13 +77,13 @@ vector<Neighbor> InvertedIndex::query_impl(const Terms& terms, size_t k, const d
         const auto it = lists_.find(term);
         if (it == lists_.end()) continue;
         const double a = double(value) * it->second.max_weight, b = double(value) * it->second.min_weight;
-        lists.push_back({&it->second.postings, value, std::max({0.0, a, b}), std::min({0.0, a, b})});
+        lists.push_back({&it->second, value, std::max({0.0, a, b}), std::min({0.0, a, b})});
         mass += std::max(std::abs(a), std::abs(b));
-        postings += it->second.postings.size();
+        postings += it->second.size();
     }
     // ties go to the shorter list, leaving long ones for last, where pruning skips them
     std::stable_sort(lists.begin(), lists.end(), [](const QueryList& x, const QueryList& y) {
-        return x.hi != y.hi ? x.hi > y.hi : x.postings->size() < y.postings->size();
+        return x.hi != y.hi ? x.hi > y.hi : x.list->size() < y.list->size();
     });
     // bounds and postings of lists[j, end) summed
     vector<double> rest_hi(lists.size() + 1, 0.0), rest_lo(lists.size() + 1, 0.0);
@@ -90,7 +91,7 @@ vector<Neighbor> InvertedIndex::query_impl(const Terms& terms, size_t k, const d
     for (size_t j = lists.size(); j-- > 0;) {
         rest_hi[j] = rest_hi[j + 1] + lists[j].hi;
         rest_lo[j] = rest_lo[j + 1] + lists[j].lo;
-        rest_postings[j] = rest_postings[j + 1] + lists[j].postings->size();
+        rest_postings[j] = rest_postings[j + 1] + lists[j].list->size();
     }
     // Scores are float sums of up to lists.size() products, so every bound
     // is widened by this much: rounding never prunes a vector the full
@@ -147,7 +148,7 @@ vector<Neighbor> InvertedIndex::query_impl(const Terms& terms, size_t k, const d
         if (prune && rest_postings[j] <= s.touched.size()) prune = false;
         if (prune && rest_hi[j] + margin <= kth) break;
         const double after = rest_lo[j + 1];
-        for (const Posting& p : *lists[j].postings) {
+        lists[j].list->each(0, lists[j].list->size(), [&](const Posting& p) {
             if (!s.seen[p.slot]) {
                 s.seen[p.slot] = kSeen;
                 s.touched.push_back(p.slot);
@@ -155,7 +156,7 @@ vector<Neighbor> InvertedIndex::query_impl(const Terms& terms, size_t k, const d
             float& score = s.scores[p.slot];
             score = std::fma(lists[j].value, p.weight, score);  // fused in every path, so they agree
             if (prune && double(score) + after > kth + margin) offer(p.slot, double(score) + after);
-        }
+        });
     }
     // The rest only add to vectors that could still reach kth. One that
     // falls out isn't added to again, and its score stays below kth, so the
@@ -170,7 +171,7 @@ vector<Neighbor> InvertedIndex::query_impl(const Terms& terms, size_t k, const d
             score = std::fma(lists[j].value, weight, score);
             if (double(score) + after > kth + margin) offer(slot, double(score) + after);
         };
-        const vector<Posting>& list = *lists[j].postings;
+        const List& list = *lists[j].list;
         if (!listed && s.touched.size() * 16 < list.size()) {
             for (uint32_t slot : s.touched) {
                 if (allowed(slot) && viable(slot)) {
@@ -183,17 +184,21 @@ vector<Neighbor> InvertedIndex::query_impl(const Terms& terms, size_t k, const d
         }
         if (listed && candidates.size() * 16 < list.size()) {
             std::erase_if(candidates, [&](uint32_t slot) { return !viable(slot); });
-            const Posting* at = list.data();
-            const Posting* end = at + list.size();
-            for (uint32_t slot : candidates) {
-                at = seek(at, end, slot);
-                if (at == end) break;
-                if (at->slot == slot) add(slot, (at++)->weight);
+            // each part is in slot order, the RAM part after the mapped one
+            for (span<const Posting> part : {list.mapped, span<const Posting>(list.postings)}) {
+                const Posting* at = part.data();
+                const Posting* end = at + part.size();
+                for (uint32_t slot : candidates) {
+                    at = seek(at, end, slot);
+                    if (at == end) break;
+                    if (at->slot == slot) add(slot, (at++)->weight);
+                }
             }
         } else {
             const uint8_t flag = listed ? kCandidate : kSeen;
-            for (const Posting& p : list)
+            list.each(0, list.size(), [&](const Posting& p) {
                 if ((s.seen[p.slot] & flag) && viable(p.slot)) add(p.slot, p.weight);
+            });
         }
     }
 
@@ -211,6 +216,17 @@ vector<Neighbor> InvertedIndex::query_impl(const Terms& terms, size_t k, const d
 size_t InvertedIndex::compact() { return compact_impl(true); }
 
 size_t InvertedIndex::compact_impl(bool keep_ids) {
+    if (file_) {
+        const vector<uint32_t> remap = id_map_.compact_remap();
+        if (remap.empty()) {
+            metadata_.drop_unused_strings();
+            return 0;
+        }
+        compact_mapped(remap);  // may throw; changes nothing until it has written the new file
+        id_map_.compact(keep_ids);
+        metadata_.compact(remap);
+        return remap.size() - id_map_.slots();
+    }
     const vector<uint32_t> remap = id_map_.compact(keep_ids);
     if (remap.empty()) {
         metadata_.drop_unused_strings();
@@ -234,18 +250,47 @@ size_t InvertedIndex::compact_impl(bool keep_ids) {
     return remap.size() - id_map_.slots();
 }
 
-size_t InvertedIndex::postings() const noexcept {
-    size_t total = 0;
-    for (const auto& [term, list] : lists_) total += list.postings.size();
-    return total;
+void InvertedIndex::compact_mapped(const vector<uint32_t>& remap) {
+    const vector<uint32_t> terms = detail::sorted_terms(lists_);
+    vector<uint64_t> live(terms.size(), 0);
+    uint64_t total = 0;
+    for (size_t i = 0; i < terms.size(); ++i) {
+        lists_.at(terms[i]).each(0, lists_.at(terms[i]).size(),
+                                 [&](const Posting& p) { live[i] += remap[p.slot] != detail::IdMap::kRemoved; });
+        total += live[i];
+    }
+    std::shared_ptr<const detail::MappedFile> file;
+    if (total > 0) {
+        file = detail::MappedFile::temporary(file_->path(), [&](std::ostream& out) {
+            for (uint32_t term : terms)
+                lists_.at(term).each(0, lists_.at(term).size(), [&](const Posting& p) {
+                    if (remap[p.slot] == detail::IdMap::kRemoved) return;
+                    const Posting moved{remap[p.slot], p.weight};
+                    out.write(reinterpret_cast<const char*>(&moved), sizeof moved);
+                });
+        });
+    }
+    // the new file is written: from here nothing throws
+    const auto* at = file ? reinterpret_cast<const Posting*>(file->data()) : nullptr;
+    for (size_t i = 0; i < terms.size(); ++i) {
+        auto it = lists_.find(terms[i]);
+        if (live[i] == 0) {
+            lists_.erase(it);
+            continue;
+        }
+        List& list = it->second;
+        list.mapped = span<const Posting>(at, live[i]);
+        vector<Posting>().swap(list.postings);
+        list.bound();
+        at += live[i];
+    }
+    file_ = std::move(file);
 }
 
-void InvertedIndex::List::bound() {
-    max_weight = min_weight = postings.front().weight;
-    for (const Posting& p : postings) {
-        max_weight = std::max(max_weight, p.weight);
-        min_weight = std::min(min_weight, p.weight);
-    }
+size_t InvertedIndex::postings() const noexcept {
+    size_t total = 0;
+    for (const auto& [term, list] : lists_) total += list.size();
+    return total;
 }
 
 void InvertedIndex::save(std::ostream& out) const {
@@ -253,39 +298,44 @@ void InvertedIndex::save(std::ostream& out) const {
 
     write_header(out, IndexKind::Inverted);
     write_pod(out, static_cast<uint64_t>(id_map_.slots()));
-    write_pod(out, static_cast<uint64_t>(lists_.size()));
-    vector<uint32_t> terms;  // sorted, so the same index always writes the same bytes
-    terms.reserve(lists_.size());
-    for (const auto& [term, list] : lists_) terms.push_back(term);
-    std::sort(terms.begin(), terms.end());
-    for (uint32_t term : terms) {
-        write_pod(out, term);
-        write_vec(out, lists_.at(term).postings);
-    }
+    save_posting_lists(out, lists_, [](std::ostream&, const List&) {});
     id_map_.save(out);
     metadata_.save(out);
 }
 
-std::unique_ptr<InvertedIndex> InvertedIndex::load_body(std::istream& in, uint32_t version) {
+std::unique_ptr<InvertedIndex> InvertedIndex::load_body(std::istream& in, uint32_t version, const detail::LoadContext* ctx) {
     using namespace detail;
 
     if (version < 9) throw std::runtime_error("corrupt file: SparseIndex in a format before version 9");
     const auto count = read_pod<uint64_t>(in);
     if (count > UINT32_MAX) throw std::runtime_error("corrupt file: invalid SparseIndex size");
-    const auto nlists = read_pod<uint64_t>(in);
 
     auto index = std::make_unique<InvertedIndex>();
-    for (uint64_t l = 0; l < nlists; ++l) {
-        const auto term = read_pod<uint32_t>(in);
-        vector<Posting> list = read_vec<Posting>(in, count);
-        if (list.empty()) throw std::runtime_error("corrupt file: empty SparseIndex posting list");
-        for (size_t j = 0; j < list.size(); ++j)
-            if (list[j].slot >= count || (j > 0 && list[j].slot <= list[j - 1].slot))
+    if (version >= 11) {
+        load_posting_lists(in, count, ctx, index->lists_, index->file_, [](std::istream&, List&) {});
+    } else {  // before 11: each list as its term and a write_vec, read into RAM
+        const auto nlists = read_pod<uint64_t>(in);
+        for (uint64_t l = 0; l < nlists; ++l) {
+            const auto term = read_pod<uint32_t>(in);
+            vector<Posting> list = read_vec<Posting>(in, count);
+            if (list.empty()) throw std::runtime_error("corrupt file: empty SparseIndex posting list");
+            auto [it, added] = index->lists_.try_emplace(term);
+            if (!added) throw std::runtime_error("corrupt file: SparseIndex term appears twice");
+            it->second.postings = std::move(list);
+        }
+    }
+    // every entry is checked, mapped or not (a mapped load reads the file once here): queries
+    // index arrays by slot, so a slot out of range would be out of bounds
+    for (auto& [term, list] : index->lists_) {
+        uint32_t prev = 0;
+        bool first = true;
+        list.each(0, list.size(), [&](const Posting& p) {
+            if (p.slot >= count || (!first && p.slot <= prev))
                 throw std::runtime_error("corrupt file: SparseIndex posting list out of order");
-        auto [it, added] = index->lists_.try_emplace(term);
-        if (!added) throw std::runtime_error("corrupt file: SparseIndex term appears twice");
-        it->second.postings = std::move(list);
-        it->second.bound();
+            prev = p.slot;
+            first = false;
+        });
+        list.bound();
     }
     index->id_map_ = IdMap::load(in, count, version);
     index->metadata_ = MetadataStore::load(in, count);

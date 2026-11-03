@@ -6,6 +6,8 @@
 #include "vecengine/index_factory.hpp"
 #include "vecengine/ivf_index.hpp"
 #include "vecengine/refine_index.hpp"
+#include "vecengine/inverted_index.hpp"
+#include "vecengine/sparse_approx_index.hpp"
 #include "vecengine/vector_store.hpp"
 #include "serialize.hpp"
 
@@ -14,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -293,4 +296,186 @@ TEST_CASE("mmap: IVF lists the file can't map are read into RAM", "[mmap][ivf][f
     // before format 11 float lists had no padding; a pre-11 IVF file loads read in
     const fs::path v1 = fs::path(QANN_TEST_DATA_DIR) / "v1_ivf_pq.qann";
     REQUIRE_FALSE(load_ivf(v1, true)->mapped());
+}
+
+namespace {
+
+using Row = std::vector<std::pair<uint32_t, float>>;
+
+struct Csr {
+    std::vector<uint64_t> indptr{0};
+    std::vector<uint32_t> indices;
+    std::vector<float> values;
+    explicit Csr(const std::vector<Row>& rows) {
+        for (const Row& row : rows) {
+            for (auto [t, v] : row) {
+                indices.push_back(t);
+                values.push_back(v);
+            }
+            indptr.push_back(indices.size());
+        }
+    }
+    SparseRows view() const { return {indptr, indices, values}; }
+};
+
+std::vector<Row> sparse_rows(size_t n, uint32_t vocab, size_t nnz, unsigned seed) {
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<uint32_t> term(0, vocab - 1);
+    std::uniform_real_distribution<float> weight(0.1f, 2.0f);
+    std::vector<Row> rows(n);
+    for (Row& row : rows) {
+        std::map<uint32_t, float> terms;
+        for (size_t j = 0; j < nnz; ++j) terms[term(rng) % (1 + term(rng))] = weight(rng);  // low terms common
+        row.assign(terms.begin(), terms.end());
+    }
+    return rows;
+}
+
+std::unique_ptr<SparseIndex> load_sparse(const fs::path& file, bool mmap) {
+    auto loaded = load_index(file, mmap);
+    REQUIRE(dynamic_cast<SparseIndex*>(loaded.get()) != nullptr);
+    return std::unique_ptr<SparseIndex>(static_cast<SparseIndex*>(loaded.release()));
+}
+
+bool sparse_mapped(const SparseIndex& index) {
+    if (auto* inv = dynamic_cast<const InvertedIndex*>(&index)) return inv->mapped();
+    return dynamic_cast<const SparseApproxIndex&>(index).mapped();
+}
+
+void require_same_sparse(const SparseIndex& a, const SparseIndex& b, const std::vector<Row>& queries, size_t k) {
+    const Csr q(queries);
+    const auto expected = a.query_batch(q.view(), k);
+    const auto actual = b.query_batch(q.view(), k);
+    for (size_t i = 0; i < queries.size(); ++i) {
+        REQUIRE(actual[i].size() == expected[i].size());
+        for (size_t j = 0; j < expected[i].size(); ++j) {
+            REQUIRE(actual[i][j].index == expected[i][j].index);
+            REQUIRE(actual[i][j].distance == expected[i][j].distance);
+        }
+    }
+    REQUIRE(a.ids() == b.ids());
+}
+
+std::string file_bytes(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(f), {});
+}
+
+} // namespace
+
+TEST_CASE("mmap: sparse posting lists mapped match ones read into RAM", "[mmap][sparse][file]") {
+    TempDir dir;
+    const auto docs = sparse_rows(3000, 400, 20, 51);
+    const auto queries = sparse_rows(30, 400, 12, 52);
+    const fs::path file = dir.path / "sparse.qann";
+    const bool approx = GENERATE(false, true);
+    CAPTURE(approx);
+    {
+        std::unique_ptr<SparseIndex> index;
+        if (approx) index = std::make_unique<SparseApproxIndex>(true, 6, 40, 5);  // reads only part of each list
+        else index = std::make_unique<InvertedIndex>(true);
+        std::vector<int64_t> ids(docs.size());
+        std::iota(ids.begin(), ids.end(), 500);
+        index->add_batch(Csr(docs).view(), ids.data());
+        save_index(*index, file);
+    }
+    auto in_ram = load_sparse(file, false);
+    auto mapped = load_sparse(file, true);
+    REQUIRE_FALSE(sparse_mapped(*in_ram));
+    REQUIRE(sparse_mapped(*mapped));
+    require_same_sparse(*in_ram, *mapped, queries, 10);
+
+    SECTION("pruning on and off agree") {
+        if (!approx) {
+            static_cast<InvertedIndex&>(*mapped).set_pruning(false);
+            require_same_sparse(*in_ram, *mapped, queries, 10);
+        }
+    }
+}
+
+TEST_CASE("mmap: adds, removes and compaction on mapped sparse lists", "[mmap][sparse][file]") {
+    TempDir dir;
+    const auto docs = sparse_rows(3000, 400, 20, 53);
+    const auto more = sparse_rows(500, 500, 20, 54);  // also terms the file doesn't have
+    const auto queries = sparse_rows(30, 500, 12, 55);
+    const fs::path file = dir.path / "sparse.qann";
+    const bool approx = GENERATE(false, true);
+    CAPTURE(approx);
+    {
+        // list_depth 0 reads whole lists, so results don't depend on which entries
+        // are sorted (a mapped list's new entries stay unsorted until a save)
+        std::unique_ptr<SparseIndex> index;
+        if (approx) index = std::make_unique<SparseApproxIndex>(false, 0, 0, 1000);
+        else index = std::make_unique<InvertedIndex>();
+        index->add_batch(Csr(docs).view());
+        save_index(*index, file);
+    }
+    auto in_ram = load_sparse(file, false);
+    auto mapped = load_sparse(file, true);
+
+    auto apply = [&](SparseIndex& index) {
+        index.add_batch(Csr(more).view());
+        std::vector<int64_t> gone;
+        for (int64_t id = 0; id < 3500; id += 3) gone.push_back(id);
+        index.remove(gone);
+        index.compact();
+        index.add_batch(Csr(std::vector<Row>(docs.begin(), docs.begin() + 100)).view());
+        index.remove(std::vector<int64_t>{1, 2, 4, 3400});
+        index.compact();
+    };
+    apply(*in_ram);
+    apply(*mapped);
+    REQUIRE(sparse_mapped(*mapped));  // compaction maps a new file
+    require_same_sparse(*in_ram, *mapped, queries, 10);
+
+    SECTION("saving over the mapped file, then loading it both ways") {
+        save_index(*in_ram, dir.path / "compacted.qann");
+        save_index(*mapped, file);
+        if (!approx) REQUIRE(file_bytes(file) == file_bytes(dir.path / "compacted.qann"));
+        require_same_sparse(*in_ram, *mapped, queries, 10);
+        require_same_sparse(*in_ram, *load_sparse(file, true), queries, 10);
+        require_same_sparse(*in_ram, *load_sparse(file, false), queries, 10);
+    }
+
+    SECTION("compacting away every vector, then adding again") {
+        auto all = mapped->ids();
+        mapped->remove(all);
+        in_ram->remove(all);
+        mapped->compact();
+        in_ram->compact();
+        REQUIRE_FALSE(sparse_mapped(*mapped));
+        mapped->add_batch(Csr(more).view());
+        in_ram->add_batch(Csr(more).view());
+        require_same_sparse(*in_ram, *mapped, queries, 10);
+    }
+
+    SECTION("a compaction that can't write its file changes nothing") {
+        mapped->remove(std::vector<int64_t>{5, 7, 3401});
+        in_ram->remove(std::vector<int64_t>{5, 7, 3401});
+        fs::permissions(dir.path, fs::perms::owner_read | fs::perms::owner_exec);
+        const bool refused = [&] {
+            try {
+                mapped->compact();
+                return false;
+            } catch (const std::runtime_error&) {
+                return true;
+            }
+        }();
+        fs::permissions(dir.path, fs::perms::owner_all);
+        if (refused) {   // (a root user can write anyway)
+            require_same_sparse(*in_ram, *mapped, queries, 10);
+            REQUIRE(mapped->size() == in_ram->size());
+            mapped->compact();
+            in_ram->compact();
+            require_same_sparse(*in_ram, *mapped, queries, 10);
+        }
+    }
+}
+
+TEST_CASE("mmap: sparse files before format 11 load read in", "[mmap][sparse][file]") {
+    const fs::path dir = QANN_TEST_DATA_DIR;
+    for (const char* name : {"v9_sparse.qann", "v9_sparse_approx.qann"}) {
+        auto index = load_sparse(dir / name, true);
+        REQUIRE_FALSE(sparse_mapped(*index));
+    }
 }

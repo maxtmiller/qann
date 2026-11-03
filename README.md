@@ -390,7 +390,7 @@ index = qann.load("vectors.qann")   # returns the saved class, e.g. IVFIndex or 
 
 - **Everything is restored:** vectors, ids, deletions, training, graphs, metadata, the metric and settings. A loaded index gives identical results and keeps accepting adds.
 - **A `RefineIndex` file includes its base.** Tune it through `loaded.base`.
-- **Larger than RAM:** `qann.load(path, mmap=True)` leaves a `RefineIndex`'s raw vectors and an `IVFIndex`'s float and SQ lists in the file and reads only what queries touch, so memory holds just the centroids, any PQ codes, ids and metadata. Results are identical; keep the file in place while the index is open. [Details](https://github.com/maxtmiller/qann/blob/main/ARCHITECTURE.md#saving-and-loading).
+- **Larger than RAM:** `qann.load(path, mmap=True)` leaves a `RefineIndex`'s raw vectors, an `IVFIndex`'s float and SQ lists and a sparse index's posting lists in the file and reads only what queries touch, so memory holds just the centroids, any PQ codes, ids and metadata. Results are identical; keep the file in place while the index is open. [Details](https://github.com/maxtmiller/qann/blob/main/ARCHITECTURE.md#saving-and-loading).
 - **Safe:** an interrupted save never leaves a partial file, and a corrupt or foreign file raises `RuntimeError`.
 - **Versioned:** newer releases load files from older ones. [Details](https://github.com/maxtmiller/qann/blob/main/ARCHITECTURE.md#saving-and-loading).
 

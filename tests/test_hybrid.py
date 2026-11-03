@@ -121,6 +121,23 @@ def test_load_mmap_maps_the_dense_refine_part(tmp_path, docs):
         np.testing.assert_array_equal(got[1], want[1])
 
 
+@pytest.mark.parametrize("sparse", [qann.InvertedIndex, qann.SparseApproxIndex])
+def test_load_mmap_maps_the_sparse_part(tmp_path, docs, sparse):
+    h = make(docs, sparse=sparse())
+    h.save(tmp_path / "h.qann")
+    loaded = qann.load(tmp_path / "h.qann", mmap=True)
+    assert loaded.sparse.mapped
+    want = h.batch_query(docs["q_dense"], docs["q_sparse"], 10)
+    got = loaded.batch_query(docs["q_dense"], docs["q_sparse"], 10)
+    np.testing.assert_array_equal(got[0], want[0])
+    np.testing.assert_array_equal(got[1], want[1])
+    for i in (h, loaded):
+        i.remove(docs["ids"][::4])
+        i.compact()
+    got, want = loaded.batch_query(docs["q_dense"], docs["q_sparse"], 10), h.batch_query(docs["q_dense"], docs["q_sparse"], 10)
+    np.testing.assert_array_equal(got[0], want[0])
+
+
 def test_parts_are_protected_while_wrapped(docs):
     dense, sparse = qann.FlatIndex(DIM), qann.InvertedIndex()
     h = qann.HybridIndex(dense, sparse)

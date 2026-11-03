@@ -2,6 +2,7 @@
 
 #include "vecengine/id_map.hpp"
 #include "vecengine/sparse_index.hpp"
+#include "vecengine/vector_store.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -61,33 +62,38 @@ public:
     size_t postings() const noexcept;
 
     // Rebuilds a SparseApproxIndex from the body save() wrote, after
-    // load_index() has read the header. Throws std::runtime_error on corrupt
-    // data.
-    static std::unique_ptr<SparseApproxIndex> load_body(std::istream& in, uint32_t version);
+    // load_index() has read the header. With ctx->file set (format 11 on),
+    // the posting lists and the forward index are mapped from that file
+    // instead of read. Throws std::runtime_error on corrupt data.
+    static std::unique_ptr<SparseApproxIndex> load_body(std::istream& in, uint32_t version,
+                                                        const detail::LoadContext* ctx = nullptr);
+
+    // Whether the lists and forward index are read from a file (qann.load(path, mmap=True))
+    // rather than held in RAM.
+    bool mapped() const noexcept { return file_ != nullptr; }
 
 private:
-    struct Posting {
-        uint32_t slot;
-        float weight;
-    };
+    using Posting = detail::SparsePosting;
 
-    // A term's postings: postings[0, sorted) heaviest first (ties by slot),
-    // then the ones added since, in slot order. The extremes of the weights
-    // order the query's terms when re-scoring.
-    struct List {
-        vector<Posting> postings;
+    // A term's postings: [0, sorted) heaviest first (ties by slot), then the
+    // ones added since, in slot order. The extremes of the weights order the
+    // query's terms when re-scoring.
+    struct List : detail::PostingList {
         size_t sorted = 0;
-        float max_weight = 0;
-        float min_weight = 0;
-
-        // Sets max_weight and min_weight from postings.
-        void bound();
 
         // Sorts the entries added since into the rest once there are more
         // than 64 of them and more than an eighth of the sorted ones (at
         // most 4096), so reading the heaviest entries stays cheap as single
-        // vectors arrive: O(list) per merge.
+        // vectors arrive: O(list) per merge. A list with mapped entries isn't
+        // sorted (the file can't change), so its new entries stay unsorted,
+        // and are all read by every query, until the index is saved.
         void settle();
+    };
+
+    // One (term, weight) of a vector in the forward index. Its layout is part of the file format.
+    struct FwdEntry {
+        uint32_t term;
+        float weight;
     };
 
     const detail::IdMap& id_map() const noexcept override { return id_map_; }
@@ -98,6 +104,15 @@ private:
 
     // compact() and compact_as_base(): keep_ids as in IdMap::compact.
     size_t compact_impl(bool keep_ids);
+
+    // compact_impl() for a mapped index, whose file can't be rewritten in place: writes the
+    // compacted lists and forward index to a temporary file next to the loaded one and maps that.
+    void compact_mapped(const vector<uint32_t>& remap);
+
+    // Entry r of the forward index, mapped or in RAM.
+    const FwdEntry& fwd(uint64_t r) const noexcept {
+        return r < fwd_mapped_.size() ? fwd_mapped_[r] : fwd_ram_[r - fwd_mapped_.size()];
+    }
     vector<Neighbor> query_impl(const Terms& terms, size_t k, const detail::SlotFilter* filter) const override;
 
     // Fills the forward index from lists_, for load_body() and compact().
@@ -108,10 +123,12 @@ private:
     size_t query_terms_;
     size_t list_depth_;
     size_t k_factor_;
-    // forward index: slot s's terms (increasing) and weights are at [fwd_ptr_[s], fwd_ptr_[s + 1])
+    // forward index: slot s's entries (terms increasing) are fwd(r) for r in [fwd_ptr_[s], fwd_ptr_[s + 1]);
+    // the first fwd_mapped_.size() are in the file, the rest in fwd_ram_
     vector<uint64_t> fwd_ptr_{0};
-    vector<uint32_t> fwd_terms_;
-    vector<float> fwd_weights_;
+    span<const FwdEntry> fwd_mapped_;
+    vector<FwdEntry> fwd_ram_;
+    std::shared_ptr<const detail::MappedFile> file_; // what mapped lists and entries point into
 };
 
 } // namespace vecengine

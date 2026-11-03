@@ -2,6 +2,7 @@
 
 #include "vecengine/index.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -25,6 +26,47 @@ struct SparseRows {
 
     size_t rows() const noexcept { return indptr.empty() ? 0 : indptr.size() - 1; }
 };
+
+namespace detail {
+
+// One stored (vector, weight) pair of a sparse posting list. Its layout is part of the file format.
+struct SparsePosting {
+    uint32_t slot;
+    float weight;
+};
+
+// A term's posting list: the entries mapped from the loaded file (qann.load(path, mmap=True)),
+// then those in RAM (added since loading, or all of them when not mapped), in one numbering.
+// max_weight and min_weight are the extremes of the weights, which bound what the term can add
+// to a score.
+struct PostingList {
+    span<const SparsePosting> mapped;
+    vector<SparsePosting> postings;
+    float max_weight = 0;
+    float min_weight = 0;
+
+    size_t size() const noexcept { return mapped.size() + postings.size(); }
+    const SparsePosting& operator[](size_t i) const noexcept {
+        return i < mapped.size() ? mapped[i] : postings[i - mapped.size()];
+    }
+    // Calls f on entries [begin, end) in order.
+    template <class F>
+    void each(size_t begin, size_t end, F&& f) const {
+        const size_t m = mapped.size();
+        for (size_t i = begin; i < std::min(end, m); ++i) f(mapped[i]);
+        for (size_t i = std::max(begin, m); i < end; ++i) f(postings[i - m]);
+    }
+    // Sets max_weight and min_weight from the entries (at least one).
+    void bound() noexcept {
+        max_weight = min_weight = (*this)[0].weight;
+        each(0, size(), [&](const SparsePosting& p) {
+            max_weight = std::max(max_weight, p.weight);
+            min_weight = std::min(min_weight, p.weight);
+        });
+    }
+};
+
+} // namespace detail
 
 // An index of sparse vectors (issue #59), scored by inner product: a
 // result's distance is -(q . d), so the largest dot product comes first, as

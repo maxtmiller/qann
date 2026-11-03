@@ -897,7 +897,7 @@ NB_MODULE(qann, m) {
         .def_prop_ro("fast_scan",
                      [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.fast_scan(); }); },
                      "Whether enable_pq(..., fast_scan=True) was used")
-        .def_prop_ro("mapped", &vecengine::IVFIndex::mapped,
+        .def_prop_ro("mapped", [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.mapped(); }); },
                      "Whether float or SQ lists are read from the file (qann.load(path, mmap=True)) rather than held in RAM")
         .def_prop_rw("nprobe",
                      [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.nprobe(); }); },
@@ -968,7 +968,7 @@ NB_MODULE(qann, m) {
         .def_prop_ro("base", [](vecengine::RefineIndex& self) -> vecengine::DenseIndex& { return self.base(); },
                      nb::rv_policy::reference_internal,
                      "The wrapped approximate index, e.g. to change nprobe on a loaded RefineIndex")
-        .def_prop_ro("mapped", &vecengine::RefineIndex::mapped,
+        .def_prop_ro("mapped", [](const vecengine::RefineIndex& self) { return read_locked(self, [&] { return self.mapped(); }); },
                      "Whether the raw vectors are read from the file (qann.load(path, mmap=True)) rather than held in RAM");
 
     nb::class_<vecengine::SparseIndex, vecengine::IndexBase>(
@@ -1017,7 +1017,10 @@ NB_MODULE(qann, m) {
                      "Distinct terms with a posting list")
         .def_prop_ro("postings",
                      [](const vecengine::InvertedIndex& self) { return read_locked(self, [&] { return self.postings(); }); },
-                     "Stored (term, vector) pairs, including deleted vectors' until compact()");
+                     "Stored (term, vector) pairs, including deleted vectors' until compact()")
+        .def_prop_ro("mapped",
+                     [](const vecengine::InvertedIndex& self) { return read_locked(self, [&] { return self.mapped(); }); },
+                     "Whether the posting lists are read from a file (qann.load(path, mmap=True)) rather than held in RAM");
 
     nb::class_<vecengine::SparseApproxIndex, vecengine::SparseIndex>(
         m, "SparseApproxIndex",
@@ -1050,7 +1053,11 @@ NB_MODULE(qann, m) {
                      "Distinct terms with a posting list")
         .def_prop_ro("postings",
                      [](const vecengine::SparseApproxIndex& self) { return read_locked(self, [&] { return self.postings(); }); },
-                     "Stored (term, vector) pairs, including deleted vectors' until compact()");
+                     "Stored (term, vector) pairs, including deleted vectors' until compact()")
+        .def_prop_ro("mapped",
+                     [](const vecengine::SparseApproxIndex& self) { return read_locked(self, [&] { return self.mapped(); }); },
+                     "Whether the posting lists and forward index are read from a file (qann.load(path, mmap=True)) "
+                     "rather than held in RAM");
 
     // Holds dense and sparse by reference; keep_alive ties their lifetimes to
     // the HybridIndex's, as for RefineIndex's base.
@@ -1222,7 +1229,7 @@ NB_MODULE(qann, m) {
     m.def("load", nb::overload_cast<const std::filesystem::path&, bool>(&vecengine::load_index), nb::arg("path"),
           nb::kw_only(), nb::arg("mmap") = false, nb::call_guard<nb::gil_scoped_release>(),
           "Load an index saved with save(path); returns the saved class (FlatIndex, IVFIndex, HNSWIndex, RefineIndex, "
-          "InvertedIndex, SparseApproxIndex or HybridIndex). mmap=True leaves a RefineIndex's raw vectors and an "
-          "IVFIndex's float and SQ lists in the file and reads them as queries need them; the file must then stay in "
-          "place while the index is open");
+          "InvertedIndex, SparseApproxIndex or HybridIndex). mmap=True leaves a RefineIndex's raw vectors, an "
+          "IVFIndex's float and SQ lists and a sparse index's posting lists in the file and reads them as queries "
+          "need them; the file must then stay in place while the index is open");
 }

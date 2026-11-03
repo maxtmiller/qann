@@ -280,8 +280,15 @@ TEST_CASE("InvertedIndex rejects malformed rows and corrupt files", "[sparse]") 
     std::stringstream s;
     index.save(s);
     const std::string bytes = s.str();
-    // header (9 bytes), slots, list count, term, list length, then (slot, weight) pairs
-    const size_t first_slot = 9 + 8 + 8 + 4 + 8;
+    // header (9 bytes), slots, list count, term, list length, posting count, a u32 pad
+    // length, then from the next 64-byte offset the (slot, weight) pairs
+    const size_t first_slot = (9 + 8 + 8 + 4 + 8 + 8 + 4 + 63) / 64 * 64;
+    auto slot_at = [&](size_t at) {
+        uint32_t v;
+        std::memcpy(&v, bytes.data() + at, sizeof v);
+        return v;
+    };
+    REQUIRE((slot_at(first_slot) == 0 && slot_at(first_slot + 8) == 1));  // the offsets point at the postings
     auto corrupt = [&](size_t at, uint32_t value) {
         std::string b = bytes;
         std::memcpy(b.data() + at, &value, sizeof value);
@@ -481,8 +488,16 @@ TEST_CASE("SparseApproxIndex rejects corrupt files, and make_index builds one", 
     index.save(s);
     const std::string bytes = s.str();
     // header (9 bytes), slots, query_terms, list_depth, k_factor, list count,
-    // term, sorted count, list length, then (slot, weight) pairs
-    const size_t k_factor = 9 + 8 + 16, sorted = k_factor + 8 + 8 + 4, first_slot = sorted + 8 + 8;
+    // term, list length, sorted count, posting count, a u32 pad length, then
+    // from the next 64-byte offset the (slot, weight) pairs
+    const size_t k_factor = 9 + 8 + 16, sorted = k_factor + 8 + 8 + 4 + 8;
+    const size_t first_slot = (sorted + 8 + 8 + 4 + 63) / 64 * 64;
+    uint64_t sorted_value;
+    uint32_t slot0, slot1;
+    std::memcpy(&sorted_value, bytes.data() + sorted, sizeof sorted_value);
+    std::memcpy(&slot0, bytes.data() + first_slot, sizeof slot0);
+    std::memcpy(&slot1, bytes.data() + first_slot + 8, sizeof slot1);
+    REQUIRE((sorted_value == 0 && slot0 == 0 && slot1 == 1));  // the offsets point at the fields
     auto corrupt = [&](std::initializer_list<std::pair<size_t, uint64_t>> writes) {
         std::string b = bytes;
         for (auto [at, value] : writes) std::memcpy(b.data() + at, &value, sizeof value);

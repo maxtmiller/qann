@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <fstream>
 #include <istream>
 #include <ostream>
 #include <stdexcept>
@@ -29,7 +30,7 @@ std::runtime_error sys_error(const std::string& what, const std::filesystem::pat
 
 } // namespace
 
-MappedFile::MappedFile(const std::filesystem::path& path) {
+MappedFile::MappedFile(const std::filesystem::path& path) : path_(path) {
     const int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) throw sys_error("open", path);
     struct stat st {};
@@ -84,6 +85,29 @@ const char* map_next(std::istream& in, const MappedFile& file, uint64_t bytes, s
     if (static_cast<uint64_t>(offset) % align != 0) throw std::runtime_error("corrupt file: misaligned data");
     in.seekg(static_cast<std::streamoff>(offset + static_cast<int64_t>(bytes)));
     return file.data() + offset;
+}
+
+std::shared_ptr<const MappedFile> MappedFile::temporary(const std::filesystem::path& near,
+                                                        const std::function<void(std::ostream&)>& write) {
+    std::string name = (near.parent_path() / (near.filename().string() + ".compact-XXXXXX")).string();
+    const int fd = ::mkstemp(name.data());
+    if (fd < 0) throw sys_error("create a temporary file for compaction next to", near);
+    ::close(fd);
+    try {
+        {
+            std::ofstream out(name, std::ios::binary | std::ios::trunc);
+            write(out);
+            out.close();
+            if (!out) throw std::runtime_error("failed to write " + name);
+        }
+        auto file = std::make_shared<const MappedFile>(name);
+        std::filesystem::remove(name);  // the map keeps the data until it goes
+        return file;
+    } catch (...) {
+        std::error_code ignored;
+        std::filesystem::remove(name, ignored);
+        throw;
+    }
 }
 
 MappedFile::~MappedFile() {
