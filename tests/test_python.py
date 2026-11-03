@@ -152,6 +152,44 @@ def test_loaded_refine_base_is_tunable(tmp_path, data, refine_index):
     assert base.size() == len(data)
 
 
+def test_load_mmap(tmp_path, data):
+    ivf = qann.IVFIndex(32, nlist=100, nprobe=8)
+    ivf.enable_pq(8)
+    ivf.train(data, seed=1)
+    index = qann.RefineIndex(ivf, k_factor=5)
+    index.add(data, metadata={"group": np.arange(len(data)) % 3})
+    path = tmp_path / "index.qann"
+    index.save(path)
+
+    mapped = qann.load(path, mmap=True)
+    assert type(mapped) is qann.RefineIndex
+    assert mapped.mapped and not index.mapped and not qann.load(path).mapped
+    assert_same_results(index, mapped, data[:50])
+    for i in range(3):
+        np.testing.assert_array_equal(mapped.query(data[i], 10, where="group = 1")[0],
+                                      index.query(data[i], 10, where="group = 1")[0])
+    np.testing.assert_array_equal(mapped.get_vectors([7, 3]), data[[7, 3]])
+
+    # removing and compacting keep the rows mapped; saving over the file drops removed rows
+    for i in (index, mapped):
+        i.remove(np.arange(0, len(data), 2))
+        i.compact()
+    assert mapped.mapped
+    assert_same_results(index, mapped, data[:50])
+    size = path.stat().st_size
+    mapped.save(path)
+    assert path.stat().st_size < size
+    assert_same_results(index, mapped, data[:50])
+    assert_same_results(index, qann.load(path, mmap=True), data[:50])
+
+
+def test_load_mmap_needs_format_10():
+    path = pathlib.Path(__file__).parent / "data" / "v9_refine_metadata.qann"
+    assert qann.load(path).size() > 0
+    with pytest.raises(RuntimeError, match="format 10"):
+        qann.load(path, mmap=True)
+
+
 def test_load_errors(tmp_path, refine_index):
     with pytest.raises(RuntimeError):
         qann.load(tmp_path / "missing.qann")
@@ -1576,6 +1614,18 @@ def test_loads_metadata_saved_on_macos():
     for row, saved_row, d, saved_d in zip(ids, saved_ids, dists, saved_dists):
         for i, j in zip(*np.nonzero(row[:, None] == saved_row[None, :])):
             np.testing.assert_allclose(d[i], saved_d[j], rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("mmap", [False, True])
+def test_loads_v10_refine_saved_on_macos(mmap):
+    # Saved on macOS (format version 10): a RefineIndex over Flat with custom ids,
+    # compacted deletions, a second add and uncompacted deletions, its rows at a
+    # 64 KB offset, so Linux maps a file written on another platform.
+    index = qann.load(DATA / "v10_refine.qann", mmap=mmap)
+    assert index.mapped == mmap and index.size() == 883
+    ids, dists = index.batch_query(np.load(DATA / "v10_queries.npy"), 10)
+    np.testing.assert_array_equal(ids, np.load(DATA / "v10_refine_ids.npy"))
+    np.testing.assert_allclose(dists, np.load(DATA / "v10_refine_dists.npy"), rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("name", ["flat", "hnsw_sq8", "refine_ivf_fs"])

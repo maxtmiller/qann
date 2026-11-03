@@ -23,7 +23,7 @@ using std::vector;
 using std::span;
 using std::pair;
 
-RefineIndex::RefineIndex(DenseIndex& base, size_t k_factor, bool custom_ids) : DenseIndex(base.metric()), base_(base), k_factor_(k_factor), id_map_(custom_ids) {
+RefineIndex::RefineIndex(DenseIndex& base, size_t k_factor, bool custom_ids) : DenseIndex(base.metric()), base_(base), k_factor_(k_factor), data_(base.dim()), id_map_(custom_ids) {
     if (base.slots() != 0) throw std::invalid_argument("base index must be empty");
     if (k_factor == 0) throw std::invalid_argument("k_factor must be >= 1");
     if (!base.ids_are_slots()) throw std::invalid_argument("base index must not use custom ids or have been compacted");
@@ -48,7 +48,7 @@ void RefineIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t
     id_map_.check(n, ids);
     base_.add_batch_impl(vecs, n, nullptr);
     id_map_.add(n, ids);
-    data_.insert(data_.end(), vecs.begin(), vecs.end());
+    data_.append(vecs);
 }
 
 size_t RefineIndex::candidates(size_t k, const detail::SlotFilter* filter) const {
@@ -72,7 +72,7 @@ vector<Neighbor> RefineIndex::direct_scan(span<const float> vec, size_t k, const
     detail::TopK top(k);
     const size_t d = dim();
     filter.for_each([&](uint32_t slot) {
-        const float dist = exact_score(vec.data(), data_.data() + size_t{slot} * d, d);
+        const float dist = exact_score(vec.data(), data_.row(slot), d);
         if (dist < top.threshold()) top.push(dist, id_map_.label(slot));
     });
     vector<Neighbor> results = top.take_sorted();
@@ -113,14 +113,15 @@ vector<Neighbor> RefineIndex::rerank(span<const float> vec, const vector<Neighbo
     vector<pair<float, size_t>> candidates;
     candidates.reserve(candidatesRaw.size());
     const size_t d = dim();
+    data_.will_need(candidatesRaw);
 
     for (size_t i = 0; i < candidatesRaw.size(); ++i) {
         constexpr size_t kAhead = 8;   // how many candidates ahead to prefetch
         if (i + kAhead < candidatesRaw.size()) {
-            const char* p = reinterpret_cast<const char*>(data_.data() + candidatesRaw[i + kAhead].index * dim());
-            for (size_t b = 0; b < dim() * sizeof(float); b += 64) __builtin_prefetch(p + b);
+            const char* p = reinterpret_cast<const char*>(data_.row(static_cast<uint32_t>(candidatesRaw[i + kAhead].index)));
+            for (size_t b = 0; b < d * sizeof(float); b += 64) __builtin_prefetch(p + b);
         }
-        float dst = exact_score(vec.data(), data_.data() + (candidatesRaw[i].index * d), d);
+        float dst = exact_score(vec.data(), data_.row(static_cast<uint32_t>(candidatesRaw[i].index)), d);
         candidates.emplace_back(dst, candidatesRaw[i].index);
     }
 
@@ -159,20 +160,7 @@ size_t RefineIndex::compact_impl(bool keep_ids) {
 
     base_.compact_as_base();
     metadata_.compact(remap);
-    size_t write_slot = 0;
-    for (size_t i = 0; i < remap.size(); ++i) {
-        uint32_t new_slot = remap[i];
-        if (remap[i] == detail::IdMap::kRemoved) continue;
-
-        if (new_slot != i) {
-            float* src = data_.data() + i * dim();
-            float* dst = data_.data() + new_slot * dim();
-            std::copy_n(src, dim(), dst);
-        }
-        ++write_slot;
-    }
-    data_.resize(write_slot * dim());
-    data_.shrink_to_fit();
+    data_.compact(remap, id_map_.slots());
 
     return remap.size() - id_map_.slots();
 }
@@ -184,12 +172,12 @@ void RefineIndex::save(std::ostream& out) const {
     write_pod(out, static_cast<uint64_t>(k_factor_));
     write_pod(out, static_cast<uint64_t>(id_map_.slots()));
     base_.save(out);
-    write_vec(out, data_);
+    data_.save(out);
     id_map_.save(out);
     metadata_.save(out);
 }
 
-std::unique_ptr<RefineIndex> RefineIndex::load_body(std::istream& in, uint32_t version) {
+std::unique_ptr<RefineIndex> RefineIndex::load_body(std::istream& in, uint32_t version, const detail::LoadContext* ctx) {
     using namespace detail;
 
     const auto k_factor = read_pod<uint64_t>(in);
@@ -213,11 +201,8 @@ std::unique_ptr<RefineIndex> RefineIndex::load_body(std::istream& in, uint32_t v
     const uint64_t dim = base->dim();
     if (count != base->slots() || count > UINT64_MAX / dim) throw std::runtime_error("corrupt file: invalid RefineIndex shape");
 
-    auto data = read_vec<float>(in, count * dim);
-    if (data.size() != count * dim) throw std::runtime_error("corrupt file: unexpected number of vectors");
-
+    auto data = VectorStore::load(in, version, count, dim, ctx);
     auto index = std::unique_ptr<RefineIndex>(new RefineIndex(std::move(base), k_factor));
-
     index->data_ = std::move(data);
 
     if (version >= 2) index->id_map_ = detail::IdMap::load(in, count, version);

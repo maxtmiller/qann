@@ -4,6 +4,7 @@
 #include "vecengine/id_map.hpp"
 #include "vecengine/fusion.hpp"
 #include "vecengine/sparse_index.hpp"
+#include "vecengine/vector_store.hpp"
 
 #include <array>
 #include <cstddef>
@@ -72,8 +73,9 @@ public:
     void save(std::ostream& out) const override;
 
     // Rebuilds a HybridIndex and the two indexes nested in it from the body
-    // save() wrote. Throws std::runtime_error on corrupt data.
-    static std::unique_ptr<HybridIndex> load_body(std::istream& in, uint32_t version);
+    // save() wrote; ctx as in RefineIndex::load_body. Throws std::runtime_error on corrupt data.
+    static std::unique_ptr<HybridIndex> load_body(std::istream& in, uint32_t version,
+                                                  const detail::LoadContext* ctx = nullptr);
 
     size_t slots() const noexcept override { return id_map_.slots(); }
     bool ids_are_slots() const noexcept override { return id_map_.ids_are_slots(); }

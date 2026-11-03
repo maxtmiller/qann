@@ -109,6 +109,18 @@ def test_remove_compact_save_load(tmp_path, docs):
     loaded.batch_query(docs["q_dense"], docs["q_sparse"], 10)
 
 
+def test_load_mmap_maps_the_dense_refine_part(tmp_path, docs):
+    h = make(docs, dense=qann.RefineIndex(qann.HNSWIndex(DIM), k_factor=4))
+    h.save(tmp_path / "h.qann")
+    loaded = qann.load(tmp_path / "h.qann", mmap=True)
+    assert loaded.dense.mapped
+    for where in (None, "group = 2"):
+        want = h.batch_query(docs["q_dense"], docs["q_sparse"], 10, where=where)
+        got = loaded.batch_query(docs["q_dense"], docs["q_sparse"], 10, where=where)
+        np.testing.assert_array_equal(got[0], want[0])
+        np.testing.assert_array_equal(got[1], want[1])
+
+
 def test_parts_are_protected_while_wrapped(docs):
     dense, sparse = qann.FlatIndex(DIM), qann.InvertedIndex()
     h = qann.HybridIndex(dense, sparse)

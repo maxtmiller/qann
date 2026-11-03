@@ -553,12 +553,16 @@ TEST_CASE("RefineIndex: load rejects truncated and corrupt data", "[refine][seri
     FlatIndex flat(dim);
     flat.add_batch(data, n);
 
-    auto body = [&](uint64_t k_factor, uint64_t count, size_t data_len) {
+    auto body = [&](uint64_t k_factor, uint64_t count, size_t data_len, uint32_t pad = 0) {
         std::stringstream t;
         write_pod<uint64_t>(t, k_factor);
         write_pod<uint64_t>(t, count);
         flat.save(t);
-        write_vec(t, std::vector<float>(data_len));
+        write_pod<uint64_t>(t, data_len);
+        write_pod<uint32_t>(t, pad);
+        t.write(std::string(pad, '\0').data(), pad);
+        const std::vector<float> rows(data_len);
+        t.write(reinterpret_cast<const char*>(rows.data()), static_cast<std::streamsize>(data_len * sizeof(float)));
         IdMap ids;
         ids.add(count, nullptr);
         ids.save(t);
@@ -569,6 +573,16 @@ TEST_CASE("RefineIndex: load rejects truncated and corrupt data", "[refine][seri
     SECTION("hand-written body is valid") {
         auto t = body(3, n, n * dim);
         REQUIRE(RefineIndex::load_body(t, kFormatVersion)->size() == n);
+    }
+
+    SECTION("padding before the vectors is skipped") {
+        auto t = body(3, n, n * dim, 100);
+        REQUIRE(RefineIndex::load_body(t, kFormatVersion)->size() == n);
+    }
+
+    SECTION("padding of 64 KB or more") {
+        auto t = body(3, n, n * dim, 64 * 1024);
+        REQUIRE_THROWS_AS(RefineIndex::load_body(t, kFormatVersion), std::runtime_error);
     }
 
     SECTION("k_factor = 0") {

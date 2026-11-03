@@ -965,7 +965,9 @@ NB_MODULE(qann, m) {
                      "Candidates fetched from base per result (k * k_factor)")
         .def_prop_ro("base", [](vecengine::RefineIndex& self) -> vecengine::DenseIndex& { return self.base(); },
                      nb::rv_policy::reference_internal,
-                     "The wrapped approximate index, e.g. to change nprobe on a loaded RefineIndex");
+                     "The wrapped approximate index, e.g. to change nprobe on a loaded RefineIndex")
+        .def_prop_ro("mapped", &vecengine::RefineIndex::mapped,
+                     "Whether the raw vectors are read from the file (qann.load(path, mmap=True)) rather than held in RAM");
 
     nb::class_<vecengine::SparseIndex, vecengine::IndexBase>(
         m, "SparseIndex",
@@ -1215,8 +1217,9 @@ NB_MODULE(qann, m) {
           "Construct a FlatIndex, IVFIndex, HNSWIndex, InvertedIndex or SparseApproxIndex from an IndexType and "
           "IndexOptions (dim is unused for the sparse ones)");
 
-    m.def("load", nb::overload_cast<const std::filesystem::path&>(&vecengine::load_index), nb::arg("path"),
-          nb::call_guard<nb::gil_scoped_release>(),
-          "Load an index saved with save(path); returns a FlatIndex, IVFIndex, HNSWIndex, RefineIndex, InvertedIndex or "
-          "SparseApproxIndex");
+    m.def("load", nb::overload_cast<const std::filesystem::path&, bool>(&vecengine::load_index), nb::arg("path"),
+          nb::kw_only(), nb::arg("mmap") = false, nb::call_guard<nb::gil_scoped_release>(),
+          "Load an index saved with save(path); returns the saved class (FlatIndex, IVFIndex, HNSWIndex, RefineIndex, "
+          "InvertedIndex, SparseApproxIndex or HybridIndex). mmap=True leaves a RefineIndex's raw vectors in the file "
+          "and reads them as queries need them; the file must then stay in place while the index is open");
 }
