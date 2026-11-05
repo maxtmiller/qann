@@ -155,6 +155,7 @@ def measure(args):
         warm = latencies(index, rows, args.k)
         print(f"  mapped  {args.label} {kf:4}  warm     {fmt(warm)}   ({1e6 / warm.mean():.0f} QPS), RSS {rss_mb():6.0f} MB",
               flush=True)
+        del index  # while it's open, the next evict() can't drop its mapped pages
 
 
 def reference(args):
@@ -194,10 +195,13 @@ def main():
 
     if sys.platform != "linux":
         sys.exit("cold runs need Linux (posix_fadvise DONTNEED)")
+    # Freed lists stay in this process's RSS (each is below glibc's mmap threshold), so the
+    # mapped runs go first and a build restarts the process before measuring.
     if not args.file.exists():
         build(args)
-    reference(args)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
     measure(args)
+    reference(args)
 
 
 if __name__ == "__main__":
