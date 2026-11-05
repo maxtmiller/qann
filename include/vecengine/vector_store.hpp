@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <iosfwd>
 #include <memory>
 #include <span>
@@ -21,12 +22,19 @@ class MappedFile {
 public:
     // Throws std::runtime_error if the file can't be opened or mapped.
     explicit MappedFile(const std::filesystem::path& path);
+
+    // A new file next to `near`, filled by write(out) and mapped, then deleted, so it lasts only as
+    // long as the map. Throws std::runtime_error if it can't be written (nothing is left behind).
+    static std::shared_ptr<const MappedFile> temporary(const std::filesystem::path& near,
+                                                       const std::function<void(std::ostream&)>& write);
     ~MappedFile();
     MappedFile(const MappedFile&) = delete;
     MappedFile& operator=(const MappedFile&) = delete;
 
     const char* data() const noexcept { return data_; }
     size_t size() const noexcept { return size_; }
+    // The file mapped, or for a temporary one the file it was made next to.
+    const std::filesystem::path& path() const noexcept { return path_; }
 
     // Turns readahead off (MADV_RANDOM) for the pages of [begin, begin + bytes), within the map.
     void advise_random(const char* begin, size_t bytes) const;
@@ -34,6 +42,7 @@ public:
 private:
     const char* data_ = nullptr;
     size_t size_ = 0;
+    std::filesystem::path path_;
 };
 
 // What load_body() needs beyond the stream. A set `file` (the file being

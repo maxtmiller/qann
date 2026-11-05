@@ -2,6 +2,7 @@
 
 #include "vecengine/id_map.hpp"
 #include "vecengine/sparse_index.hpp"
+#include "vecengine/vector_store.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -47,26 +48,19 @@ public:
     size_t postings() const noexcept;
 
     // Rebuilds an InvertedIndex from the body save() wrote, after
-    // load_index() has read the header. Throws std::runtime_error on corrupt
-    // data.
-    static std::unique_ptr<InvertedIndex> load_body(std::istream& in, uint32_t version);
+    // load_index() has read the header. With ctx->file set (format 11 on),
+    // the posting lists are mapped from that file instead of read. Throws
+    // std::runtime_error on corrupt data.
+    static std::unique_ptr<InvertedIndex> load_body(std::istream& in, uint32_t version,
+                                                    const detail::LoadContext* ctx = nullptr);
+
+    // Whether the posting lists are read from a file (qann.load(path, mmap=True)) rather than held in RAM.
+    bool mapped() const noexcept { return file_ != nullptr; }
 
 private:
-    struct Posting {
-        uint32_t slot;
-        float weight;
-    };
-
-    // A term's postings, in increasing slot order, and the extremes of their
-    // weights, which bound what the term can add to a score.
-    struct List {
-        vector<Posting> postings;
-        float max_weight = 0;
-        float min_weight = 0;
-
-        // Sets max_weight and min_weight from postings.
-        void bound();
-    };
+    using Posting = detail::SparsePosting;
+    // A term's postings, in increasing slot order (mapped ones first: they hold the older slots).
+    using List = detail::PostingList;
 
     const detail::IdMap& id_map() const noexcept override { return id_map_; }
 
@@ -76,6 +70,10 @@ private:
 
     // compact() and compact_as_base(): keep_ids as in IdMap::compact.
     size_t compact_impl(bool keep_ids);
+
+    // compact_impl() for mapped lists, which can't be rewritten in place: writes the
+    // compacted lists to a temporary file next to the loaded one and maps that instead.
+    void compact_mapped(const vector<uint32_t>& remap);
 
     // One query, term at a time, its lists taken
     // from the largest possible contribution down. With pruning_, once the
@@ -89,6 +87,7 @@ private:
     std::unordered_map<uint32_t, List> lists_;
     detail::IdMap id_map_;
     bool pruning_ = true;
+    std::shared_ptr<const detail::MappedFile> file_; // what mapped lists point into
 };
 
 } // namespace vecengine

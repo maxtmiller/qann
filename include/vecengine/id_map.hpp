@@ -94,6 +94,10 @@ public:
     // reassigns slots to ids to compact vector store 
     vector<uint32_t> compact(bool keep_ids);
 
+    // The remap compact() would return (each slot's new slot, or kRemoved; empty when nothing is
+    // deleted), without changing anything, for storage that must be rewritten before the ids change.
+    vector<uint32_t> compact_remap() const;
+
     // Whether every slot's id is the slot itself, which a RefineIndex base
     // needs: auto ids, never compacted with keep_ids, no gaps in the ids.
     bool ids_are_slots() const noexcept {

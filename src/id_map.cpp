@@ -151,13 +151,20 @@ SlotFilter IdMap::live(vector<uint64_t> words) const {
     return f;
 }
 
-vector<uint32_t> IdMap::compact(bool keep_ids) {
+vector<uint32_t> IdMap::compact_remap() const {
     if (deleted_count_ == 0) return {};
-
     vector<uint32_t> remap(slots_, kRemoved);
     uint32_t next = 0;
     for (size_t old = 0; old < slots_; ++old)
         if (!deleted_[old]) remap[old] = next++;
+    return remap;
+}
+
+vector<uint32_t> IdMap::compact(bool keep_ids) {
+    if (deleted_count_ == 0) return {};
+
+    vector<uint32_t> remap = compact_remap();
+    const uint32_t next = static_cast<uint32_t>(slots_ - deleted_count_);
 
     if (keep_ids && !custom_ids_ && labels_.empty()) {
         labels_.resize(slots_);

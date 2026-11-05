@@ -301,3 +301,48 @@ def test_sparse_approx_loads_file_saved_on_macos():
     np.testing.assert_allclose(dists, np.load(DATA / "v9_sparse_approx_dists.npy"), rtol=1e-5, atol=1e-5)
     index.compact()
     assert index.size() == 1363
+
+
+@pytest.mark.parametrize("kind", ["inverted", "approx"])
+def test_load_mmap(tmp_path, kind):
+    rng = np.random.default_rng(31)
+    docs, queries = _random_csr(rng, 2000, 300, 15), _random_csr(rng, 20, 300, 8)
+    index = qann.InvertedIndex(custom_ids=True) if kind == "inverted" else qann.SparseApproxIndex(custom_ids=True, list_depth=0)
+    index.add(docs, ids=np.arange(2000) + 10, metadata={"group": np.arange(2000) % 3})
+    path = tmp_path / "sparse.qann"
+    index.save(path)
+
+    mapped = qann.load(path, mmap=True)
+    assert mapped.mapped and not index.mapped and not qann.load(path).mapped
+
+    def same(a, b):
+        for kw in ({}, {"where": "group = 1"}, {"allowed": np.arange(10, 60)}):
+            ia, da = a.batch_query(queries, 10, **kw)
+            ib, db = b.batch_query(queries, 10, **kw)
+            np.testing.assert_array_equal(ia, ib)
+            np.testing.assert_array_equal(da, db)
+
+    same(index, mapped)
+    for i in (index, mapped):
+        i.add(docs[:200], ids=np.arange(200) + 5000)
+        i.remove(np.arange(10, 2010, 2))
+        i.compact()
+    assert mapped.mapped  # compaction maps a new temporary file
+    same(index, mapped)
+    mapped.save(path)
+    same(index, qann.load(path, mmap=True))
+    assert list(tmp_path.iterdir()) == [path]  # the temporary file is gone
+
+
+@pytest.mark.parametrize("mmap", [False, True])
+@pytest.mark.parametrize("name", ["sparse", "sparse_approx"])
+def test_loads_v11_saved_on_macos(name, mmap):
+    # Saved on macOS (format version 11): custom ids, compacted deletions, a second add
+    # (unsorted entries in the approximate index's lists) and uncompacted deletions, so
+    # Linux maps posting lists and a forward index written on another platform. Scores are
+    # fused multiply-adds in a fixed order, so distances match exactly.
+    index = qann.load(DATA / f"v11_{name}.qann", mmap=mmap)
+    assert index.mapped == mmap and index.size() == 1073
+    ids, dists = index.batch_query(sp.load_npz(DATA / "v11_sparse_queries.npz"), 10)
+    np.testing.assert_array_equal(ids, np.load(DATA / f"v11_{name}_ids.npy"))
+    np.testing.assert_array_equal(dists, np.load(DATA / f"v11_{name}_dists.npy"))

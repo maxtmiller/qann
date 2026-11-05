@@ -202,8 +202,8 @@ std::unique_ptr<HybridIndex> HybridIndex::load_body(std::istream& in, uint32_t v
     if (header.version != version) throw std::runtime_error("corrupt file: HybridIndex parts have a different format version");
     std::unique_ptr<SparseIndex> sparse;
     switch (header.kind) {
-        case IndexKind::Inverted: sparse = InvertedIndex::load_body(in, version); break;
-        case IndexKind::SparseApprox: sparse = SparseApproxIndex::load_body(in, version); break;
+        case IndexKind::Inverted: sparse = InvertedIndex::load_body(in, version, ctx); break;
+        case IndexKind::SparseApprox: sparse = SparseApproxIndex::load_body(in, version, ctx); break;
         default: throw std::runtime_error("corrupt file: a HybridIndex's sparse index must be Inverted or SparseApprox");
     }
     for (const IndexBase* part : {static_cast<const IndexBase*>(dense.get()), static_cast<const IndexBase*>(sparse.get())})
