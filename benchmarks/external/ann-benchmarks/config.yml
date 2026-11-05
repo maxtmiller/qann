@@ -8,7 +8,8 @@ float:
     name: qann-hnsw
     run_groups:
       base:
-        args: [[8, 16, 24, 32, 48, 64], [500]]
+        # up to 96 like hnswlib's sweep, so both reach the same top recall (issue #129)
+        args: [[8, 16, 24, 32, 48, 64, 96], [500]]
         query_args: [[10, 20, 40, 80, 120, 200, 400, 600, 800]]
   - base_args: ['@metric']
     constructor: QannHNSW
@@ -36,3 +37,9 @@ float:
         # k_factor up to 64: with 4-bit codes on hard data (gist) the true top 10
         # only make the re-ranked candidates at 32 or 64 (issue #64)
         query_args: [[1, 2, 4, 8, 16, 32, 64, 128, 256], [4, 8, 16, 32, 64]]
+      deep:
+        # glove-100 and nytimes-256 still gained recall at nlist 256, nprobe 256 (every list)
+        # and k_factor 64, so the cap was the re-rank depth (issue #129). Only the builds that
+        # reached the top, to keep the sweep's run time.
+        args: [[256, 512], [2], [false]]
+        query_args: [[128, 256], [128, 256]]
