@@ -49,7 +49,7 @@ std::unique_ptr<IndexBase> load_index(std::istream& in, const detail::LoadContex
     const detail::Header header = detail::read_header(in);
     switch (header.kind) {
         case detail::IndexKind::Flat:   return FlatIndex::load_body(in, header.version);
-        case detail::IndexKind::IVF:    return IVFIndex::load_body(in, header.version);
+        case detail::IndexKind::IVF:    return IVFIndex::load_body(in, header.version, ctx);
         case detail::IndexKind::Refine: return RefineIndex::load_body(in, header.version, ctx);
         case detail::IndexKind::HNSW:   return HNSWIndex::load_body(in, header.version);
         case detail::IndexKind::Inverted: return InvertedIndex::load_body(in, header.version);

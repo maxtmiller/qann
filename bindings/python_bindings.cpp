@@ -897,6 +897,8 @@ NB_MODULE(qann, m) {
         .def_prop_ro("fast_scan",
                      [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.fast_scan(); }); },
                      "Whether enable_pq(..., fast_scan=True) was used")
+        .def_prop_ro("mapped", &vecengine::IVFIndex::mapped,
+                     "Whether float or SQ lists are read from the file (qann.load(path, mmap=True)) rather than held in RAM")
         .def_prop_rw("nprobe",
                      [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.nprobe(); }); },
                      [](vecengine::IVFIndex& self, std::size_t v) { write_locked(self, [&] { self.set_nprobe(v); }); },
@@ -1220,6 +1222,7 @@ NB_MODULE(qann, m) {
     m.def("load", nb::overload_cast<const std::filesystem::path&, bool>(&vecengine::load_index), nb::arg("path"),
           nb::kw_only(), nb::arg("mmap") = false, nb::call_guard<nb::gil_scoped_release>(),
           "Load an index saved with save(path); returns the saved class (FlatIndex, IVFIndex, HNSWIndex, RefineIndex, "
-          "InvertedIndex, SparseApproxIndex or HybridIndex). mmap=True leaves a RefineIndex's raw vectors in the file "
-          "and reads them as queries need them; the file must then stay in place while the index is open");
+          "InvertedIndex, SparseApproxIndex or HybridIndex). mmap=True leaves a RefineIndex's raw vectors and an "
+          "IVFIndex's float and SQ lists in the file and reads them as queries need them; the file must then stay in "
+          "place while the index is open");
 }

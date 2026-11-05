@@ -36,6 +36,10 @@ using std::vector;
 using std::span;
 using std::pair;
 
+// File offset float and SQ list rows start at (format 11): a cache line, and float-aligned for
+// mapping. Lists can number 65,535, so a page per list would waste up to 4 GB.
+static constexpr uint64_t kListAlign = 64;
+
 IVFIndex::IVFIndex(size_t dim, size_t nlist, size_t nprobe, bool custom_ids, Metric metric): DenseIndex(metric), dim_(dim), nlist_(nlist), nprobe_(nprobe), id_map_(custom_ids)  {
     if (nlist < 100 || nlist > 65535) throw std::invalid_argument("nlist must be in [100, 65535]");
     if (dim == 0) throw std::invalid_argument("dim must be >= 1");
@@ -202,6 +206,7 @@ void IVFIndex::rebuild_slot_lookup() {
     slot_pos_.resize(id_map_.slots());
     for (const auto& [l, list] : data_)
         for (size_t j = 0; j < list.ids.size(); ++j) {
+            if (list.ids[j] == detail::IdMap::kRemoved) continue;
             slot_list_[list.ids[j]] = l;
             slot_pos_[list.ids[j]] = static_cast<uint32_t>(j);
         }
@@ -214,10 +219,10 @@ vector<Neighbor> IVFIndex::direct_scan(span<const float> vec, size_t k, const de
         const size_t j = slot_pos_[slot];
         float dist;
         if (sq_bits_) {
-            const uint8_t* code = list.codes.data() + j * sq_code_bytes();
+            const uint8_t* code = list.code(j, sq_code_bytes());
             dist = metric_ == Metric::InnerProduct ? -sq_.inner_product(vec.data(), code) : sq_.distance(vec.data(), code);
         } else {
-            dist = exact_score(vec.data(), list.vecs.data() + j * dim_, dim_);
+            dist = exact_score(vec.data(), list.vec(j, dim_), dim_);
         }
         if (dist < top.threshold()) top.push(dist, id_map_.label(slot));
     });
@@ -502,17 +507,21 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
         };
         // with a filter, whether vector j passes it, checked before scoring so a
         // rejected vector costs no distance; unfiltered queries score every vector
-        auto passes = [&](size_t j) { return !filter || filter->test(list.ids[j]); };
+        // (removed: a mapped list's compaction marks its removed vectors rather than moving rows)
+        auto passes = [&](size_t j) {
+            const uint32_t slot = list.ids[j];
+            return slot != detail::IdMap::kRemoved && (!filter || filter->test(slot));
+        };
 
         if (sq_bits_) {
             VECENGINE_PROF_START(t_raw);
             const size_t w = sq_code_bytes();
             if (metric_ == Metric::InnerProduct) {
                 for (size_t j = 0; j < listSize; ++j)
-                    if (passes(j)) push(-sq_.inner_product(vec.data(), list.codes.data() + j * w), j);
+                    if (passes(j)) push(-sq_.inner_product(vec.data(), list.code(j, w)), j);
             } else {
                 for (size_t j = 0; j < listSize; ++j)
-                    if (passes(j)) push(sq_.distance(vec.data(), list.codes.data() + j * w), j);
+                    if (passes(j)) push(sq_.distance(vec.data(), list.code(j, w)), j);
             }
             VECENGINE_PROF_STOP(t_raw, kProfRawScan);
             continue;
@@ -521,7 +530,7 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
         if (!pq_enabled()) {
             VECENGINE_PROF_START(t_raw);
             for (size_t j = 0; j < listSize; ++j)
-                if (passes(j)) push(exact_score(vec.data(), list.vecs.data() + j * dim_, dim_), j);
+                if (passes(j)) push(exact_score(vec.data(), list.vec(j, dim_), dim_), j);
             VECENGINE_PROF_STOP(t_raw, kProfRawScan);
             continue;
         }
@@ -620,7 +629,18 @@ void IVFIndex::compact_storage(const vector<uint32_t>& remap) {
         auto it = data_.find(i);
         if (it == data_.end()) continue;
         InvertedList& list = it->second;
-        
+
+        // a mapped list's rows can't move: renumber in place and mark the removed ones
+        if (list.mapped) {
+            size_t live = 0;
+            for (uint32_t& slot : list.ids) {
+                if (slot != detail::IdMap::kRemoved) slot = remap[slot];
+                live += slot != detail::IdMap::kRemoved;
+            }
+            if (live == 0) data_.erase(it);
+            continue;
+        }
+
         for (size_t j = 0; j < list.ids.size(); ++j) {
             uint32_t new_slot = remap[list.ids[j]];
             if (new_slot == detail::IdMap::kRemoved) continue;
@@ -658,7 +678,8 @@ void IVFIndex::compact_storage(const vector<uint32_t>& remap) {
             list.vecs.shrink_to_fit();
         }
     }
-    
+    if (file_ && std::none_of(data_.begin(), data_.end(), [](const auto& entry) { return entry.second.mapped != nullptr; }))
+        file_.reset();
 }
 
 void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_iters, std::optional<uint32_t> seed) {
@@ -733,11 +754,40 @@ void IVFIndex::save(std::ostream& out) const {
     }
 
     static const InvertedList empty;
+    const size_t row_bytes = sq_bits_ ? sq_code_bytes() : dim_ * sizeof(float);
     for (uint16_t i = 0; i < nlist_; ++i) {
         auto it = data_.find(i);
         const InvertedList& list = it == data_.end() ? empty : it->second;
-        write_vec(out, list.ids);
-        if (pq_ || sq_bits_) write_vec(out, list.codes); else write_vec(out, list.vecs);
+        if (pq_) {
+            write_vec(out, list.ids);
+            write_vec(out, list.codes);
+            continue;
+        }
+        // float and SQ rows (version 11) start at a 64-byte offset, so a load with mmap can point
+        // into the file
+        const size_t per_row = sq_bits_ ? row_bytes : dim_;   // elements per row in the stored count
+        if (!list.mapped) {
+            write_vec(out, list.ids);
+            write_pod(out, static_cast<uint64_t>(list.ids.size() * per_row));
+            write_pad(out, kListAlign);
+            const char* rows = sq_bits_ ? reinterpret_cast<const char*>(list.codes.data())
+                                        : reinterpret_cast<const char*>(list.vecs.data());
+            out.write(rows, static_cast<std::streamsize>(list.ids.size() * row_bytes));
+            continue;
+        }
+        // a mapped list writes only its live rows (compaction only marked the removed ones)
+        vector<uint32_t> live;
+        for (uint32_t slot : list.ids)
+            if (slot != IdMap::kRemoved) live.push_back(slot);
+        write_vec(out, live);
+        write_pod(out, static_cast<uint64_t>(live.size() * per_row));
+        write_pad(out, kListAlign);
+        for (size_t j = 0; j < list.ids.size(); ++j) {
+            if (list.ids[j] == IdMap::kRemoved) continue;
+            const char* row = sq_bits_ ? reinterpret_cast<const char*>(list.code(j, row_bytes))
+                                       : reinterpret_cast<const char*>(list.vec(j, dim_));
+            out.write(row, static_cast<std::streamsize>(row_bytes));
+        }
     }
     id_map_.save(out);
     write_pod(out, static_cast<uint8_t>(use_precomputed_));
@@ -745,7 +795,7 @@ void IVFIndex::save(std::ostream& out) const {
     metadata_.save(out);
 }
 
-std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version) {
+std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version, const detail::LoadContext* ctx) {
     using namespace detail;
 
     const auto dim = read_pod<uint64_t>(in);
@@ -816,7 +866,27 @@ std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version
         InvertedList list;
         list.ids = read_vec<uint32_t>(in, n_total);
 
-        if (index->sq_bits_) {
+        if (!index->pq_ && version >= 11) {
+            // float or SQ rows after a pad: mapped with ctx->file (kernel readahead suits
+            // a scan reading each list front to back), read otherwise
+            const size_t row_bytes = index->sq_bits_ ? index->sq_code_bytes() : dim * sizeof(float);
+            const uint64_t expected = list.ids.size() * (index->sq_bits_ ? row_bytes : dim);
+            if (read_pod<uint64_t>(in) != expected) throw std::runtime_error("corrupt file: IVF list length mismatch");
+            read_pad(in, kListAlign);
+            const uint64_t bytes = list.ids.size() * row_bytes;
+            if (ctx && ctx->file && bytes > 0) {
+                list.mapped = map_next(in, *ctx->file, bytes, alignof(float));
+                list.mapped_rows = list.ids.size();
+                index->file_ = ctx->file;
+            } else if (index->sq_bits_) {
+                list.codes.resize(bytes);
+                in.read(reinterpret_cast<char*>(list.codes.data()), static_cast<std::streamsize>(bytes));
+            } else {
+                list.vecs.resize(expected);
+                in.read(reinterpret_cast<char*>(list.vecs.data()), static_cast<std::streamsize>(bytes));
+            }
+            if (!in) throw std::runtime_error("truncated file");
+        } else if (index->sq_bits_) {
             const uint64_t expected = list.ids.size() * index->sq_code_bytes();
             list.codes = read_vec<uint8_t>(in, expected);
             if (list.codes.size() != expected) throw std::runtime_error("corrupt file: IVF code length mismatch");

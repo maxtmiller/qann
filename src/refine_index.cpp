@@ -190,7 +190,7 @@ std::unique_ptr<RefineIndex> RefineIndex::load_body(std::istream& in, uint32_t v
         throw std::runtime_error("corrupt file: RefineIndex base has a different format version");
     switch (header.kind) {
         case IndexKind::Flat: base = FlatIndex::load_body(in, header.version); break;
-        case IndexKind::IVF:  base = IVFIndex::load_body(in, header.version); break;
+        case IndexKind::IVF:  base = IVFIndex::load_body(in, header.version, ctx); break;
         case IndexKind::HNSW: base = HNSWIndex::load_body(in, header.version); break;
         default: throw std::runtime_error("corrupt file: RefineIndex base must be Flat, IVF or HNSW");
     }
