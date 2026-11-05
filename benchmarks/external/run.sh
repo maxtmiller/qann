@@ -161,6 +161,14 @@ run_ann() {
     # (a small probed list, or a zero query normalized to NaN), and ann-benchmarks then
     # rejects the whole index for duplicate ids. Drop the padding, as the batch path does.
     sed -i 's/^        return I\[0\]$/        return I[0][I[0] >= 0]/' ann_benchmarks/algorithms/faiss/module.py
+    # Upstream's IVFPQfs factory PQ{d//2}x4fs fails when d // 2 doesn't divide d (glove-25), so
+    # faiss had no glove-25 results. Zero-pad an odd d to a multiple of 8 as the qann adapter does
+    # (distances unchanged; glove-25 gets PQ16, like qann's m=16). The IVF then sits under the
+    # Pad transform, so nprobe is set on the extracted IVF.
+    sed -i 's|^        factory_string = f"IVF{self._n_list},PQ{d//2}x4fs"$|        p = d + -d % 8 if d % 2 else d\n        factory_string = (f"Pad{p}," if p != d else "") + f"IVF{self._n_list},PQ{p // 2}x4fs"|' \
+        ann_benchmarks/algorithms/faiss/module.py
+    sed -i 's/^        self.base_index.nprobe = self._n_probe$/        faiss.extract_index_ivf(self.base_index).nprobe = self._n_probe/' \
+        ann_benchmarks/algorithms/faiss/module.py
 
     log "Building images: qann ${compare}"
     venv/bin/python install.py --algorithm qann
