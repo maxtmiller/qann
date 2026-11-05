@@ -107,6 +107,10 @@ vector<Neighbor> SparseApproxIndex::query_impl(const Terms& terms, size_t k, con
         std::nth_element(best.begin(), best.begin() + (keep - 1), best.end());
         best.resize(keep);
     }
+    // in slot order, so a tie at the k-th place goes to the lower slot whatever order the lists
+    // and nth_element left the candidates in (a mapped list's unsorted tail differs from a RAM
+    // list's); the forward rows are then read in file order too
+    std::sort(best.begin(), best.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
 
     // Re-score the candidates with the whole query. Terms are added in the
     // order InvertedIndex::query_impl adds its lists (the most a term can add
