@@ -368,11 +368,10 @@ std::unique_ptr<SparseApproxIndex> SparseApproxIndex::load_body(std::istream& in
         const uint64_t entries = index->fwd_ptr_.back();
         if (read_pod<uint64_t>(in) != entries) throw std::runtime_error("corrupt file: invalid SparseApproxIndex forward index");
         read_pad(in, kPostingAlign);
+        const char* fwd_at = nullptr;
         if (ctx && ctx->file && entries > 0) {
-            const char* at = map_next(in, *ctx->file, entries * sizeof(FwdEntry), alignof(FwdEntry));
-            // re-scoring reads candidates' rows, scattered: readahead would only fetch rows nobody asked for
-            ctx->file->advise_random(at, entries * sizeof(FwdEntry));
-            index->fwd_mapped_ = span<const FwdEntry>(reinterpret_cast<const FwdEntry*>(at), entries);
+            fwd_at = map_next(in, *ctx->file, entries * sizeof(FwdEntry), alignof(FwdEntry));
+            index->fwd_mapped_ = span<const FwdEntry>(reinterpret_cast<const FwdEntry*>(fwd_at), entries);
             index->file_ = ctx->file;
         } else {
             index->fwd_ram_.resize(entries);
@@ -384,6 +383,9 @@ std::unique_ptr<SparseApproxIndex> SparseApproxIndex::load_body(std::istream& in
             for (uint64_t r = index->fwd_ptr_[slot] + 1; r < index->fwd_ptr_[slot + 1]; ++r)
                 if (index->fwd(r).term <= index->fwd(r - 1).term)
                     throw std::runtime_error("corrupt file: SparseApproxIndex forward index out of order");
+        // only after the check above, which reads the rows in order and needs readahead: re-scoring
+        // reads candidates' rows, scattered, where readahead would fetch rows nobody asked for
+        if (fwd_at) ctx->file->advise_random(fwd_at, entries * sizeof(FwdEntry));
     }
     index->id_map_ = IdMap::load(in, count, version);
     index->metadata_ = MetadataStore::load(in, count);
