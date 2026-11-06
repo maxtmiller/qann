@@ -254,18 +254,20 @@ TEST_CASE("kmeans: same seed gives identical results", "[kmeans]") {
 // ---------------------------------------------------------------------------
 
 // Compares against a full sort for k below, near and above n, so both the
-// compaction path (buffer hits 2k) and the never-full path run.
+// compaction path (buffer hits 2k) and the never-full path run, with ids that
+// fit in 32 bits and ids that don't (take_sorted sorts those differently).
 TEST_CASE("TopK: matches a full sort", "[topk]") {
     std::mt19937 rng(7);
     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+    for (size_t base : {size_t{0}, size_t{1} << 40}) {
     for (size_t k : {size_t{1}, size_t{5}, size_t{160}, size_t{3000}}) {
         for (size_t n : {size_t{0}, size_t{1}, size_t{7}, size_t{1000}, size_t{2000}}) {
             std::vector<std::pair<float, size_t>> all;
             vecengine::detail::TopK top(k);
             for (size_t i = 0; i < n; ++i) {
                 float d = dist(rng);
-                all.emplace_back(d, i);
-                if (d < top.threshold()) top.push(d, i);
+                all.emplace_back(d, base + i);
+                if (d < top.threshold()) top.push(d, base + i);
             }
             std::sort(all.begin(), all.end());
             all.resize(std::min(k, n));
@@ -276,6 +278,33 @@ TEST_CASE("TopK: matches a full sort", "[topk]") {
                 REQUIRE(got[i].index == all[i].second);
                 REQUIRE(got[i].distance == all[i].first);
             }
+        }
+    }
+    }
+}
+
+// Many candidates share a few distances, negative ones included, so trims cut
+// through ties: the first pushed of those tied at the k-th distance are kept.
+TEST_CASE("TopK: keeps the first pushed of tied candidates", "[topk]") {
+    std::mt19937 rng(3);
+    std::uniform_int_distribution<int> level(-4, 4);
+    for (size_t k : {size_t{1}, size_t{10}, size_t{100}}) {
+        std::vector<std::pair<float, size_t>> all;
+        vecengine::detail::TopK top(k);
+        for (size_t i = 0; i < 2000; ++i) {
+            const float d = 0.5f * static_cast<float>(level(rng));
+            all.emplace_back(d, i);
+            if (d < top.threshold()) top.push(d, i);
+        }
+        std::stable_sort(all.begin(), all.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+        all.resize(k);
+        std::sort(all.begin(), all.end());
+
+        auto got = top.take_sorted();
+        REQUIRE(got.size() == k);
+        for (size_t i = 0; i < k; ++i) {
+            REQUIRE(got[i].index == all[i].second);
+            REQUIRE(got[i].distance == all[i].first);
         }
     }
 }
