@@ -332,7 +332,9 @@ std::unique_ptr<HNSWIndex> HNSWIndex::load_body(std::istream& in, uint32_t versi
 
 vector<HNSWIndex::Candidate> HNSWIndex::search_layer(Probe q, span<const uint32_t> entry_points, size_t ef, int level, bool skip_deleted, bool locked,
                                                     const detail::SlotFilter* filter) const {
-    t_visited.begin(slots());
+    // one thread-local lookup per search: through a shared library each access costs a __tls_get_addr call
+    VisitedTags& visited = t_visited;
+    visited.begin(slots());
     vector<uint32_t> copy;   // a locked search's snapshot of the list being expanded
     if (locked) copy.reserve(capacity(level));
     vector<uint32_t> fresh;  // the expanded node's neighbors not visited yet
@@ -343,16 +345,18 @@ vector<HNSWIndex::Candidate> HNSWIndex::search_layer(Probe q, span<const uint32_
 
     // a node always joins minHeap to be expanded; it joins the results
     // (maxHeap) unless it is deleted (or outside the filter) and the caller
-    // skips deleted nodes
+    // skips deleted nodes. With nothing deleted and no filter there is nothing
+    // to check: the deleted bits are a random read, a cache miss per node.
+    const bool check = skip_deleted && (filter || id_map_.live() != id_map_.slots());
     auto admit = [&](float dist, uint32_t slot) {
         minHeap.emplace(dist, slot);
-        if (skip_deleted && (filter ? !filter->test(slot) : id_map_.is_deleted(slot))) return;
+        if (check && (filter ? !filter->test(slot) : id_map_.is_deleted(slot))) return;
         maxHeap.emplace(dist, slot);
         if (maxHeap.size() > ef) maxHeap.pop();
     };
 
     for (uint32_t p : entry_points) {
-        if (t_visited.visit(p)) admit(distance(q, p), p);
+        if (visited.visit(p)) admit(distance(q, p), p);
     }
 
     while (!minHeap.empty()) {
@@ -380,14 +384,19 @@ vector<HNSWIndex::Candidate> HNSWIndex::search_layer(Probe q, span<const uint32_
         // beat the worst result (or fill the results)
         fresh.clear();
         for (uint32_t n : list) {
-            if (t_visited.visit(n)) {
+            if (visited.visit(n)) {
                 fresh.push_back(n);
                 prefetch_vector(n);
             }
         }
         for (uint32_t n : fresh) {
             const float dist = distance(q, n);
-            if (maxHeap.size() < ef || dist < maxHeap.top().first) admit(dist, n);
+            if (maxHeap.size() >= ef && dist >= maxHeap.top().first) continue;
+            // admit() written out: on this, the hottest path, the compiler kept the lambda as a call
+            minHeap.emplace(dist, n);
+            if (check && (filter ? !filter->test(n) : id_map_.is_deleted(n))) continue;
+            maxHeap.emplace(dist, n);
+            if (maxHeap.size() > ef) maxHeap.pop();
         }
     }
 
