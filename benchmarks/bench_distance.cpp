@@ -39,8 +39,8 @@ static void BM_L2_AVX2(benchmark::State& state) {
         benchmark::DoNotOptimize(vecengine::l2_distance_avx2(vp.a.data(), vp.b.data(), N));
 }
 
-// The _AVX512 kernels exist only in VECENGINE_NATIVE builds on a CPU with
-// AVX-512; elsewhere they forward to scalar.
+// The _AVX512 kernels need a CPU with AVX-512 (they stop with an illegal
+// instruction elsewhere); on arm64 they forward to scalar.
 template <std::size_t N>
 static void BM_L2_AVX512(benchmark::State& state) {
     VecPair<N> vp;
