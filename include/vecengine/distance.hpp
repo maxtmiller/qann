@@ -41,11 +41,23 @@ float l2_distance_neon(const float* a, const float* b, std::size_t n);
 float cosine_distance_neon(const float* a, const float* b, std::size_t n);
 float inner_product_neon(const float* a, const float* b, std::size_t n);
 
-// AVX-512 versions, used only by builds that target it (VECENGINE_NATIVE on a
-// CPU with AVX-512); portable x86 builds stay on AVX2.
+// AVX-512 versions. Builds that target AVX-512 (VECENGINE_NATIVE on such a CPU)
+// call them directly; other x86 builds with GCC or Clang compile them anyway and
+// call them when the CPU has AVX-512 (detail::kAvx512), else the AVX2 ones.
 float l2_distance_avx512(const float* a, const float* b, std::size_t n);
 float cosine_distance_avx512(const float* a, const float* b, std::size_t n);
 float inner_product_avx512(const float* a, const float* b, std::size_t n);
+
+#if !defined(__AVX512F__) && (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+#  define VECENGINE_AVX512_DISPATCH 1
+namespace detail {
+// Whether this CPU runs AVX-512, checked once at load. Reads false before
+// then, which only means the AVX2 kernels.
+extern const bool kAvx512;
+} // namespace detail
+#else
+#  define VECENGINE_AVX512_DISPATCH 0
+#endif
 
 } // namespace vecengine
 

@@ -63,19 +63,39 @@ TEST_CASE("l2_distance_scalar: known values", "[l2][scalar]") {
 
 TEST_CASE("SIMD distance kernels match the scalar ones at every dimension", "[l2][ip][cosine][simd]") {
     // every unrolled loop and tail length of whichever kernels this build uses
-    // (AVX-512 with VECENGINE_NATIVE on a CPU that has it, else AVX2 or NEON)
+    // (AVX-512 where the CPU has it, else AVX2 or NEON), and on x86 builds that
+    // choose at run time, the AVX2 ones too
     for (size_t dim = 1; dim <= 140; ++dim) {
         CAPTURE(dim);
         const auto v = random_vectors(2, dim, static_cast<unsigned>(dim));
         const float* a = v.data();
         const float* b = v.data() + dim;
         const float l2 = vecengine::l2_distance_scalar(a, b, dim);
-        REQUIRE_THAT(vecengine::l2_distance(a, b, dim), WithinAbs(l2, 1e-5f * (1.0f + l2)));
         const float ip = vecengine::inner_product_scalar(a, b, dim);
+        const float cos = vecengine::cosine_distance_scalar(a, b, dim);
+        REQUIRE_THAT(vecengine::l2_distance(a, b, dim), WithinAbs(l2, 1e-5f * (1.0f + l2)));
         REQUIRE_THAT(vecengine::inner_product(a, b, dim), WithinAbs(ip, 1e-5f * (1.0f + std::abs(ip))));
-        REQUIRE_THAT(vecengine::cosine_distance(a, b, dim), WithinAbs(vecengine::cosine_distance_scalar(a, b, dim), 1e-5f));
+        REQUIRE_THAT(vecengine::cosine_distance(a, b, dim), WithinAbs(cos, 1e-5f));
+#if VECENGINE_AVX512_DISPATCH && defined(__AVX2__)
+        REQUIRE_THAT(vecengine::l2_distance_avx2(a, b, dim), WithinAbs(l2, 1e-5f * (1.0f + l2)));
+        REQUIRE_THAT(vecengine::inner_product_avx2(a, b, dim), WithinAbs(ip, 1e-5f * (1.0f + std::abs(ip))));
+        REQUIRE_THAT(vecengine::cosine_distance_avx2(a, b, dim), WithinAbs(cos, 1e-5f));
+#endif
     }
 }
+
+#if VECENGINE_AVX512_DISPATCH
+TEST_CASE("x86 builds call the AVX-512 kernels exactly when the CPU has AVX-512", "[simd]") {
+    const auto v = random_vectors(2, 100, 1);
+    const float *a = v.data(), *b = v.data() + 100;
+    // the kernels sum in different orders, so the result is bit-identical to the chosen one;
+    // the AVX-512 kernel is only called where it can run
+    CAPTURE(vecengine::detail::kAvx512);
+    const float want = vecengine::detail::kAvx512 ? vecengine::l2_distance_avx512(a, b, 100)
+                                                  : vecengine::l2_distance_avx2(a, b, 100);
+    REQUIRE(vecengine::l2_distance(a, b, 100) == want);
+}
+#endif
 
 TEST_CASE("FlatIndex: query returns self at rank 0", "[index]") {
     vecengine::FlatIndex idx(3);

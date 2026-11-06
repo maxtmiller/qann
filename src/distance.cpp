@@ -3,7 +3,7 @@
 #include <cmath>
 #include <numeric>
 
-#if defined(__AVX2__) || defined(__AVX512F__)
+#if defined(__AVX2__) || defined(__AVX512F__) || VECENGINE_AVX512_DISPATCH
 #  include <immintrin.h>
 #endif
 
@@ -160,16 +160,33 @@ float inner_product_avx2(const float* a, const float* b, std::size_t n) { return
 #endif // __AVX2__
 
 // ---------------------------------------------------------------------------
-// AVX-512 implementations (builds with -march=native on a CPU that has it)
+// AVX-512 implementations: built for AVX-512 (VECENGINE_NATIVE on such a CPU),
+// or compiled per function on every other x86 build and chosen at run time
 // ---------------------------------------------------------------------------
 
-#if defined(__AVX512F__)
+#if defined(__AVX512F__) || VECENGINE_AVX512_DISPATCH
+
+#if VECENGINE_AVX512_DISPATCH
+// Only these functions are compiled for AVX-512, not the whole file: a file
+// built with -mavx512f could emit AVX-512 code into inline functions it shares
+// with other files (std:: templates), which the linker may then pick for all
+// of them, and those would crash on CPUs without it.
+#  define VECENGINE_TARGET_AVX512 __attribute__((target("avx512f")))
+namespace detail {
+const bool kAvx512 = [] {
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx512f") != 0;
+}();
+} // namespace detail
+#else
+#  define VECENGINE_TARGET_AVX512
+#endif
 
 // The last n % 16 dimensions go through one masked step: lanes past n load as
 // zero, so they add nothing to any sum.
 static inline __mmask16 tail_mask(std::size_t left) { return static_cast<__mmask16>((1u << left) - 1); }
 
-float l2_distance_avx512(const float* a, const float* b, std::size_t n) {
+VECENGINE_TARGET_AVX512 float l2_distance_avx512(const float* a, const float* b, std::size_t n) {
     __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
     __m512 acc2 = _mm512_setzero_ps(), acc3 = _mm512_setzero_ps();
     std::size_t i = 0;
@@ -196,7 +213,7 @@ float l2_distance_avx512(const float* a, const float* b, std::size_t n) {
     return _mm512_reduce_add_ps(_mm512_add_ps(_mm512_add_ps(acc0, acc1), _mm512_add_ps(acc2, acc3)));
 }
 
-float cosine_distance_avx512(const float* a, const float* b, std::size_t n) {
+VECENGINE_TARGET_AVX512 float cosine_distance_avx512(const float* a, const float* b, std::size_t n) {
     __m512 vdot0 = _mm512_setzero_ps(), vnorma0 = _mm512_setzero_ps(), vnormb0 = _mm512_setzero_ps();
     __m512 vdot1 = _mm512_setzero_ps(), vnorma1 = _mm512_setzero_ps(), vnormb1 = _mm512_setzero_ps();
     std::size_t i = 0;
@@ -227,7 +244,7 @@ float cosine_distance_avx512(const float* a, const float* b, std::size_t n) {
     return 1.0f - (dot / denom);
 }
 
-float inner_product_avx512(const float* a, const float* b, std::size_t n) {
+VECENGINE_TARGET_AVX512 float inner_product_avx512(const float* a, const float* b, std::size_t n) {
     __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
     __m512 acc2 = _mm512_setzero_ps(), acc3 = _mm512_setzero_ps();
     std::size_t i = 0;
@@ -247,12 +264,13 @@ float inner_product_avx512(const float* a, const float* b, std::size_t n) {
 
 #else
 
-// Non-AVX-512 build: forward to scalar so the TU still compiles cleanly.
+// Builds without AVX-512 (arm64, or compilers without the target attribute):
+// forward to scalar so the file still compiles; dispatch never picks these.
 float l2_distance_avx512(const float* a, const float* b, std::size_t n) { return l2_distance_scalar(a, b, n); }
 float cosine_distance_avx512(const float* a, const float* b, std::size_t n) { return cosine_distance_scalar(a, b, n); }
 float inner_product_avx512(const float* a, const float* b, std::size_t n) { return inner_product_scalar(a, b, n); }
 
-#endif // __AVX512F__
+#endif // __AVX512F__ || VECENGINE_AVX512_DISPATCH
 
 
 #if defined(__ARM_NEON)
