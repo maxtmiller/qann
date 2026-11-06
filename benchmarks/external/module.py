@@ -25,6 +25,7 @@ class _Qann(BaseANN):
         self.metric = METRICS[metric]
         self.normalize = metric in ("angular", "cosine")
         self.pad = 0
+        self.buf = None
 
     def _metric_for(self, X):
         # After normalizing, a zero vector is at L2 distance 1 from every query, as if its
@@ -45,7 +46,19 @@ class _Qann(BaseANN):
         return X
 
     def query(self, v, n):
-        ids, _ = self.index.query(self._prep(np.asarray(v).reshape(1, -1))[0], n)
+        # Single queries are what ann-benchmarks times, and _prep's array calls cost about
+        # 20 us per query (np.pad alone 14 us), a fifth to a quarter of a glove-25 query, so this
+        # writes into one reused, zero-padded buffer instead (about 2 us).
+        d = len(v)
+        if self.buf is None:
+            self.buf = np.zeros(d + self.pad, dtype=np.float32)
+        q = self.buf
+        q[:d] = v
+        if self.normalize:
+            norm = np.sqrt(np.dot(q, q))
+            if norm > 0:
+                q /= norm
+        ids, _ = self.index.query(q, n)
         return ids[ids >= 0]
 
     def batch_query(self, X, n):
