@@ -381,17 +381,28 @@ vector<HNSWIndex::Candidate> HNSWIndex::search_layer(Probe q, span<const uint32_
             list = neighbors(current.second, level);
         }
 
-        // first pass: find the unvisited neighbors and start loading their vectors, so
-        // the memory reads overlap; second pass: compute distances, add those that
-        // beat the worst result (or fill the results)
+        // first pass: find the unvisited neighbors; second pass: compute distances, add
+        // those that beat the worst result (or fill the results). How to prefetch their
+        // vectors depends on the CPU (SIFT1M, M=16, ef 40 / 200, one thread). An Apple M3
+        // keeps many misses in flight, so every line of every neighbor is requested up
+        // front: 41 / 150 us, against 75 / 284 us for the x86 way. An AMD EPYC (Zen 4)
+        // drops part of that burst; requesting only the first line of the next neighbor
+        // while computing this one, as hnswlib does, took 121 / 454 us to 108 / 405 us.
+#if defined(__x86_64__) || defined(_M_X64)
+        constexpr bool burst = false;
+#else
+        constexpr bool burst = true;
+#endif
         fresh.clear();
         for (uint32_t n : list) {
             if (visited.visit(n)) {
                 fresh.push_back(n);
-                prefetch_vector(n);
+                if (burst) prefetch_vector(n);
             }
         }
-        for (uint32_t n : fresh) {
+        for (size_t i = 0; i < fresh.size(); ++i) {
+            const uint32_t n = fresh[i];
+            if (!burst && i + 1 < fresh.size()) __builtin_prefetch(stored(fresh[i + 1]));
             const float dist = distance(q, n);
             if (maxHeap.size() >= ef && dist >= maxHeap.top().first) continue;
             // admit() written out: on this, the hottest path, the compiler kept the lambda as a call
