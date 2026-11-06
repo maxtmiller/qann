@@ -18,10 +18,12 @@ namespace {
 
 // Tracks which nodes the current search has visited without clearing between
 // searches: a node is visited when its tag equals the current generation.
-// One per thread, since query_batch runs searches in parallel.
+// One per thread, since query_batch runs searches in parallel. Tags are 16-bit,
+// so the array a search reads at random is half as large (2 MB at 1M nodes);
+// the price is clearing it once every 65,535 searches.
 struct VisitedTags {
-    vector<uint32_t> tags;
-    uint32_t gen = 0;
+    vector<uint16_t> tags;
+    uint16_t gen = 0;
 
     // Starts a new search over n nodes.
     void begin(size_t n) {
