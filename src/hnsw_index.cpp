@@ -18,10 +18,12 @@ namespace {
 
 // Tracks which nodes the current search has visited without clearing between
 // searches: a node is visited when its tag equals the current generation.
-// One per thread, since query_batch runs searches in parallel.
+// One per thread, since query_batch runs searches in parallel. Tags are 16-bit,
+// so the array a search reads at random is half as large (2 MB at 1M nodes);
+// the price is clearing it once every 65,535 searches.
 struct VisitedTags {
-    vector<uint32_t> tags;
-    uint32_t gen = 0;
+    vector<uint16_t> tags;
+    uint16_t gen = 0;
 
     // Starts a new search over n nodes.
     void begin(size_t n) {
@@ -332,7 +334,9 @@ std::unique_ptr<HNSWIndex> HNSWIndex::load_body(std::istream& in, uint32_t versi
 
 vector<HNSWIndex::Candidate> HNSWIndex::search_layer(Probe q, span<const uint32_t> entry_points, size_t ef, int level, bool skip_deleted, bool locked,
                                                     const detail::SlotFilter* filter) const {
-    t_visited.begin(slots());
+    // one thread-local lookup per search: through a shared library each access costs a __tls_get_addr call
+    VisitedTags& visited = t_visited;
+    visited.begin(slots());
     vector<uint32_t> copy;   // a locked search's snapshot of the list being expanded
     if (locked) copy.reserve(capacity(level));
     vector<uint32_t> fresh;  // the expanded node's neighbors not visited yet
@@ -343,16 +347,18 @@ vector<HNSWIndex::Candidate> HNSWIndex::search_layer(Probe q, span<const uint32_
 
     // a node always joins minHeap to be expanded; it joins the results
     // (maxHeap) unless it is deleted (or outside the filter) and the caller
-    // skips deleted nodes
+    // skips deleted nodes. With nothing deleted and no filter there is nothing
+    // to check: the deleted bits are a random read, a cache miss per node.
+    const bool check = skip_deleted && (filter || id_map_.live() != id_map_.slots());
     auto admit = [&](float dist, uint32_t slot) {
         minHeap.emplace(dist, slot);
-        if (skip_deleted && (filter ? !filter->test(slot) : id_map_.is_deleted(slot))) return;
+        if (check && (filter ? !filter->test(slot) : id_map_.is_deleted(slot))) return;
         maxHeap.emplace(dist, slot);
         if (maxHeap.size() > ef) maxHeap.pop();
     };
 
     for (uint32_t p : entry_points) {
-        if (t_visited.visit(p)) admit(distance(q, p), p);
+        if (visited.visit(p)) admit(distance(q, p), p);
     }
 
     while (!minHeap.empty()) {
@@ -375,19 +381,35 @@ vector<HNSWIndex::Candidate> HNSWIndex::search_layer(Probe q, span<const uint32_
             list = neighbors(current.second, level);
         }
 
-        // first pass: find the unvisited neighbors and start loading their vectors, so
-        // the memory reads overlap; second pass: compute distances, add those that
-        // beat the worst result (or fill the results)
+        // first pass: find the unvisited neighbors; second pass: compute distances, add
+        // those that beat the worst result (or fill the results). How to prefetch their
+        // vectors depends on the CPU (SIFT1M, M=16, ef 40 / 200, one thread). An Apple M3
+        // keeps many misses in flight, so every line of every neighbor is requested up
+        // front: 41 / 150 us, against 75 / 284 us for the x86 way. An AMD EPYC (Zen 4)
+        // drops part of that burst; requesting only the first line of the next neighbor
+        // while computing this one, as hnswlib does, took 121 / 454 us to 108 / 405 us.
+#if defined(__x86_64__) || defined(_M_X64)
+        constexpr bool burst = false;
+#else
+        constexpr bool burst = true;
+#endif
         fresh.clear();
         for (uint32_t n : list) {
-            if (t_visited.visit(n)) {
+            if (visited.visit(n)) {
                 fresh.push_back(n);
-                prefetch_vector(n);
+                if (burst) prefetch_vector(n);
             }
         }
-        for (uint32_t n : fresh) {
+        for (size_t i = 0; i < fresh.size(); ++i) {
+            const uint32_t n = fresh[i];
+            if (!burst && i + 1 < fresh.size()) __builtin_prefetch(stored(fresh[i + 1]));
             const float dist = distance(q, n);
-            if (maxHeap.size() < ef || dist < maxHeap.top().first) admit(dist, n);
+            if (maxHeap.size() >= ef && dist >= maxHeap.top().first) continue;
+            // admit() written out: on this, the hottest path, the compiler kept the lambda as a call
+            minHeap.emplace(dist, n);
+            if (check && (filter ? !filter->test(n) : id_map_.is_deleted(n))) continue;
+            maxHeap.emplace(dist, n);
+            if (maxHeap.size() > ef) maxHeap.pop();
         }
     }
 

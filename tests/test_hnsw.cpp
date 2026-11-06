@@ -156,6 +156,19 @@ TEST_CASE("HNSW: query and query_batch agree", "[hnsw]") {
     require_identical(single, batch);
 }
 
+TEST_CASE("HNSW: results stay the same after the visited tags wrap", "[hnsw]") {
+    OneThread one_thread;  // the tags are per thread: keep every search on this one
+    const size_t n = 300, dim = 8, nq = 20, k = 5;
+    auto data = hnsw_random(n, dim, 11);
+    auto queries = hnsw_random(nq, dim, 12);
+    HNSWIndex hnsw(dim, 8, 50, false, 7);
+    hnsw.add_batch(data, n);
+
+    const auto before = hnsw.query_batch(queries, nq, k);
+    for (size_t i = 0; i < 70000; ++i) hnsw.query({queries.data(), dim}, 1);  // past 65,535 searches
+    require_identical(before, hnsw.query_batch(queries, nq, k));
+}
+
 TEST_CASE("HNSW: add one at a time matches add_batch", "[hnsw]") {
     OneThread one_thread;
     const size_t n = 500, dim = 8, nq = 20, k = 5;
