@@ -12,7 +12,7 @@ QaNN (**Q**uantized **N**earest **N**eighbors) is a Python library for fast near
 
 ![Recall against queries per second on glove-100-angular for qann, hnswlib and FAISS](https://raw.githubusercontent.com/maxtmiller/qann/main/docs/images/ann-glove-100-angular.png)
 
-GloVe-100 (1.2M word vectors, angular) on [ann-benchmarks](https://github.com/erikbern/ann-benchmarks): recall@10 against queries per second, one query at a time on one thread of an AMD EPYC 9J14 (Zen 4) VM; up and to the right is better. qann `main` before 0.1.0a27, hnswlib 0.8.0, faiss-cpu 1.14.3. IVF fast-scan with re-ranking (`qann-ivf-fastscan`) is the fastest at every recall level. The harness and configs are on the [`external-benchmarks`](https://github.com/maxtmiller/qann/tree/external-benchmarks/benchmarks/external) branch.
+GloVe-100 (1.2M word vectors, angular) on [ann-benchmarks](https://github.com/erikbern/ann-benchmarks): recall@10 against queries per second, one query at a time on one thread of an AMD EPYC 9J14 (Zen 4) VM; up and to the right is better. qann `main` before 0.1.0a27, hnswlib 0.8.0, faiss-cpu 1.14.3. Each line is that library's fastest index on this dataset: qann's IVF fast-scan with re-ranking (`qann-ivf-fastscan`), hnswlib's HNSW and FAISS's IVF-PQ fast-scan. qann's own HNSW, left out for readability, ran just ahead of hnswlib. The harness and configs are on the [`external-benchmarks`](https://github.com/maxtmiller/qann/tree/external-benchmarks/benchmarks/external) branch.
 
 ## Install
 
