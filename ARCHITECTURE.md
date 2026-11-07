@@ -403,7 +403,7 @@ It only helps when `base` ranks with approximate distances (IVF + PQ). `k_factor
   - Loading takes 0.1 s and 93 MB RSS mapped, against 0.89 s and 1,568 MB read in.
   - With a warm page cache, mapped queries match RAM: 360 vs 361 µs at `k_factor` 10, 491 vs 498 µs at 50.
   - From a cold cache each query faults its `k * k_factor` candidate rows in one at a time: 35 ms at `k_factor` 10, 144 ms at 50, about 340 µs per row.
-- **Tried and dropped: `MADV_WILLNEED` on the candidates' pages before re-ranking.** Cold queries were only 1.3x faster (26 and 109 ms), since the kernel overlapped few of the reads. It cost one `madvise` per candidate on every query, so warm queries were 24% slower at `k_factor` 10 and 74% slower at 50 (446 and 853 µs); on the M3 it also cut all-thread batch throughput by about 9x.
+- **Tried and dropped: `MADV_WILLNEED` on the candidates' pages before re-ranking.** Cold queries were only 1.3x faster (26 and 109 ms), since the kernel overlapped few of the reads. It cost one `madvise` per candidate on every query, so warm queries were 24% slower at `k_factor` 10 and 74% slower at 50 (446 and 853 µs).
 - **Not yet: reading the candidates in parallel (#121).** A cold re-rank is a known set of `k * k_factor` independent rows, so a disk that serves dozens of reads at once could return them all in about one read's time instead of one after another.
   - Issue them together: `pread` into a per-query buffer from a small thread pool, or one `io_uring` submission on Linux. Only candidates whose pages aren't resident need reading; `mincore` can tell, though it is also a system call per range.
   - Score from that buffer: the scoring code takes row pointers, so only `VectorStore` changes.
