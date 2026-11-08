@@ -556,12 +556,13 @@ The README keeps to what each feature does and how to call it. This section hold
 | dense alone | 0.645 | 0.720 | 0.369 | 0.385 |
 | `HybridIndex`, `"rrf"` | 0.685 | 0.715 | 0.352 | 0.350 |
 | `HybridIndex`, `"linear"` (1, 1), the default | 0.710 | 0.732 | 0.375 | 0.374 |
-| `"linear"`, best of a weight sweep | 0.710 (0.5, 1) | 0.740 (1, 0.5) | 0.402 (1, 0.5) | 0.402 (1, 0.5) |
+| `"linear"`, `tune_weights` on the test queries | 0.710 (1, 1) | 0.740 (1, 0.5) | 0.402 (1, 0.5) | 0.402 (1, 0.5) |
 
 - **Setup:** SciFact (5,183 abstracts, 300 queries) and FiQA (57,638 forum answers, 648 queries); models `all-MiniLM-L6-v2` and `bge-small-en-v1.5` (fastembed's quantized ONNX build); default `depth_factor` 5. BM25 and dense match published BEIR figures.
 - **Hybrid helps when fused well.** Equal-weight linear fusion beat the better single retriever in 3 of 4 cases, and tuned weights by up to +0.05 nDCG@10. Recall@100 on SciFact rose from 0.886 (BM25) and 0.925 (MiniLM) to about 0.965.
 - **RRF trusts a weak retriever's ranks as much as a strong one's.** Where BM25 is much weaker (FiQA), RRF fell below dense alone, by up to 0.035. It is safest when both sides are about equally good.
-- **The sweep is tuned on the test queries,** so its row is optimistic, and its best weights differ by dataset. A stronger dense model leaves less for BM25 to add.
+- **Tuning on the test queries is optimistic,** and the best weights differ by dataset. A stronger dense model leaves less for BM25 to add. On SciFact MiniLM, (0.5, 1) ties (1, 1); `tune_weights` keeps the earlier pair in its grid.
+- **Held out, tuning still pays where the sides differ in strength.** Tuned on the even-numbered queries and scored on the odd ones, nDCG@10 went from 0.361 to 0.378 (FiQA, MiniLM) and 0.368 to 0.391 (FiQA, bge-small), both at (1, 0.5). On SciFact it picked (0.75, 1) and (1, 1) and changed nothing beyond noise (0.709 to 0.707, 0.728 both).
 
 ### Inner product
 

@@ -3,6 +3,7 @@
 #include "vecengine/index.hpp"
 #include "vecengine/id_map.hpp"
 #include "vecengine/fusion.hpp"
+#include "vecengine/metrics.hpp"
 #include "vecengine/sparse_index.hpp"
 #include "vecengine/vector_store.hpp"
 
@@ -63,6 +64,17 @@ public:
     vector<vector<FusedHit>> query_batch(span<const float> dense_queries, const SparseRows& sparse_queries,
                                          size_t k, const Expr& where, span<const int64_t> allowed) const;
 
+    // Mean metric@k over the queries of each (dense, sparse) weight pair in
+    // grid, in grid order, without changing weights(): each side is searched
+    // once at k * depth_factor() and the hits are fused with method() and
+    // each pair. relevant[q] holds query q's labels as check_relevance()
+    // leaves them, with user ids. Throws std::invalid_argument if k is 0, grid
+    // is empty or holds a pair set_weights() would refuse, relevant doesn't
+    // have one entry per query, there are no queries, or as query_batch does.
+    vector<double> score_weights(span<const float> dense_queries, const SparseRows& sparse_queries,
+                                 span<const Relevance> relevant, size_t k, RankMetric metric,
+                                 span<const std::array<float, 2>> grid) const;
+
     // IndexBase overrides; see IndexBase for the contract of each. remove()
     // deletes the same slots in both indexes, and compact() compacts both with
     // the same remap.
@@ -107,6 +119,19 @@ public:
 
 private:
     const detail::IdMap& id_map() const noexcept override { return id_map_; }
+
+    // One query's dense (side 0) and sparse (side 1) hits, as slots and distances.
+    struct SideHits {
+        vector<int64_t> ids[2];
+        vector<float> dists[2];
+    };
+
+    // Searches each side for k * depth_factor() hits per query; filter as in search().
+    vector<SideHits> retrieve(span<const float> dense_queries, const SparseRows& sparse_queries, size_t k,
+                              const detail::SlotFilter* filter) const;
+
+    // Fuses one query's hits with method() and the given weights, mapping slots to user ids.
+    vector<FusedHit> fuse_hits(const SideHits& hits, std::array<float, 2> weights, size_t k) const;
 
     // query_batch() for every overload; filter is nullptr for an unfiltered query.
     vector<vector<FusedHit>> search(span<const float> dense_queries, const SparseRows& sparse_queries, size_t k,

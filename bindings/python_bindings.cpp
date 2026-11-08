@@ -10,6 +10,8 @@
 #include <nanobind/stl/map.h>
 #include <nanobind/stl/unordered_map.h>
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <mutex>
@@ -23,6 +25,7 @@
 #include "vecengine/ivf_index.hpp"
 #include "vecengine/hnsw_index.hpp"
 #include "vecengine/metadata.hpp"
+#include "vecengine/metrics.hpp"
 #include "vecengine/pq.hpp"
 #include "vecengine/refine_index.hpp"
 #include "vecengine/inverted_index.hpp"
@@ -220,6 +223,59 @@ static nb::tuple fuse(nb::sequence results, const std::string& method_name, floa
         }
     if (ndim == 1) return nb::make_tuple(to_numpy(std::move(ids), {limit}), to_numpy(std::move(scores), {limit}));
     return nb::make_tuple(to_numpy(std::move(ids), {rows, limit}), to_numpy(std::move(scores), {rows, limit}));
+}
+
+// One query's labels: a dict {id: grade} or any iterable of relevant ids (grade 1).
+static vecengine::Relevance as_relevance(nb::handle labels) {
+    vecengine::Relevance r;
+    if (nb::isinstance<nb::dict>(labels)) {
+        for (auto [id, grade] : nb::borrow<nb::dict>(labels)) r.emplace_back(nb::cast<int64_t>(id), nb::cast<float>(grade));
+    } else {
+        for (nb::handle id : nb::iter(labels)) r.emplace_back(nb::cast<int64_t>(id), 1.0f);
+        std::sort(r.begin(), r.end());
+        r.erase(std::unique(r.begin(), r.end()), r.end());
+    }
+    vecengine::check_relevance(r);
+    return r;
+}
+
+// One Relevance per query from a sequence of labels.
+static std::vector<vecengine::Relevance> as_relevance_rows(nb::handle relevant, std::size_t rows) {
+    std::vector<vecengine::Relevance> out;
+    for (nb::handle labels : nb::iter(relevant)) out.push_back(as_relevance(labels));
+    if (out.size() != rows) throw std::invalid_argument("relevant must have one entry per query");
+    return out;
+}
+
+static vecengine::RankMetric rank_metric_from(const std::string& name) {
+    if (name == "ndcg") return vecengine::RankMetric::NDCG;
+    if (name == "recall") return vecengine::RankMetric::Recall;
+    if (name == "mrr") return vecengine::RankMetric::MRR;
+    throw std::invalid_argument("metric must be 'ndcg', 'recall' or 'mrr'; got '" + name + "'");
+}
+
+// qann.recall / ndcg / mrr: the mean over queries of metric@k. ids is one
+// query's ranked ids (1D, relevant one set or dict) or one row per query (2D,
+// relevant one entry per row); k defaults to the row width.
+static double mean_rank_score(vecengine::RankMetric metric, nb::handle ids, nb::handle relevant,
+                              std::optional<std::size_t> k) {
+    nb::module_ np = nb::module_::import_("numpy");
+    nb::object arr = np.attr("asarray")(ids);
+    if (nb::cast<std::size_t>(arr.attr("size")) > 0) {
+        const auto kind = nb::cast<std::string>(arr.attr("dtype").attr("kind"));
+        if (kind != "i" && kind != "u") throw nb::type_error("ids must be integers");
+    }
+    const IdMatrix a = nb::cast<IdMatrix>(np.attr("ascontiguousarray")(arr, nb::arg("dtype") = "int64"));
+    if (a.ndim() != 1 && a.ndim() != 2) throw std::invalid_argument("ids must be 1D (one query) or 2D (one row per query)");
+    const std::size_t rows = a.ndim() == 1 ? 1 : a.shape(0);
+    const std::size_t width = a.ndim() == 1 ? a.shape(0) : a.shape(1);
+    const std::vector<vecengine::Relevance> labels =
+        a.ndim() == 1 ? std::vector<vecengine::Relevance>{as_relevance(relevant)} : as_relevance_rows(relevant, rows);
+    if (rows == 0) throw std::invalid_argument("ids must have at least one query");
+    double sum = 0.0;
+    for (std::size_t q = 0; q < rows; ++q)
+        sum += vecengine::rank_score(metric, {a.data() + q * width, width}, labels[q], k.value_or(width));
+    return sum / static_cast<double>(rows);
 }
 
 // Changing an index a RefineIndex or HybridIndex wraps directly would
@@ -685,6 +741,27 @@ NB_MODULE(qann, m) {
           "to limit per row, padded with -1 / 0. Fetch several times limit from each retriever, or good "
           "results never reach the fusion");
 
+    m.def("recall", [](nb::handle ids, nb::handle relevant, std::optional<std::size_t> k) {
+              return mean_rank_score(vecengine::RankMetric::Recall, ids, relevant, k);
+          },
+          nb::arg("ids"), nb::arg("relevant"), nb::arg("k").none() = nb::none(),
+          "Recall@k: the share of each query's relevant ids among its first k ids, averaged over queries. ids is "
+          "one query's ranked ids (1D; relevant is one set of ids or {id: grade} dict) or batch_query's (nq, k) ids "
+          "(relevant holds one per row). Grades > 0 count as relevant; -1 padding is skipped. k defaults to the "
+          "row width");
+    m.def("ndcg", [](nb::handle ids, nb::handle relevant, std::optional<std::size_t> k) {
+              return mean_rank_score(vecengine::RankMetric::NDCG, ids, relevant, k);
+          },
+          nb::arg("ids"), nb::arg("relevant"), nb::arg("k").none() = nb::none(),
+          "nDCG@k averaged over queries: gain = grade (1 for every id of a set), discounted by log2(rank + 1), "
+          "over the best possible order of the relevant ids. ids, relevant and k as in recall");
+    m.def("mrr", [](nb::handle ids, nb::handle relevant, std::optional<std::size_t> k) {
+              return mean_rank_score(vecengine::RankMetric::MRR, ids, relevant, k);
+          },
+          nb::arg("ids"), nb::arg("relevant"), nb::arg("k").none() = nb::none(),
+          "MRR@k: 1 / rank of each query's first relevant id in its first k (0 if none), averaged over queries. "
+          "ids, relevant and k as in recall");
+
     // Methods bound on DenseIndex are inherited by FlatIndex, IVFIndex and RefineIndex,
     // and give type checkers the right methods for what load() and make_index() return.
     // Registered before the index classes, which use it as a default argument.
@@ -1145,6 +1222,39 @@ NB_MODULE(qann, m) {
              nb::arg("where").none() = nb::none(),
              "The k best documents for each query: row q of dense (nq, dim) and of sparse (nq rows) is one query, "
              "run in parallel. Returns (ids, scores) of shape (nq, k), highest score first, padded with -1 / 0")
+        .def("tune_weights",
+             [](vecengine::HybridIndex& self, FloatMatrix dense, nb::handle sparse, nb::handle relevant, std::size_t k,
+                const std::string& metric, std::optional<std::vector<std::pair<float, float>>> grid) {
+                 if (dense.shape(1) != self.dim()) throw std::invalid_argument("dense query dimension does not match index dimension");
+                 const OwnedRows rows = as_sparse_rows(sparse, "sparse");
+                 const std::size_t nq = dense.shape(0);
+                 if (rows.view().rows() != nq)
+                     throw std::invalid_argument("dense and sparse must have one row per query, the same number of rows");
+                 const std::vector<vecengine::Relevance> labels = as_relevance_rows(relevant, nq);
+                 const vecengine::RankMetric m = rank_metric_from(metric);
+                 // (1, 1) first, so a tie keeps the default; then less sparse weight, then less dense
+                 const std::vector<std::pair<float, float>> pairs = grid.value_or(std::vector<std::pair<float, float>>{
+                     {1, 1}, {1, 0.75f}, {1, 0.5f}, {1, 0.25f}, {1, 0.1f}, {1, 0},
+                     {0.75f, 1}, {0.5f, 1}, {0.25f, 1}, {0.1f, 1}, {0, 1}});
+                 std::vector<std::array<float, 2>> g;
+                 for (const auto& [d, s] : pairs) g.push_back({d, s});
+                 const std::vector<double> scores = read_locked(self, [&] {
+                     return self.score_weights(std::span<const float>(dense.data(), dense.size()), rows.view(), labels, k, m, g);
+                 });
+                 const std::size_t best = std::max_element(scores.begin(), scores.end()) - scores.begin();
+                 write_locked(self, [&] { self.set_weights(g[best][0], g[best][1]); });
+                 nb::dict out;
+                 for (std::size_t i = 0; i < g.size(); ++i) out[nb::make_tuple(g[i][0], g[i][1])] = scores[i];
+                 return out;
+             },
+             nb::arg("dense"), nb::arg("sparse"), nb::arg("relevant"), nb::arg("k") = 10, nb::kw_only(),
+             nb::arg("metric") = "ndcg", nb::arg("grid").none() = nb::none(),
+             "Pick weights from labeled queries: scores metric@k ('ndcg', 'recall' or 'mrr') for every (dense, sparse) "
+             "pair in grid, sets weights to the best (the first on a tie) and returns {pair: mean score}. Searches "
+             "each side once and re-fuses per pair, so a grid costs about one batch_query. relevant holds one set of "
+             "ids or {id: grade} dict per query, as in qann.ndcg. The default grid spans dense-only (1, 0) to "
+             "sparse-only (0, 1), starting at (1, 1); only the ratio matters. Uses the current method and "
+             "depth_factor. Check the choice on queries held out of tuning")
         .def_prop_rw("method",
                      [](const vecengine::HybridIndex& self) { return std::string(method_name(read_locked(self, [&] { return self.method(); }))); },
                      [](vecengine::HybridIndex& self, const std::string& name) {

@@ -360,3 +360,45 @@ TEST_CASE("HybridIndex load rejects corrupt files", "[hybrid][serialize]") {
     const auto inverted = static_cast<uint8_t>(detail::IndexKind::Inverted);
     REQUIRE_THROWS_AS(load(patched(dense_kind_at, &inverted, 1)), std::runtime_error);
 }
+
+TEST_CASE("HybridIndex score_weights matches querying with each weight pair", "[hybrid]") {
+    const Data d;
+    FlatIndex dense(kDim);
+    InvertedIndex sparse;
+    HybridIndex h(dense, sparse, true);
+    h.add_batch(d.dense, d.sparse.view(), d.ids.data());
+
+    // two relevant documents per query, with different grades
+    std::vector<Relevance> relevant(kQ);
+    for (size_t q = 0; q < kQ; ++q) {
+        relevant[q] = {{d.ids[(q * 7) % kN], 1.0f}, {d.ids[(q * 13 + 5) % kN], 2.0f}};
+        check_relevance(relevant[q]);
+    }
+    const std::vector<std::array<float, 2>> grid{{1, 1}, {1, 0}, {0, 1}, {0.3f, 0.9f}};
+    for (const FusionMethod method : {FusionMethod::Linear, FusionMethod::RRF}) {
+        h.set_method(method);
+        h.set_weights(0.4f, 0.6f);
+        const auto scores = h.score_weights(d.dense_q, d.sparse_q.view(), relevant, 10, RankMetric::NDCG, grid);
+        REQUIRE(scores.size() == grid.size());
+        REQUIRE(h.weights() == std::array<float, 2>{0.4f, 0.6f});
+        for (size_t g = 0; g < grid.size(); ++g) {
+            h.set_weights(grid[g][0], grid[g][1]);
+            const auto hits = h.query_batch(d.dense_q, d.sparse_q.view(), 10);
+            double sum = 0.0;
+            for (size_t q = 0; q < kQ; ++q) {
+                std::vector<int64_t> ids;
+                for (const FusedHit& hit : hits[q]) ids.push_back(hit.id);
+                sum += rank_score(RankMetric::NDCG, ids, relevant[q], 10);
+            }
+            REQUIRE(scores[g] == sum / kQ);
+        }
+        h.set_weights(0.4f, 0.6f);
+    }
+
+    const std::vector<std::array<float, 2>> zero{{0, 0}};
+    REQUIRE_THROWS_AS(h.score_weights(d.dense_q, d.sparse_q.view(), relevant, 10, RankMetric::NDCG, zero), std::invalid_argument);
+    REQUIRE_THROWS_AS(h.score_weights(d.dense_q, d.sparse_q.view(), relevant, 0, RankMetric::NDCG, grid), std::invalid_argument);
+    REQUIRE_THROWS_AS(h.score_weights(d.dense_q, d.sparse_q.view(), span<const Relevance>(relevant).first(kQ - 1), 10,
+                                      RankMetric::NDCG, grid),
+                      std::invalid_argument);
+}
