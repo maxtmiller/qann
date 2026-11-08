@@ -464,7 +464,10 @@ constexpr size_t kSortedScatterCost = 3;
 
 // The same for testing one row picked from a set of bits (MetadataStore::narrow):
 // its values are read out of order, so each costs more than a scanned row.
-constexpr size_t kTestCost = 8;
+// Measured as tag = 'x' AND <condition> on 1M rows (M3): narrowing beat a full
+// evaluation up to about 20% of the rows for a numeric pass, 7% for string
+// bitmaps and 4.5% for sorted rows, which 4-7 fits.
+constexpr size_t kTestCost = 5;
 
 // Sets bit i of words where row(i) holds, for i in [0, slots). Each word is
 // built in a register without branches: filters often match about half the
@@ -931,12 +934,16 @@ size_t count_bits(const vector<uint64_t>& words) {
     return n;
 }
 
-// Whether `count` rows are few enough to work on as a row list: one is then
-// smaller than a bitmap of every slot (4 bytes a row against a bit a slot).
-bool few_rows(size_t count, size_t slots) { return count * 32 < slots; }
+// Whether `count` rows are few enough to work on as a row list instead of a
+// bitmap of every slot. A list skips the passes over all the words, but each
+// Or / Not on it costs a sort or a set difference: on 1M rows nested filters
+// were faster as lists below about 0.3% of the rows and up to 7x slower at
+// 1-3%, and a plain And was faster as a bitmap throughout (M3, #45 follow-up).
+bool few_rows(size_t count, size_t slots) { return count * 256 < slots; }
 
 vector<uint32_t> rows_of_bits(const vector<uint64_t>& words) {
     vector<uint32_t> rows;
+    rows.reserve(count_bits(words));
     for (size_t w = 0; w < words.size(); ++w)
         for (uint64_t b = words[w]; b; b &= b - 1) rows.push_back(static_cast<uint32_t>(w * 64 + std::countr_zero(b)));
     return rows;
@@ -1241,7 +1248,7 @@ vector<uint8_t> MetadataStore::string_match(const Column& col, const Expr& leaf)
 
 MetadataStore::Estimate MetadataStore::estimate(const Column& col, const vector<const Expr*>& leaves, size_t slots) const {
     const Expr& leaf = *leaves[0];
-    if (leaf.op() == Expr::Op::IsNull) return {slots, slots};
+    if (leaf.op() == Expr::Op::IsNull) return {slots, (slots + 63) / 64};   // the flag words, complemented
     if (col.type == ColumnType::String) {
         const vector<uint8_t> match = string_match(col, leaf);
         size_t matches = 0, cost = 0;
@@ -1268,7 +1275,7 @@ void keep_if(vector<uint64_t>& words, Test&& test) {
         uint64_t kept = words[w];
         for (uint64_t b = words[w]; b; b &= b - 1) {
             const int bit = std::countr_zero(b);
-            if (!test(w * 64 + bit)) kept &= ~(uint64_t{1} << bit);
+            kept &= ~(uint64_t{!test(w * 64 + bit)} << bit);   // no branch: tests often fail at random
         }
         words[w] = kept;
     }
@@ -1277,13 +1284,21 @@ void keep_if(vector<uint64_t>& words, Test&& test) {
 // Drops each row of a sorted row list that fails test(row), keeping the order.
 template <class Test>
 void keep_if(vector<uint32_t>& rows, Test&& test) {
-    rows.erase(std::remove_if(rows.begin(), rows.end(), [&](uint32_t s) { return !test(s); }), rows.end());
+    // write every row and advance past it only if it passes: no branch on the
+    // test, which remove_if takes and mispredicts on about half the rows
+    size_t kept = 0;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const uint32_t s = rows[i];
+        rows[kept] = s;
+        kept += test(s) ? 1 : 0;
+    }
+    rows.resize(kept);
 }
 
 // keep_if for valid rows whose V(x[row]) <op> value, with op chosen outside the loop.
 template <class Set, class Flags, class V, class T>
 void keep_compared(Set& set, const Flags& valid, const T* x, Expr::Op op, V value) {
-    auto run = [&](auto pred) { keep_if(set, [&](size_t s) { return valid[s] && pred(static_cast<V>(x[s])); }); };
+    auto run = [&](auto pred) { keep_if(set, [&](size_t s) { return valid[s] & pred(static_cast<V>(x[s])); }); };
     switch (op) {
         case Expr::Op::Eq: run([&](V a) { return a == value; }); break;
         case Expr::Op::Ne: run([&](V a) { return a != value; }); break;
