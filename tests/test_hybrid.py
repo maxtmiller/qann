@@ -303,3 +303,57 @@ def test_every_allowed_wrapper_combination_saves_and_loads(tmp_path, docs):
                 lambda: qann.HybridIndex(qann.FlatIndex(DIM), hybrid)):
         with pytest.raises(TypeError):
             bad()
+
+
+def test_ranking_metrics():
+    ids = np.array([[7, 3, 5, 9], [-1, 1, 1, 2]])
+    relevant = [{9: 1, 3: 2, 5: 0}, {1, 2}]
+    assert qann.recall(ids, relevant) == pytest.approx(1.0)
+    assert qann.recall(ids, relevant, k=2) == pytest.approx((0.5 + 0.5) / 2)
+    assert qann.mrr(ids, relevant) == pytest.approx((0.5 + 0.5) / 2)
+    dcg0 = 2 / np.log2(3) + 1 / np.log2(5)
+    dcg1 = 1 / np.log2(3) + 1 / np.log2(5)
+    want = (dcg0 / (2 + 1 / np.log2(3)) + dcg1 / (1 + 1 / np.log2(3))) / 2
+    assert qann.ndcg(ids, relevant) == pytest.approx(want)
+
+    # one query: 1D ids and one set; lists, numpy ints and grades as floats work too
+    assert qann.ndcg(np.array([3, 9]), {3: 2.0, 9: 1.0}) == pytest.approx(1.0)
+    assert qann.recall([4, 6], [np.int64(6), 8]) == pytest.approx(0.5)
+
+    with pytest.raises(ValueError, match="one entry per query"):
+        qann.recall(ids, relevant[:1])
+    with pytest.raises(ValueError, match="at least one relevant"):
+        qann.recall(ids, [{1: 0}, {2}])
+    with pytest.raises(ValueError, match="k must be"):
+        qann.recall(ids, relevant, k=0)
+    with pytest.raises(TypeError):
+        qann.recall(np.array([[1.5]]), [{1}])
+
+
+def test_tune_weights(docs):
+    h = make(docs)
+    # documents only the sparse side ranks first: tuning must move weight to it
+    s_ids, _ = qann.InvertedIndex.batch_query(h.sparse, docs["q_sparse"], 3)
+    relevant = [{int(docs["ids"][i]) for i in row if i >= 0} or {int(docs["ids"][0])} for row in s_ids]
+    h.weights = (0.7, 0.2)
+
+    scores = h.tune_weights(docs["q_dense"], docs["q_sparse"], relevant, 10)
+    assert len(scores) == 11 and next(iter(scores)) == (1.0, 1.0)
+    assert h.weights == max(scores, key=scores.get)
+    assert scores[(0.0, 1.0)] > scores[(1.0, 0.0)]
+
+    # each score is what batch_query with those weights would get
+    for w in [(1.0, 0.5), (0.0, 1.0)]:
+        h.weights = w
+        ids, _ = h.batch_query(docs["q_dense"], docs["q_sparse"], 10)
+        assert scores[w] == pytest.approx(qann.ndcg(ids, relevant))
+
+    grid = [(1.0, 0.0), (0.5, 0.5)]
+    scores = h.tune_weights(docs["q_dense"], docs["q_sparse"], relevant, 5, metric="mrr", grid=grid)
+    assert list(scores) == grid
+    with pytest.raises(ValueError, match="metric must be"):
+        h.tune_weights(docs["q_dense"], docs["q_sparse"], relevant, metric="map")
+    with pytest.raises(ValueError, match="not both 0"):
+        h.tune_weights(docs["q_dense"], docs["q_sparse"], relevant, grid=[(0, 0)])
+    with pytest.raises(ValueError, match="one entry per query"):
+        h.tune_weights(docs["q_dense"], docs["q_sparse"], relevant[:-1])

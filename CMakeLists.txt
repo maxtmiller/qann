@@ -95,6 +95,7 @@ add_library(vecengine_core STATIC
   src/sparse_approx_index.cpp
   src/fusion.cpp
   src/hybrid_index.cpp
+  src/metrics.cpp
   src/vector_store.cpp
 )
 
@@ -158,6 +159,7 @@ add_executable(test_vecengine
   tests/test_sparse.cpp
   tests/test_fusion.cpp
   tests/test_hybrid.cpp
+  tests/test_metrics.cpp
   tests/test_mmap.cpp
 )
 

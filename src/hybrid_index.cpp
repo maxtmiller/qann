@@ -105,13 +105,13 @@ vector<vector<FusedHit>> HybridIndex::query_batch(span<const float> dense_querie
     return search(dense_queries, sparse_queries, k, &filter);
 }
 
-vector<vector<FusedHit>> HybridIndex::search(span<const float> dense_queries, const SparseRows& sparse_queries, size_t k,
-                                             const detail::SlotFilter* filter) const {
+vector<HybridIndex::SideHits> HybridIndex::retrieve(span<const float> dense_queries, const SparseRows& sparse_queries,
+                                                    size_t k, const detail::SlotFilter* filter) const {
     SparseIndex::check_rows(sparse_queries);
     const size_t n = sparse_queries.rows();
     if (dense_queries.size() != n * dim())
         throw std::invalid_argument("the dense and sparse queries must have the same number of rows");
-    vector<vector<FusedHit>> results(n);
+    vector<SideHits> results(n);
     const size_t reachable = filter ? filter->count : id_map_.live();
     if (k == 0 || reachable == 0 || n == 0) return results;
 
@@ -121,23 +121,59 @@ vector<vector<FusedHit>> HybridIndex::search(span<const float> dense_queries, co
                                   reachable);
     const auto dense_hits = dense_.query_prepared(dense_queries, n, depth, filter, true);
     const auto sparse_hits = sparse_.search(sparse_queries, depth, filter);
-
     detail::parallel_for(n, [&](size_t q) {
-        vector<int64_t> ids[2];
-        vector<float> dists[2];
-        for (int side = 0; side < 2; ++side) {
-            const vector<Neighbor>& hits = side == 0 ? dense_hits[q] : sparse_hits[q];
-            for (const Neighbor& h : hits) {
-                ids[side].push_back(static_cast<int64_t>(h.index));   // a slot: both indexes' ids are their slots
-                dists[side].push_back(h.distance);
+        for (int side = 0; side < 2; ++side)
+            for (const Neighbor& h : side == 0 ? dense_hits[q] : sparse_hits[q]) {
+                results[q].ids[side].push_back(static_cast<int64_t>(h.index));   // a slot: both indexes' ids are their slots
+                results[q].dists[side].push_back(h.distance);
             }
-        }
-        const span<const int64_t> id_lists[2] = {ids[0], ids[1]};
-        const span<const float> dist_lists[2] = {dists[0], dists[1]};
-        results[q] = fuse(method_, id_lists, dist_lists, weights_, rrf_k_, k);
-        for (FusedHit& hit : results[q]) hit.id = id_map_.label(static_cast<uint32_t>(hit.id));
     });
     return results;
+}
+
+vector<FusedHit> HybridIndex::fuse_hits(const SideHits& hits, std::array<float, 2> weights, size_t k) const {
+    const span<const int64_t> id_lists[2] = {hits.ids[0], hits.ids[1]};
+    const span<const float> dist_lists[2] = {hits.dists[0], hits.dists[1]};
+    vector<FusedHit> fused = fuse(method_, id_lists, dist_lists, weights, rrf_k_, k);
+    for (FusedHit& hit : fused) hit.id = id_map_.label(static_cast<uint32_t>(hit.id));
+    return fused;
+}
+
+vector<vector<FusedHit>> HybridIndex::search(span<const float> dense_queries, const SparseRows& sparse_queries, size_t k,
+                                             const detail::SlotFilter* filter) const {
+    const vector<SideHits> hits = retrieve(dense_queries, sparse_queries, k, filter);
+    vector<vector<FusedHit>> results(hits.size());
+    if (k == 0) return results;
+    detail::parallel_for(hits.size(), [&](size_t q) { results[q] = fuse_hits(hits[q], weights_, k); });
+    return results;
+}
+
+vector<double> HybridIndex::score_weights(span<const float> dense_queries, const SparseRows& sparse_queries,
+                                          span<const Relevance> relevant, size_t k, RankMetric metric,
+                                          span<const std::array<float, 2>> grid) const {
+    if (k == 0) throw std::invalid_argument("k must be at least 1");
+    if (grid.empty()) throw std::invalid_argument("grid needs at least one (dense, sparse) weight pair");
+    for (const auto& [d, s] : grid)
+        if (!std::isfinite(d) || !std::isfinite(s) || d < 0.0f || s < 0.0f || (d == 0.0f && s == 0.0f))
+            throw std::invalid_argument("each grid pair must be finite, >= 0 and not both 0");
+    const size_t n = sparse_queries.rows();
+    if (relevant.size() != n) throw std::invalid_argument("relevant must have one entry per query");
+    if (n == 0) throw std::invalid_argument("tuning needs at least one query");
+
+    const vector<SideHits> hits = retrieve(dense_queries, sparse_queries, k, nullptr);
+    vector<double> scores(grid.size());
+    vector<double> per_query(n);
+    for (size_t g = 0; g < grid.size(); ++g) {
+        detail::parallel_for(n, [&](size_t q) {
+            vector<int64_t> ids;
+            for (const FusedHit& hit : fuse_hits(hits[q], grid[g], k)) ids.push_back(hit.id);
+            per_query[q] = rank_score(metric, ids, relevant[q], k);
+        });
+        double sum = 0.0;
+        for (double v : per_query) sum += v;   // in query order, so the mean doesn't depend on threads
+        scores[g] = sum / static_cast<double>(n);
+    }
+    return scores;
 }
 
 size_t HybridIndex::remove(span<const int64_t> ids) {
