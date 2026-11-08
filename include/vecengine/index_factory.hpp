@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vecengine/index.hpp"
+#include "vecengine/pq.hpp"
 
 #include <cstddef>
 #include <memory>
@@ -53,6 +54,14 @@ std::unique_ptr<IndexBase> load_index(std::istream& in);
 // Saves an index to a file. Writes to path + ".tmp" first and renames it into
 // place, so a failed save never leaves a partial file at `path`.
 void save_index(const IndexBase& index, const std::filesystem::path& path);
+
+// Saves a standalone PQCodebook to a file (file kind PQCodebook), atomically
+// as save_index does.
+void save_codebook(const PQCodebook& codebook, const std::filesystem::path& path);
+
+// Loads a codebook saved by save_codebook. Throws std::runtime_error on any
+// problem with the file, including one that holds an index instead.
+PQCodebook load_codebook(const std::filesystem::path& path);
 
 // Loads an index saved by save_index. Every problem with the file's contents
 // is reported as std::runtime_error. With mmap, a RefineIndex's raw vectors, an

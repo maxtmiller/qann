@@ -1714,3 +1714,24 @@ def test_inner_product_hnsw_queries_while_adding():
     index.ef_search = 200
     ids, _ = index.batch_query(queries, 10)
     assert np.mean([len(set(a) & set(b)) / 10 for a, b in zip(ids, truth)]) >= 0.95
+
+
+def test_pq_codebook_save_load(tmp_path):
+    rng = np.random.default_rng(30)
+    data = rng.random((1000, 16), dtype=np.float32)
+    pq = qann.PQCodebook(16, 4, 64)
+    pq.train(data, seed=1)
+    path = tmp_path / "codebook.qann"
+    pq.save(path)
+    loaded = qann.PQCodebook.load(str(path))
+    assert (loaded.dim(), loaded.num_subspaces(), loaded.centroids_per_subspace()) == (16, 4, 64)
+    for v in data[:20]:
+        np.testing.assert_array_equal(loaded.encode(v), pq.encode(v))
+        np.testing.assert_array_equal(loaded.compute_adc_table(v), pq.compute_adc_table(v))
+
+    with pytest.raises(RuntimeError, match="PQCodebook.load"):
+        qann.load(path)
+    index = qann.FlatIndex(16)
+    index.save(tmp_path / "index.qann")
+    with pytest.raises(RuntimeError, match="qann.load"):
+        qann.PQCodebook.load(tmp_path / "index.qann")

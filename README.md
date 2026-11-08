@@ -397,7 +397,7 @@ index = qann.load("vectors.qann")   # returns the saved class, e.g. IVFIndex or 
 - **Safe:** an interrupted save never leaves a partial file, and a corrupt or foreign file raises `RuntimeError`.
 - **Versioned:** newer releases load files from older ones. [Details](https://github.com/maxtmiller/qann/blob/main/ARCHITECTURE.md#saving-and-loading).
 
-`PQCodebook` on its own can't be saved yet; save the `IVFIndex` that uses it.
+A standalone `PQCodebook` has its own file: `pq.save(path)` and `qann.PQCodebook.load(path)`. `qann.load` is for indexes and refuses a codebook file (and the other way round).
 
 ## Product quantization
 
@@ -411,6 +411,7 @@ index = qann.load("vectors.qann")   # returns the saved class, e.g. IVFIndex or 
 | `distance_adc(table, code)` | Approximate squared L2 between the table's query and a code. |
 | `distance_sdc(query_code, code)` | Approximate squared L2 between two codes. |
 | `dim()`, `num_subspaces()`, `centroids_per_subspace()` | Shape of the codebook. |
+| `save(path)`, `PQCodebook.load(path)` | Save to and load from a file; see [Saving and loading](#saving-and-loading). |
 
 ```python
 pq = qann.PQCodebook(128, 16)
