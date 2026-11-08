@@ -9,6 +9,7 @@
 #include <iosfwd>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -220,10 +221,25 @@ private:
         // String: the rows holding one code, so a filter on a few strings
         // costs about their rows instead of a pass over the column (#72).
         // Null rows are in none. Kept in memory only; load() rebuilds it.
+        // A list while the code is rare, a bitmap once it is common. A lone
+        // row is held inline, so a column of mostly distinct strings costs 16
+        // bytes per string here and no allocation (#92).
         struct CodeRows {
-            vector<uint32_t> rows;  // the rows in no order, while the code is rare
-            vector<uint64_t> bits;  // a bit per row once it is common (rows is then empty); may end before the last row
-            size_t count = 0;
+            struct Heap {
+                vector<uint32_t> rows;  // the list, in no order (empty in bitmap form)
+                vector<uint64_t> bits;  // a bit per row in bitmap form; may end before the last row
+            };
+            uint32_t count = 0;
+            uint32_t one = 0;            // the row, while heap is null and count is 1
+            std::unique_ptr<Heap> heap;  // null until the code has held two rows
+
+            bool is_bitmap() const noexcept { return heap && !heap->bits.empty(); }
+
+            // The rows in list form (not for a bitmap).
+            std::span<const uint32_t> list() const noexcept { return heap ? std::span<const uint32_t>(heap->rows) : std::span<const uint32_t>(&one, count); }
+
+            // Adds row s, which it doesn't hold yet, in either form.
+            void add(uint32_t s);
         };
         vector<CodeRows> rows_of;  // String: one per dict entry
         size_t balanced_rows = 0;  // String: rows() when every code was last rebalanced

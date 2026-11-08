@@ -603,15 +603,24 @@ void MetadataStore::Column::index_rows(size_t first) {
     rebalance(touched);
 }
 
-void MetadataStore::Column::index_row(size_t s) {
-    if (!valid[s]) return;
-    CodeRows& r = rows_of[codes[s]];
-    if (r.bits.empty()) r.rows.push_back(static_cast<uint32_t>(s));
-    else {
-        if (r.bits.size() <= s / 64) r.bits.resize(s / 64 + 1, 0);
-        r.bits[s / 64] |= uint64_t{1} << (s % 64);
+void MetadataStore::Column::CodeRows::add(uint32_t s) {
+    if (is_bitmap()) {
+        vector<uint64_t>& bits = heap->bits;
+        if (bits.size() <= s / 64) bits.resize(s / 64 + 1, 0);
+        bits[s / 64] |= uint64_t{1} << (s % 64);
+    } else if (heap) {
+        heap->rows.push_back(s);
+    } else if (count == 0) {
+        one = s;
+    } else {
+        heap = std::make_unique<Heap>();
+        heap->rows = {one, s};
     }
-    ++r.count;
+    ++count;
+}
+
+void MetadataStore::Column::index_row(size_t s) {
+    if (valid[s]) rows_of[codes[s]].add(static_cast<uint32_t>(s));
 }
 
 void MetadataStore::Column::reindex() {
@@ -625,12 +634,12 @@ void MetadataStore::Column::unindex(const vector<uint32_t>& rows, const vector<u
     for (size_t i = 0; i < rows.size(); ++i) {
         if (!valid[rows[i]]) continue;
         CodeRows& r = rows_of[old_codes[i]];
-        --r.count;
-        if (r.bits.empty()) gone[old_codes[i]].insert(rows[i]);
-        else r.bits[rows[i] / 64] &= ~(uint64_t{1} << (rows[i] % 64));
+        --r.count;   // an inline row needs nothing else: count 0 drops it
+        if (r.is_bitmap()) r.heap->bits[rows[i] / 64] &= ~(uint64_t{1} << (rows[i] % 64));
+        else if (r.heap) gone[old_codes[i]].insert(rows[i]);
     }
     for (auto& [code, drop] : gone) {
-        vector<uint32_t>& list = rows_of[code].rows;
+        vector<uint32_t>& list = rows_of[code].heap->rows;
         list.erase(std::remove_if(list.begin(), list.end(), [&](uint32_t s) { return drop.count(s); }), list.end());
     }
 }
@@ -648,16 +657,19 @@ void MetadataStore::Column::rebalance(const vector<uint32_t>& touched) {
 
 void MetadataStore::Column::balance(CodeRows& r) const {
     const size_t n = rows();
-    if (r.bits.empty() && r.count >= 64 && r.count * 32 >= n) {
-        r.bits.assign((n + 63) / 64, 0);
-        for (uint32_t s : r.rows) r.bits[s / 64] |= uint64_t{1} << (s % 64);
-        vector<uint32_t>().swap(r.rows);
-    } else if (!r.bits.empty() && r.count * 64 < n) {
-        r.rows.reserve(r.count);
-        for (size_t w = 0; w < r.bits.size(); ++w)
-            for (uint64_t b = r.bits[w]; b; b &= b - 1)
-                r.rows.push_back(static_cast<uint32_t>(w * 64 + std::countr_zero(b)));
-        vector<uint64_t>().swap(r.bits);
+    const size_t count = r.count;
+    if (!r.is_bitmap() && count >= 64 && count * 32 >= n) {   // 64+ rows, so the list is on the heap
+        CodeRows::Heap& h = *r.heap;
+        h.bits.assign((n + 63) / 64, 0);
+        for (uint32_t s : h.rows) h.bits[s / 64] |= uint64_t{1} << (s % 64);
+        vector<uint32_t>().swap(h.rows);
+    } else if (r.is_bitmap() && count * 64 < n) {
+        CodeRows::Heap& h = *r.heap;
+        h.rows.reserve(count);
+        for (size_t w = 0; w < h.bits.size(); ++w)
+            for (uint64_t b = h.bits[w]; b; b &= b - 1)
+                h.rows.push_back(static_cast<uint32_t>(w * 64 + std::countr_zero(b)));
+        vector<uint64_t>().swap(h.bits);
     }
 }
 
@@ -1211,7 +1223,7 @@ MetadataStore::Estimate MetadataStore::estimate(const Column& col, const vector<
             if (!match[c]) continue;
             const Column::CodeRows& r = col.rows_of[c];
             matches += r.count;
-            cost += r.bits.empty() ? r.count * kScatterCost : r.bits.size();
+            cost += r.is_bitmap() ? r.heap->bits.size() : r.count * kScatterCost;
         }
         return {matches, std::min(cost, slots)};
     }
@@ -1361,13 +1373,20 @@ vector<uint64_t> MetadataStore::evaluate_leaf(const Expr& leaf, size_t slots) co
         // a few matching strings: set their rows' bits instead of passing over every row
         size_t cost = 0;
         for (size_t c = 0; c < col->dict.size(); ++c)
-            if (match[c]) cost += col->rows_of[c].bits.empty() ? col->rows_of[c].count * kScatterCost : col->rows_of[c].bits.size();
+            if (match[c]) {
+                const Column::CodeRows& r = col->rows_of[c];
+                cost += r.is_bitmap() ? r.heap->bits.size() : r.count * kScatterCost;
+            }
         if (cost < slots) {
             for (size_t c = 0; c < col->dict.size(); ++c) {
                 if (!match[c]) continue;
                 const Column::CodeRows& r = col->rows_of[c];
-                for (size_t w = 0; w < r.bits.size(); ++w) words[w] |= r.bits[w];
-                for (uint32_t s : r.rows) words[s / 64] |= uint64_t{1} << (s % 64);
+                if (r.is_bitmap()) {
+                    const vector<uint64_t>& bits = r.heap->bits;
+                    for (size_t w = 0; w < bits.size(); ++w) words[w] |= bits[w];
+                } else {
+                    for (uint32_t s : r.list()) words[s / 64] |= uint64_t{1} << (s % 64);
+                }
             }
             return words;
         }
