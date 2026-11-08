@@ -34,6 +34,7 @@ enum class IndexKind : uint8_t {
     Inverted = 5,  // format 9+
     SparseApprox = 6,  // format 9+
     Hybrid = 7,  // format 9+
+    PQCodebook = 8,  // format 11+: a standalone PQCodebook, not an index
 };
 
 // Writes a trivially copyable value as raw bytes.
@@ -132,6 +133,8 @@ inline Header read_header(std::istream& in) {
             return {IndexKind::SparseApprox, version};
         case static_cast<uint8_t>(IndexKind::Hybrid):
             return {IndexKind::Hybrid, version};
+        case static_cast<uint8_t>(IndexKind::PQCodebook):
+            return {IndexKind::PQCodebook, version};
         default:
             throw std::runtime_error("unknown index kind");
     }

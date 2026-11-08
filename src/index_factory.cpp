@@ -55,6 +55,9 @@ std::unique_ptr<IndexBase> load_index(std::istream& in, const detail::LoadContex
         case detail::IndexKind::Inverted: return InvertedIndex::load_body(in, header.version, ctx);
         case detail::IndexKind::SparseApprox: return SparseApproxIndex::load_body(in, header.version, ctx);
         case detail::IndexKind::Hybrid: return HybridIndex::load_body(in, header.version, ctx);
+        case detail::IndexKind::PQCodebook:
+            throw std::runtime_error("this file holds a PQCodebook, not an index; load it with load_codebook "
+                                     "(qann.PQCodebook.load)");
     }
     throw std::runtime_error("unknown index kind");
 }
@@ -63,14 +66,19 @@ std::unique_ptr<IndexBase> load_index(std::istream& in, const detail::LoadContex
 
 std::unique_ptr<IndexBase> load_index(std::istream& in) { return load_index(in, nullptr); }
 
-void save_index(const IndexBase& index, const std::filesystem::path& path) {
+namespace {
+
+// Calls write(out) on path + ".tmp", then renames it into place, so a failed
+// save never leaves a partial file at path.
+template <class Write>
+void write_atomically(const std::filesystem::path& path, Write&& write) {
     std::filesystem::path tmp = path;
     tmp += ".tmp";
 
     try {
         std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
         if (!out) throw std::runtime_error("cannot open " + tmp.string() + " for writing");
-        index.save(out);
+        write(out);
         out.close();
         if (!out) throw std::runtime_error("failed to write " + tmp.string());
         std::filesystem::rename(tmp, path);
@@ -78,6 +86,34 @@ void save_index(const IndexBase& index, const std::filesystem::path& path) {
         std::error_code ignored;
         std::filesystem::remove(tmp, ignored);
         throw;
+    }
+}
+
+} // namespace
+
+void save_index(const IndexBase& index, const std::filesystem::path& path) {
+    write_atomically(path, [&](std::ostream& out) { index.save(out); });
+}
+
+void save_codebook(const PQCodebook& codebook, const std::filesystem::path& path) {
+    write_atomically(path, [&](std::ostream& out) {
+        detail::write_header(out, detail::IndexKind::PQCodebook);
+        codebook.save(out);
+    });
+}
+
+PQCodebook load_codebook(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw std::runtime_error("cannot open " + path.string() + " for reading");
+    if (detail::read_header(in).kind != detail::IndexKind::PQCodebook)
+        throw std::runtime_error("this file holds an index, not a PQCodebook; load it with load_index (qann.load)");
+    try {
+        PQCodebook codebook = PQCodebook::load(in);
+        if (in.peek() != std::ifstream::traits_type::eof())
+            throw std::runtime_error("corrupt file: unexpected data after the codebook");
+        return codebook;
+    } catch (const std::invalid_argument& e) {
+        throw std::runtime_error(std::string("corrupt file: ") + e.what());   // e.g. a shape the constructor refuses
     }
 }
 

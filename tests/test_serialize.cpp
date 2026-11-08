@@ -689,3 +689,58 @@ TEST_CASE("save_index/load_index: file errors", "[serialize][file]") {
         try { load_dense(file); } catch (const std::invalid_argument&) { FAIL("leaked invalid_argument"); } catch (const std::runtime_error&) {}
     }
 }
+
+TEST_CASE("save_codebook/load_codebook: file round-trip and errors", "[pq][serialize][file]") {
+    TempDir dir;
+    const size_t n = 1000, dim = 16, m = 4, k = 64;
+    auto data = random_vectors(n, dim, 16);
+    PQCodebook pq(dim, m, k);
+    pq.train(data, n, 10, 1);
+
+    const fs::path file = dir.path / "codebook.qann";
+    save_codebook(pq, file);
+    REQUIRE_FALSE(fs::exists(dir.path / "codebook.qann.tmp"));
+    const PQCodebook loaded = load_codebook(file);
+    REQUIRE(loaded.dim() == dim);
+    REQUIRE(loaded.num_subspaces() == m);
+    REQUIRE(loaded.centroids_per_subspace() == k);
+    std::vector<float> table_a(m * k), table_b(m * k);
+    for (size_t i = 0; i < 50; ++i) {
+        const std::span<const float> v(data.data() + i * dim, dim);
+        REQUIRE(pq.encode(v) == loaded.encode(v));
+        pq.compute_adc_table(v, table_a);
+        loaded.compute_adc_table(v, table_b);
+        REQUIRE(table_a == table_b);
+    }
+
+    SECTION("an untrained codebook round-trips") {
+        save_codebook(PQCodebook(8, 2, 16), file);
+        REQUIRE(load_codebook(file).centroids_per_subspace() == 16);
+    }
+
+    SECTION("index and codebook files are not mixed up") {
+        REQUIRE_THROWS_AS(load_dense(file), std::runtime_error);
+        FlatIndex flat(4);
+        save_index(flat, dir.path / "index.qann");
+        REQUIRE_THROWS_AS(load_codebook(dir.path / "index.qann"), std::runtime_error);
+    }
+
+    SECTION("truncated, junk after, or a bad shape") {
+        std::ifstream in(file, std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        in.close();
+        std::ofstream(file, std::ios::binary | std::ios::trunc) << bytes.substr(0, bytes.size() - 5);
+        REQUIRE_THROWS_AS(load_codebook(file), std::runtime_error);
+
+        std::ofstream(file, std::ios::binary | std::ios::trunc) << bytes << "junk";
+        REQUIRE_THROWS_AS(load_codebook(file), std::runtime_error);
+
+        std::string bad = bytes;
+        bad[9 + 8] = 3;   // num_subspaces 3 doesn't divide dim 16
+        std::ofstream(file, std::ios::binary | std::ios::trunc) << bad;
+        REQUIRE_THROWS_AS(load_codebook(file), std::runtime_error);
+        try { load_codebook(file); } catch (const std::invalid_argument&) { FAIL("leaked invalid_argument"); } catch (const std::runtime_error&) {}
+    }
+
+    REQUIRE_THROWS_AS(load_codebook(dir.path / "missing.qann"), std::runtime_error);
+}

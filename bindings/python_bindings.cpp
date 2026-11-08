@@ -1330,7 +1330,13 @@ NB_MODULE(qann, m) {
              "Approximate squared L2 between two codes via the precomputed SDC table")
         .def("dim", &vecengine::PQCodebook::dim)
         .def("num_subspaces", &vecengine::PQCodebook::num_subspaces)
-        .def("centroids_per_subspace", &vecengine::PQCodebook::centroids_per_subspace);
+        .def("centroids_per_subspace", &vecengine::PQCodebook::centroids_per_subspace)
+        .def("save", [](const vecengine::PQCodebook& self, const std::filesystem::path& path) {
+                 vecengine::save_codebook(self, path);
+             },
+             nb::arg("path"), "Save the codebook to a file; load it back with qann.PQCodebook.load(path)")
+        .def_static("load", &vecengine::load_codebook, nb::arg("path"), nb::call_guard<nb::gil_scoped_release>(),
+                    "Load a codebook saved with PQCodebook.save(path). Index files go through qann.load instead");
 
     m.def("make_index", &vecengine::make_index, nb::arg("type"), nb::arg("dim"), nb::arg("opts") = vecengine::IndexOptions{},
           "Construct a FlatIndex, IVFIndex, HNSWIndex, InvertedIndex or SparseApproxIndex from an IndexType and "
