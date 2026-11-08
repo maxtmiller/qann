@@ -458,8 +458,9 @@ constexpr size_t kScatterCost = 4;
 
 // The same for a numeric column's sorted rows, which come in random row order
 // and so don't stall on one word the way a string's ascending list does: about
-// 0.63 ns a row against 0.38 ns per scanned row on 1M rows.
-constexpr size_t kSortedScatterCost = 2;
+// 0.6 ns a row against 0.19 ns per scanned row on 1M rows (M3; 0.38 before null
+// flags became bits, #45).
+constexpr size_t kSortedScatterCost = 3;
 
 // The same for testing one row picked from a set of bits (MetadataStore::narrow):
 // its values are read out of order, so each costs more than a scanned row.
@@ -478,11 +479,17 @@ void fill_bits(vector<uint64_t>& words, size_t slots, Row&& row) {
     }
 }
 
-// fill_bits for valid rows whose x[i] <op> value, with op chosen outside the loop.
+// words &= valid, one word at a time: drops null rows (and keeps the bits past
+// the last row 0, as valid's are).
+void and_valid(vector<uint64_t>& words, const vector<uint64_t>& valid) {
+    for (size_t w = 0; w < words.size(); ++w) words[w] &= valid[w];
+}
+
+// fill_bits for rows whose x[i] <op> value, with op chosen outside the loop.
+// Null rows are tested too (their value is 0); and_valid drops them after.
 template <class T>
-void compare_rows(vector<uint64_t>& words, size_t slots, const vector<uint8_t>& valid, const T* x, Expr::Op op,
-                  T value) {
-    auto run = [&](auto pred) { fill_bits(words, slots, [&](size_t i) { return bool(valid[i] & pred(x[i])); }); };
+void compare_rows(vector<uint64_t>& words, size_t slots, const T* x, Expr::Op op, T value) {
+    auto run = [&](auto pred) { fill_bits(words, slots, [&](size_t i) { return pred(x[i]); }); };
     switch (op) {
         case Expr::Op::Eq: run([&](T a) { return a == value; }); break;
         case Expr::Op::Ne: run([&](T a) { return a != value; }); break;
@@ -546,9 +553,28 @@ void MetadataStore::check_update(size_t n, const Metadata& md) const {
     check(n, md);
 }
 
+void MetadataStore::RowFlags::assign(size_t n, bool on) {
+    n_ = 0;
+    words_.clear();
+    resize(n, on);
+}
+
+void MetadataStore::RowFlags::resize(size_t n, bool on) {
+    if (n < n_) {
+        words_.resize((n + 63) / 64);
+        if (n % 64) words_.back() &= (uint64_t{1} << (n % 64)) - 1;
+        n_ = n;
+        return;
+    }
+    words_.resize((n + 63) / 64, 0);
+    if (on)
+        for (size_t i = n_; i < n; ++i) words_[i / 64] |= uint64_t{1} << (i % 64);
+    n_ = n;
+}
+
 void MetadataStore::write_row(Column& col, size_t to, const MetadataColumn& c, size_t i) {
     const bool has = c.valid.empty() || c.valid[i];
-    col.valid[to] = has;
+    col.valid.set(to, has);
     if (col.type == ColumnType::Int64) col.ints[to] = has ? std::get<vector<int64_t>>(c.values)[i] : 0;
     else if (col.type == ColumnType::Float64) {
         const auto* ints = std::get_if<vector<int64_t>>(&c.values);  // ints fit a float column
@@ -743,7 +769,7 @@ void MetadataStore::append(size_t rows, size_t n, const Metadata& md) {
         assert(col.rows() == rows);
         auto it = given.find(col.name);
         if (it == given.end() || n == 0) {  // left out of this add: null
-            col.valid.insert(col.valid.end(), n, 0);
+            col.valid.resize(rows + n);
             if (col.type == ColumnType::Int64) col.ints.insert(col.ints.end(), n, 0);
             else if (col.type == ColumnType::Float64) col.floats.insert(col.floats.end(), n, 0.0);
             if (col.type != ColumnType::String) col.maybe_sort();
@@ -770,7 +796,7 @@ void MetadataStore::compact(const vector<uint32_t>& remap) {
         for (size_t old = 0; old < remap.size(); ++old) {
             const uint32_t to = remap[old];
             if (to == IdMap::kRemoved) continue;
-            col.valid[to] = col.valid[old];
+            col.valid.set(to, col.valid[old]);
             if (col.type == ColumnType::Int64) col.ints[to] = col.ints[old];
             else if (col.type == ColumnType::Float64) col.floats[to] = col.floats[old];
             else col.codes[to] = col.codes[old];
@@ -1255,8 +1281,8 @@ void keep_if(vector<uint32_t>& rows, Test&& test) {
 }
 
 // keep_if for valid rows whose V(x[row]) <op> value, with op chosen outside the loop.
-template <class Set, class V, class T>
-void keep_compared(Set& set, const vector<uint8_t>& valid, const T* x, Expr::Op op, V value) {
+template <class Set, class Flags, class V, class T>
+void keep_compared(Set& set, const Flags& valid, const T* x, Expr::Op op, V value) {
     auto run = [&](auto pred) { keep_if(set, [&](size_t s) { return valid[s] && pred(static_cast<V>(x[s])); }); };
     switch (op) {
         case Expr::Op::Eq: run([&](V a) { return a == value; }); break;
@@ -1276,7 +1302,7 @@ void MetadataStore::narrow(const Expr& leaf, Set& words) const {
     const Column* col = find(leaf.field());
     if (!col) throw std::invalid_argument("unknown metadata field '" + leaf.field() + "'");
     const Expr::Op op = leaf.op();
-    const vector<uint8_t>& valid = col->valid;
+    const auto& valid = col->valid;
 
     if (op == Expr::Op::IsNull) {
         keep_if(words, [&](size_t s) { return !valid[s]; });
@@ -1361,10 +1387,11 @@ vector<uint64_t> MetadataStore::evaluate_leaf(const Expr& leaf, size_t slots) co
 
     vector<uint64_t> words((slots + 63) / 64, 0);
     const Expr::Op op = leaf.op();
-    const vector<uint8_t>& valid = col->valid;
+    const vector<uint64_t>& valid = col->valid.words();
 
     if (op == Expr::Op::IsNull) {
-        fill_bits(words, slots, [&](size_t i) { return !valid[i]; });
+        for (size_t w = 0; w < words.size(); ++w) words[w] = ~valid[w];
+        if (slots % 64) words.back() &= (uint64_t{1} << (slots % 64)) - 1;
         return words;
     }
 
@@ -1390,9 +1417,11 @@ vector<uint64_t> MetadataStore::evaluate_leaf(const Expr& leaf, size_t slots) co
             }
             return words;
         }
-        // a null row's code is 0, which may not be in an empty dictionary, so test valid first
+        // a null row's code is 0, which is in the dictionary unless it's empty, and then nothing matches
+        if (col->dict.empty()) return words;
         const uint32_t* codes = col->codes.data();
-        fill_bits(words, slots, [&](size_t i) { return valid[i] && match[codes[i]]; });
+        fill_bits(words, slots, [&](size_t i) { return match[codes[i]]; });
+        and_valid(words, valid);
         return words;
     }
 
@@ -1409,16 +1438,17 @@ vector<uint64_t> MetadataStore::evaluate_leaf(const Expr& leaf, size_t slots) co
                 else floats.insert(as_double(v, leaf.field()));
             }
             fill_bits(words, slots, [&](size_t i) {
-                return valid[i] && (ints.count(x[i]) || (!floats.empty() && floats.count(static_cast<double>(x[i]))));
+                return ints.count(x[i]) || (!floats.empty() && floats.count(static_cast<double>(x[i])));
             });
         } else if (auto* value = std::get_if<int64_t>(&leaf.values()[0])) {
-            compare_rows(words, slots, valid, x.data(), op, *value);
+            compare_rows(words, slots, x.data(), op, *value);
         } else {
             // against a float value, compare in double
             const double threshold = as_double(leaf.values()[0], leaf.field());
             vector<double> as_doubles(x.begin(), x.end());
-            compare_rows(words, slots, valid, as_doubles.data(), op, threshold);
+            compare_rows(words, slots, as_doubles.data(), op, threshold);
         }
+        and_valid(words, valid);
         return words;
     }
 
@@ -1426,10 +1456,11 @@ vector<uint64_t> MetadataStore::evaluate_leaf(const Expr& leaf, size_t slots) co
     if (op == Expr::Op::In) {
         std::unordered_set<double> wanted;
         for (const auto& v : leaf.values()) wanted.insert(as_double(v, leaf.field()));
-        fill_bits(words, slots, [&](size_t i) { return valid[i] && wanted.count(x[i]); });
+        fill_bits(words, slots, [&](size_t i) { return wanted.count(x[i]) != 0; });
     } else {
-        compare_rows(words, slots, valid, x.data(), op, as_double(leaf.values()[0], leaf.field()));
+        compare_rows(words, slots, x.data(), op, as_double(leaf.values()[0], leaf.field()));
     }
+    and_valid(words, valid);
     return words;
 }
 
@@ -1492,7 +1523,9 @@ void MetadataStore::save(std::ostream& out) const {
     for (const Column& col : columns_) {
         write_string(out, col.name);
         write_pod(out, static_cast<uint8_t>(col.type));
-        write_vec(out, col.valid);
+        vector<uint8_t> flags(col.rows());   // a byte per row on disk, as before #45
+        for (size_t i = 0; i < flags.size(); ++i) flags[i] = col.valid[i];
+        write_vec(out, flags);
         if (col.type == ColumnType::Int64) write_vec(out, col.ints);
         else if (col.type == ColumnType::Float64) write_vec(out, col.floats);
         else {
@@ -1518,10 +1551,13 @@ MetadataStore MetadataStore::load(std::istream& in, uint64_t slots) {
         if (type > static_cast<uint8_t>(ColumnType::String)) throw corrupt("invalid metadata column type");
         col.type = static_cast<ColumnType>(type);
 
-        col.valid = read_vec<uint8_t>(in, slots);
-        if (col.valid.size() != slots) throw corrupt("metadata column length mismatch");
-        for (uint8_t v : col.valid)
-            if (v > 1) throw corrupt("invalid metadata null flag");
+        const vector<uint8_t> flags = read_vec<uint8_t>(in, slots);
+        if (flags.size() != slots) throw corrupt("metadata column length mismatch");
+        col.valid.assign(slots, false);
+        for (size_t i = 0; i < slots; ++i) {
+            if (flags[i] > 1) throw corrupt("invalid metadata null flag");
+            col.valid.set(i, flags[i]);
+        }
 
         if (col.type == ColumnType::Int64) {
             col.ints = read_vec<int64_t>(in, slots);

@@ -208,10 +208,31 @@ public:
     static MetadataStore load(std::istream& in, uint64_t slots);
 
 private:
+    // A bit per row (#45: a byte each before). Bits at size() and beyond are
+    // always 0, so words() can be ANDed straight into a filter's result.
+    class RowFlags {
+    public:
+        size_t size() const noexcept { return n_; }
+        bool operator[](size_t i) const noexcept { return (words_[i / 64] >> (i % 64)) & 1; }
+        const vector<uint64_t>& words() const noexcept { return words_; }
+        void set(size_t i, bool on) noexcept {
+            const uint64_t bit = uint64_t{1} << (i % 64);
+            words_[i / 64] = on ? words_[i / 64] | bit : words_[i / 64] & ~bit;
+        }
+        // Sets n flags, all to on.
+        void assign(size_t n, bool on);
+        // Keeps the first min(n, size()) flags; rows added get on.
+        void resize(size_t n, bool on = false);
+
+    private:
+        vector<uint64_t> words_;
+        size_t n_ = 0;
+    };
+
     struct Column {
         std::string name;
         ColumnType type;
-        vector<uint8_t> valid;    // 1 where the row has a value
+        RowFlags valid;           // set where the row has a value
         vector<int64_t> ints;     // Int64
         vector<double> floats;    // Float64
         vector<uint32_t> codes;   // String: index into dict
