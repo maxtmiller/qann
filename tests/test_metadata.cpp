@@ -154,8 +154,9 @@ TEST_CASE("MetadataStore: compact frees strings only removed rows used", "[metad
 }
 
 TEST_CASE("MetadataStore: string filters stay exact through adds, updates, compaction and load (fuzz)", "[metadata]") {
-    // A few common strings and many rare ones, so filters take both the row
-    // pass and the per-string rows, and strings move between lists and bitmaps.
+    // A few common strings, many rare ones and near-unique ones, so filters
+    // take both the row pass and the per-string rows, and strings move
+    // between one inline row, lists and bitmaps.
     std::mt19937 rng(21);
     auto draw = [&]() -> std::optional<std::string> {
         const unsigned r = rng() % 100;
@@ -163,6 +164,7 @@ TEST_CASE("MetadataStore: string filters stay exact through adds, updates, compa
         if (r < 45) return std::string("s0");
         if (r < 60) return std::string("s1");
         if (r < 68) return std::string("s2");
+        if (r < 84) return "u" + std::to_string(rng() % 50000);
         return "s" + std::to_string(3 + rng() % 400);
     };
     auto column = [](const std::vector<std::optional<std::string>>& v) {
@@ -179,8 +181,10 @@ TEST_CASE("MetadataStore: string filters stay exact through adds, updates, compa
     std::vector<std::optional<std::string>> ref;
     auto check = [&](int step) {
         CAPTURE(step, ref.size());
-        const std::vector<std::string> probes = {"s0", "s1", "s2", "s" + std::to_string(3 + rng() % 400),
-                                                 "s" + std::to_string(3 + rng() % 400), "zz"};
+        std::vector<std::string> probes = {"s0", "s1", "s2", "s" + std::to_string(3 + rng() % 400),
+                                           "s" + std::to_string(3 + rng() % 400), "zz"};
+        for (int i = 0; i < 3 && !ref.empty(); ++i)   // values in use, often on one row
+            if (const auto& v = ref[rng() % ref.size()]) probes.push_back(*v);
         const std::string& a = probes[rng() % probes.size()];
         const std::string& b = probes[rng() % probes.size()];
         struct Case {
