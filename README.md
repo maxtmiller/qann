@@ -469,6 +469,17 @@ RAM counts a `RefineIndex` loaded with `qann.load(path, mmap=True)`, which leave
 - **Selective filters favor IVF at scale.** With 1% of 1.34M vectors allowed, HNSW switches to scoring the allowed vectors directly: exact, but 2.3-3.8 ms at 768 dimensions, against 0.35-0.8 ms for IVF.
 - **Tune hybrid weights when BM25 is weak.** On FiQA, linear fusion at the default (1, 1) scored below dense search alone (0.373 against 0.385 nDCG@10); `tune_weights` on half the queries reached 0.391 on the other half. On SciFact, where BM25 is strong, the default already gave the best result (0.738 against 0.720 for dense alone).
 
+## LangChain
+
+[`langchain-qann`](https://github.com/maxtmiller/qann/tree/main/integrations/langchain-qann) is a LangChain `VectorStore` on a qann index. It supports the presets `"hnsw"`, `"ivf-pq"` and `"flat"` or any qann index you build, metadata filters as dicts, SQL or `qann.Expr`, and saving to one file:
+
+```python
+from langchain_qann import QANNVectorStore
+
+store = QANNVectorStore.from_texts(texts, embeddings, metadatas=metadatas, index="ivf-pq")
+docs = store.similarity_search("query", k=10, filter="year >= 2020")
+```
+
 ## More
 
 [ARCHITECTURE.md](https://github.com/maxtmiller/qann/blob/main/ARCHITECTURE.md) has the design, a file-by-file reference, the measurements behind this README and the benchmarks.
