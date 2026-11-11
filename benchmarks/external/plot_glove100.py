@@ -97,7 +97,7 @@ ax.set_xlabel("Recall@10", color=MUTED, fontsize=26, labelpad=16)
 ax.set_ylabel("Queries / sec", color=MUTED, fontsize=26, labelpad=16)
 
 if THEME == "dark":
-    title, sub = "Up to 3.6x faster than hnswlib on GloVe-100", "single thread · ann-benchmarks"
+    title, sub = "Up to 3.7x faster than hnswlib on GloVe-100", "single thread · ann-benchmarks"
 else:
     title, sub = "glove-100-angular: recall vs queries per second", "ann-benchmarks · one query at a time on one thread · AMD EPYC (Zen 4)"
 fig.text(0.065, 0.955, title, color=INK, fontsize=44, fontweight="bold", va="top")
