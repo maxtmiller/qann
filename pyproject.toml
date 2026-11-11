@@ -51,7 +51,7 @@ test-requires = ["pytest", "numpy", "scipy"]
 test-command = "pytest {project}/tests"
 
 [tool.cibuildwheel.linux]
-before-all = "dnf install -y --enablerepo=powertools openblas-devel"
+before-all = "dnf install -y --disablerepo='*' --enablerepo=appstream,powertools openblas-devel"
 
 [tool.cibuildwheel.macos.environment]
 MACOSX_DEPLOYMENT_TARGET = "11.0"
