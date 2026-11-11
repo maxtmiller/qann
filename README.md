@@ -438,6 +438,37 @@ dists = [pq.distance_adc(table, c) for c in codes]
 - **Thread-safe:** queries, adds and training release the GIL, and several threads can query one index at once. Adds and setting changes wait for running queries, so no query sees a half-updated index.
 - **Typed:** wheels include type stubs for editors and type checkers.
 
+## Choosing a configuration
+
+Measured with `benchmarks/rag_matrix.py` on an AMD EPYC 9J14 VM (8 cores). There are two datasets:
+
+- **BEIR FiQA:** 58k financial Q&A passages embedded with bge-small (384 dimensions), scored against human relevance labels.
+- **VIBE arxiv-nomic:** 1.34M abstracts embedded with nomic (768 dimensions), scored against exact search.
+
+Each index runs at its cheapest search setting within 0.005 nDCG@10 of exact search (FiQA) or reaching 0.95 recall@10 (arxiv). The full tables are in [ARCHITECTURE.md](https://github.com/maxtmiller/qann/blob/main/ARCHITECTURE.md#rag-configuration-matrix).
+
+| | FiQA: µs / query | FiQA: RAM per vector | 1.34M: µs / query | 1.34M: RAM per vector | 1.34M, 1% filter: µs |
+|---|---|---|---|---|---|
+| `FlatIndex` (exact) | 2,704 | 1,546 B | 132,396 | 3,082 B | 4,261 |
+| `HNSWIndex` + SQ8 + `RefineIndex(k_factor=2)` | 178 | 532 B | 240 | 916 B | 2,282 |
+| `IVFIndex` + fast-scan PQ + `RefineIndex(k_factor=4)` | **121** | **125 B** | 279 | **212 B** | **802** |
+
+RAM counts a `RefineIndex` loaded with `qann.load(path, mmap=True)`, which leaves its full vectors on disk. Latency is one query at a time on one thread.
+
+- **Start with IVF + fast-scan PQ + `RefineIndex`, loaded with `mmap=True`:**
+  ```python
+  base = qann.IVFIndex(dim, nlist, metric=qann.Metric.Cosine)
+  base.enable_pq(dim // 2, fast_scan=True)
+  base.train(vectors)
+  index = qann.RefineIndex(base, k_factor=4)
+  ```
+  On FiQA it came within 0.002 nDCG@10 of exact search, answered fastest on one thread, and kept 12 to 15x less in RAM than float vectors. It also stays fast under metadata filters.
+- **For the most throughput on a large unfiltered corpus, use HNSW + SQ8 + `RefineIndex(k_factor=2)`.** It needs RAM for SQ8 codes and the graph (916 B per vector at 768 dimensions). It answered 21.6k queries per second on 8 cores against 8.0k for IVF + PQ, and built faster at this scale (272 s against 724 s; the benchmark trained IVF on every vector, and a sample would be faster).
+- **Re-rank PQ.** Without `RefineIndex`, fast-scan PQ found 80-85% of exact search's top 10, and 80-84% under filters. Its nDCG@10 on FiQA dropped only 0.004, since labels are less strict than exact neighbors. SQ8 alone kept 98-99% on FiQA.
+- **Under ~10k vectors, use `FlatIndex`.** It is exact and fast enough: 130 µs on SciFact's 5k documents.
+- **Selective filters favor IVF at scale.** With 1% of 1.34M vectors allowed, HNSW switches to scoring the allowed vectors directly: exact, but 2.3-3.8 ms at 768 dimensions, against 0.35-0.8 ms for IVF.
+- **Tune hybrid weights when BM25 is weak.** On FiQA, linear fusion at the default (1, 1) scored below dense search alone (0.373 against 0.385 nDCG@10); `tune_weights` on half the queries reached 0.391 on the other half. On SciFact, where BM25 is strong, the default already gave the best result (0.738 against 0.720 for dense alone).
+
 ## More
 
 [ARCHITECTURE.md](https://github.com/maxtmiller/qann/blob/main/ARCHITECTURE.md) has the design, a file-by-file reference, the measurements behind this README and the benchmarks.

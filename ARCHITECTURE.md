@@ -96,6 +96,7 @@ qann/
 │   ├── sparse_bm25.py              # InvertedIndex BM25 on BEIR: QPS and nDCG@10, pruning off and on (issue #59)
 │   ├── sparse_bigann.py            # InvertedIndex and SparseApproxIndex on the big-ann sparse track (SPLADE, issue #59)
 │   ├── hybrid_beir.py              # BM25, dense and HybridIndex nDCG@10 / recall@100 on BEIR (fastembed embeddings, issue #60)
+│   ├── rag_matrix.py               # RAG matrix: index x compression x filters x hybrid, quality / latency / memory / build (issue #143)
 │   ├── fastscan_recall.py          # recall of 4-bit codes and uint8 tables on SIFT1M (fast-scan study)
 │   ├── fastscan_bench.cpp          # NEON fast-scan kernel vs the scalar ADC scan (ARM only)
 │   ├── baseline_siftsmall.json     # recall baseline for the CI gate
@@ -766,6 +767,59 @@ The sections below are from earlier releases.
 **Batched coarse search** (`profile_query`, which uses `query_batch`, 1 thread, `VECLIB_MAXIMUM_THREADS=1`): coarse search drops from about 19 µs to 7.5 µs per query. Together with precomputed tables, IVF + PQ16 goes from 131 to 103 µs per query and IVF + PQ16 + R16 from 188 to 149 µs. The machine was loaded (load average 6), so treat the totals as approximate; the coarse section is the reliable comparison. The thread-scaling table above predates both changes.
 
 **Fast-scan** (`profile_query`, 1 thread, `VECLIB_MAXIMUM_THREADS=1`, `nprobe = 16`, IVF-PQ64×4fs vs IVF-PQ16 in the same run, load average 3 to 6): 49 vs 91 µs per query (1.9×), with the code scan at 33.5 vs 66 µs (2.0×); with re-ranking 102 vs 159 µs. In an earlier, more loaded run, `nprobe = 64` gave 184 vs 351 µs (1.9×). PQ64×4fs is also the more accurate of the two after re-ranking (see the fast-scan section). The scan is about half of PQ16's rather than the kernel's 6×: the kernel is ~19 µs per query, rounding the 16 lists' tables ~3 µs (NEON `quantize_lut`; ~10 µs scalar), and the rest is building the tables and pushing survivors. `fast_scan_block_mask` compares each block's sums with the threshold in registers, so blocks with no survivor (most of them once the top k fills) cost nothing beyond the kernel. Coarse search, re-ranking and result handling don't change, which bounds the end-to-end gain (~3.6× at most without re-ranking, ~2.8× with it, even if the scan took no time).
+
+
+### RAG configuration matrix
+
+`benchmarks/rag_matrix.py` (issue #143) measures the choices a RAG builder makes together: index type, compression, re-ranking, metadata filters and hybrid fusion. It reports answer quality, latency, memory and build time. The README's "Choosing a configuration" section draws on these tables.
+
+**Setup.** AMD EPYC 9J14 VM, 8 cores, qann 0.1.0a28, idle machine, timings the best of 3 rounds. Each index sweeps its search setting (`nprobe` or `ef_search`) for top-10 queries and stops at its *operating point*, the cheapest setting within 0.005 nDCG@10 of exact search (BEIR, human labels) or reaching 0.95 recall@10 (arxiv, no labels).
+
+- **Indexes:** IVF uses `nlist = max(100, √n)`, fast-scan PQ uses `dim / 2` 4-bit subspaces, and HNSW uses `M = 16`, `ef_construction = 200`. All are cosine.
+- **Latency:** "µs" is one query at a time on one thread; "QPS" is `batch_query` on all cores.
+- **Memory:** "B/vec" is the saved file per vector. "RAM" subtracts a `RefineIndex`'s full vectors, which `mmap=True` leaves on disk.
+- **Filters:** `where="cat < c"` on a random int column, keeping 1%, 10% or 50% of the corpus. Each cell is recall@10 against exact filtered search, then µs on one thread.
+
+**BEIR FiQA** (57,638 passages, bge-small, 384 dimensions, 648 test queries). BM25 (`InvertedIndex`) alone scores 0.238 nDCG@10 at 263 µs.
+
+| Index | Setting | nDCG@10 | R@10 vs exact | µs | QPS | B/vec | RAM | Build s | Filter 1% | 10% | 50% |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Flat | exact | 0.385 | 1.000 | 2,704 | 1.7k | 1,546 | 1,546 | 0.1 | 1.000 / 26 | 1.000 / 322 | 1.000 / 3,381 |
+| HNSW | ef 128 | 0.380 | 0.990 | 261 | 20.0k | 1,683 | 1,683 | 4.1 | 1.000 / 25 | 1.000 / 319 | 0.992 / 336 |
+| HNSW-SQ8 | ef 128 | 0.381 | 0.982 | 183 | 32.1k | 531 | 531 | 3.1 | 0.994 / 38 | 0.992 / 413 | 0.984 / 239 |
+| HNSW-SQ8 + R2 | ef 128 | 0.380 | 0.989 | 178 | 32.7k | 2,068 | 532 | 2.9 | 1.000 / 38 | 1.000 / 385 | 0.991 / 230 |
+| IVF | nprobe 64 | 0.383 | 0.993 | 697 | 4.0k | 1,557 | 1,557 | 3.5 | 1.000 / 36 | 0.996 / 230 | 0.993 / 855 |
+| IVF-SQ8 | nprobe 64 | 0.383 | 0.986 | 762 | 6.4k | 405 | 405 | 3.5 | 0.994 / 50 | 0.988 / 250 | 0.985 / 550 |
+| IVF-SQ4 + R4 | nprobe 64 | 0.383 | 0.993 | 879 | 5.2k | 1,751 | 215 | 3.5 | 1.000 / 25 | 0.996 / 249 | 0.993 / 552 |
+| IVF-PQfs | nprobe 128 | 0.381 | 0.800 | 218 | 19.3k | 123 | 123 | 4.7 | 0.831 / 302 | 0.801 / 356 | 0.796 / 222 |
+| IVF-PQfs + R4 | nprobe 64 | 0.383 | 0.991 | 121 | 33.3k | 1,661 | 125 | 4.9 | 1.000 / 25 | 0.994 / 199 | 0.991 / 128 |
+
+**arxiv-nomic-768-normalized** (VIBE, 1,344,643 abstracts, 768 dimensions, 1,000 queries, recall against the file's exact neighbors).
+
+| Index | Setting | R@10 | µs | QPS | B/vec | RAM | Build s | Filter 1% | 10% | 50% |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Flat | exact | 1.000 | 132,396 | 30 | 3,082 | 3,082 | 5 | 1.000 / 4,261 | 1.000 / 40,747 | 1.000 / 173,866 |
+| HNSW | ef 32 | 0.954 | 271 | 13.1k | 3,219 | 3,219 | 437 | 1.000 / 3,798 | 0.933 / 612 | 0.952 / 354 |
+| HNSW-SQ8 | ef 48 | 0.967 | 315 | 17.2k | 915 | 915 | 269 | 0.995 / 2,326 | 0.958 / 769 | 0.967 / 399 |
+| HNSW-SQ8 + R2 | ef 32 | 0.951 | 240 | 21.6k | 3,988 | 916 | 272 | 1.000 / 2,282 | 0.975 / 974 | 0.951 / 312 |
+| IVF | nprobe 16 | 0.955 | 2,238 | 612 | 3,089 | 3,089 | 645 | 0.959 / 426 | 0.949 / 1,338 | 0.946 / 3,384 |
+| IVF-SQ8 | nprobe 16 | 0.951 | 2,138 | 2.3k | 785 | 785 | 644 | 0.955 / 356 | 0.945 / 1,078 | 0.942 / 2,150 |
+| IVF-SQ4 + R4 | nprobe 16 | 0.955 | 2,266 | 2.0k | 3,474 | 402 | 643 | 0.959 / 349 | 0.949 / 953 | 0.946 / 1,769 |
+| IVF-PQfs | nprobe 1,160 (all) | 0.851 | 14,887 | 142 | 211 | 211 | 721 | 0.834 / 14,666 | 0.838 / 14,986 | 0.845 / 14,938 |
+| IVF-PQfs + R4 | nprobe 16 | 0.955 | 279 | 8.0k | 3,284 | 212 | 724 | 0.959 / 802 | 0.948 / 516 | 0.946 / 325 |
+
+**BEIR SciFact** (5,183 documents, 300 queries). Exact search scores 0.720 nDCG@10 at 130 µs, and BM25 0.664 at 25 µs. Every index reaches its operating point at `nprobe = 32` or `ef_search = 24-32` in 23-112 µs, except IVF-PQfs without re-ranking (0.710 at every `nprobe`).
+
+**Hybrid** (`HybridIndex` with the index at its operating point and BM25). Weights tuned with `tune_weights` on the even-numbered queries, nDCG@10 on the odd ones:
+- **FiQA:** linear (1, 1) gives 0.370-0.373, below dense alone. Tuned weights (1, 0.5) give 0.386-0.391 against 0.365-0.368 for (1, 1) on the same queries, the same for every index.
+- **SciFact:** (1, 1) gives 0.735-0.739, above dense alone, and tuning keeps (1, 1).
+- **Latency:** hybrid adds the BM25 query and fusion: 476 µs with IVF-PQfs + R4 on FiQA, 3,052 µs with Flat.
+
+**What the tables show:**
+- **Labels vs exact neighbors.** Fast-scan PQ without re-ranking finds only 80% of exact search's top 10 on FiQA, yet loses just 0.004 nDCG@10, because the labeled passages are usually near the top either way. Recall against exact search overstates the quality cost for RAG. Under filters, though, its recall drops to about 0.8, and at 1.34M it cannot reach 0.95 even probing every list, so PQ needs `RefineIndex`.
+- **IVF + fast-scan PQ + R4 with `mmap=True` is the best all-round choice.** It is the fastest single-thread query on FiQA and the fastest at a 50% filter. It keeps 125-212 B per vector in RAM, 12-15x less than floats. At 1.34M, HNSW-SQ8 + R2 is slightly faster on one thread (240 against 279 µs) and 2.7x faster batched, for 4.3x the RAM.
+- **IVF builds slowly at scale.** At 1.34M × 768, an IVF index took about 645 s to build, against 270 s for an SQ8 HNSW graph. The benchmark trains k-means on all 1.34M vectors, so training on a sample would likely cut that.
+- **HNSW under selective filters.** At 1% of 1.34M (13k vectors allowed), `count² <= ef * M * slots` picks direct scoring: exact, but 2.3-3.8 ms at 768 dimensions, while IVF answers in 0.35-0.8 ms at 0.96 recall. The threshold was tuned on SIFT (128 dimensions), where scoring a vector costs a sixth as much. At 10%, HNSW at its operating `ef` loses recall (0.933 float, 0.958 SQ8).
 
 ---
 
