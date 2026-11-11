@@ -51,7 +51,9 @@ test-requires = ["pytest", "numpy", "scipy"]
 test-command = "pytest {project}/tests"
 
 [tool.cibuildwheel.linux]
-before-all = "dnf install -y --disablerepo='*' --enablerepo=appstream,powertools openblas-devel"
+# AlmaLinux's own repo instead of its mirror list: random mirrors were slow (29 min)
+# or served 404s / empty indexes (#151). Only the two repos OpenBLAS comes from.
+before-all = "sed -i -e 's/^mirrorlist=/#mirrorlist=/' -e 's|^# baseurl=|baseurl=|' /etc/yum.repos.d/almalinux*.repo && dnf install -y --disablerepo='*' --enablerepo=appstream,powertools openblas-devel"
 
 [tool.cibuildwheel.macos.environment]
 MACOSX_DEPLOYMENT_TARGET = "11.0"
