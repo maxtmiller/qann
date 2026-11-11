@@ -466,8 +466,14 @@ constexpr size_t kSortedScatterCost = 3;
 // its values are read out of order, so each costs more than a scanned row.
 // Measured as tag = 'x' AND <condition> on 1M rows (M3): narrowing beat a full
 // evaluation up to about 20% of the rows for a numeric pass, 7% for string
-// bitmaps and 4.5% for sorted rows, which 4-7 fits.
+// bitmaps and 4.5% for sorted rows, which 4-7 fits. On x86 (AMD EPYC 9J14, #146)
+// an out-of-order read costs more: about 15%, 3% and 3%, which 8 fits best (5
+// cost up to 1.57x at 4-5% for bitmaps and sorted rows, 8 at most 1.09x).
+#if defined(__x86_64__) || defined(_M_X64)
+constexpr size_t kTestCost = 8;
+#else
 constexpr size_t kTestCost = 5;
+#endif
 
 // Sets bit i of words where row(i) holds, for i in [0, slots). Each word is
 // built in a register without branches: filters often match about half the
