@@ -10,3 +10,9 @@ class TestQANNVectorStore(VectorStoreIntegrationTests):
     @pytest.fixture()
     def vectorstore(self) -> VectorStore:
         return QANNVectorStore(self.get_embeddings())
+
+
+class TestQANNVectorStoreHybrid(VectorStoreIntegrationTests):
+    @pytest.fixture()
+    def vectorstore(self) -> VectorStore:
+        return QANNVectorStore(self.get_embeddings(), sparse="bm25")

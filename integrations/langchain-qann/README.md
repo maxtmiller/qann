@@ -1,6 +1,8 @@
 # langchain-qann
 
-A LangChain vector store backed by [qann](https://github.com/maxtmiller/qann): HNSW, IVF with fast-scan PQ and re-ranking, or exact search, with metadata filters. Texts, ids and metadata are stored in the qann index, so a store saves to one file.
+A LangChain vector store backed by [qann](https://github.com/maxtmiller/qann): HNSW, IVF with fast-scan PQ and re-ranking, or exact search, with metadata filters and hybrid (dense + BM25 or SPLADE) search. Texts, ids and metadata are stored in the qann index, so a store saves to one file.
+
+This is a community integration maintained with qann, not by LangChain.
 
 ```bash
 pip install langchain-qann
@@ -56,6 +58,33 @@ docs = store.similarity_search("query", k=10, nprobe=64)
 retriever = store.as_retriever(search_kwargs={"k": 10, "ef_search": 128})
 ```
 
+## Hybrid search
+
+`sparse=` adds a sparse side, searched together with the dense one and fused (qann's `HybridIndex`):
+
+```python
+store = QANNVectorStore.from_texts(texts, embeddings, sparse="bm25")
+docs = store.similarity_search("form 10-K filing deadline", k=10)
+```
+
+- **`sparse="bm25"`** scores the texts with BM25: lowercase words and numbers, English stopwords removed, no stemming. Each query term's IDF comes from the current document counts, so adds and deletes update it without re-encoding stored documents. The counts are rebuilt from the stored texts on `load` (about 2 s for 58k documents).
+- **A custom encoder**, e.g. SPLADE, is any object with `encode_documents(texts)` and `encode_query(text)` returning `scipy.sparse` rows with term ids below 2^31. Pass it again to `load(..., sparse=encoder)`, like the embeddings.
+- **Weights.** `weights=(dense, sparse)` sets the fusion, default `(1, 1)`. Set it in `search_params` or per query: `weights=(1, 0)` is dense only and `(0, 1)` sparse only. `method="rrf"` switches from linear fusion to reciprocal rank fusion.
+- **Tuning.** `store.tune_hybrid_weights(queries, relevant)` picks the weights from labeled queries and keeps them, and they're saved with the store. `relevant` holds the relevant document ids per query, as a set or `{id: grade}`. Tune on queries you won't evaluate on.
+- **Text vs vector.** Searches by text use both sides; searches by vector (`similarity_search_by_vector`) have no text for the sparse side, so they use the dense side.
+- **Scores.** `similarity_search_with_score` returns the fused score (higher is better) instead of a distance.
+
+On BEIR FiQA (58k passages, bge-small, `index="ivf-pq"`), nDCG@10:
+
+| | nDCG@10 |
+|---|---|
+| dense only | 0.384 |
+| BM25 only | 0.238 |
+| hybrid, default (1, 1) | 0.373 |
+| hybrid, tuned on half the queries (1, 0.5), scored on the other half | 0.389 (default: 0.368) |
+
+Where BM25 is much weaker than the embeddings, as here, equal weights hurt and tuning matters; on SciFact, where BM25 is strong, the default already beats dense alone.
+
 ## Filters
 
 `filter=` takes any of:
@@ -74,6 +103,6 @@ Metadata strings and numbers become filterable columns (numbers as floats, boole
 - `add_texts` / `add_documents` with ids; adding an existing id replaces that document.
 - `add_embeddings(texts, vectors, metadatas, ids=...)` for precomputed embeddings.
 - `get_by_ids`, `delete(ids)` (`delete()` removes everything).
-- `similarity_search_with_score` (qann distance, lower is closer), `similarity_search_with_relevance_scores`, search by vector.
+- `similarity_search_with_score` (qann distance, lower is closer; the fused score with hybrid search), `similarity_search_with_relevance_scores`, search by vector.
 - `max_marginal_relevance_search`.
 - Async methods (LangChain's defaults, run in a thread; qann releases the GIL during queries and adds).
