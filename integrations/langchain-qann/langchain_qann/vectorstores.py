@@ -10,10 +10,13 @@ from typing import Any
 
 import numpy as np
 import qann
+import scipy.sparse as sp
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.vectorstores import VectorStore
 from langchain_core.vectorstores.utils import maximal_marginal_relevance
+
+from langchain_qann.sparse import BM25, VOCAB, SparseEncoder
 
 # Columns the store keeps next to the user's metadata. Text, id and the full
 # metadata (as JSON, so nested values round-trip) live in the index file
@@ -22,7 +25,7 @@ TEXT, ID, META = "_lc_text", "_lc_id", "_lc_meta"
 RESERVED = (TEXT, ID, META)
 METRICS = {"cosine": qann.Metric.Cosine, "l2": qann.Metric.L2, "ip": qann.Metric.InnerProduct}
 PRESETS = ("hnsw", "ivf-pq", "flat")
-SEARCH_SETTINGS = ("nprobe", "ef_search", "k_factor")
+SEARCH_SETTINGS = ("nprobe", "ef_search", "k_factor", "weights", "method", "depth_factor", "rrf_k")
 # IVF needs at least this many vectors in its first batch to train on
 MIN_IVF_TRAIN = 1000
 
@@ -40,9 +43,15 @@ class QANNVectorStore(VectorStore):
       - "flat": exact search.
     Presets are created on the first add, once the embedding size is known.
 
+    sparse turns on hybrid search (qann.HybridIndex: the dense index plus an
+    InvertedIndex, fused): "bm25" for built-in BM25 on the texts, or an object with
+    encode_documents(texts) and encode_query(text) returning scipy.sparse rows (e.g.
+    SPLADE). Searches by text then use both sides; searches by vector use the dense side.
+
     search_params sets search options for every query: nprobe, ef_search or k_factor,
-    applied to the index or its RefineIndex base. Searches take the same names as
-    keyword arguments for one query.
+    applied to the index or its RefineIndex base, and for hybrid search weights
+    ((dense, sparse), default (1, 1)), method ("linear" or "rrf"), depth_factor and
+    rrf_k. Searches take the same names as keyword arguments for one query.
 
     filter takes a dict of exact matches ({"source": "10-K", "year": [2023, 2024]}, a
     list meaning any of), a SQL WHERE string ("year >= 2020 AND lang = 'en'"), a
@@ -56,25 +65,50 @@ class QANNVectorStore(VectorStore):
         index: str | qann.DenseIndex = "hnsw",
         *,
         metric: str = "cosine",
-        search_params: dict[str, int] | None = None,
+        search_params: dict[str, Any] | None = None,
+        sparse: str | SparseEncoder | None = None,
     ) -> None:
         if isinstance(index, str) and index not in PRESETS:
             raise ValueError(f"index must be one of {PRESETS} or a qann.DenseIndex, got {index!r}")
         if metric not in METRICS:
             raise ValueError(f"metric must be one of {tuple(METRICS)}, got {metric!r}")
+        if isinstance(index, qann.HybridIndex) and sparse is None:
+            sparse = "bm25"
+        if sparse == "bm25":
+            self._sparse = BM25()
+        elif sparse is None or (hasattr(sparse, "encode_documents") and hasattr(sparse, "encode_query")):
+            self._sparse = sparse
+        else:
+            raise ValueError('sparse must be "bm25", None or an object with encode_documents and encode_query')
         self._embedding = embedding
         self._preset = index if isinstance(index, str) else None
         self._metric = metric
-        self.index: qann.DenseIndex | None = None if isinstance(index, str) else index
-        self._base = getattr(self.index, "base", None)   # a RefineIndex needs its base kept alive
         self.search_params = dict(search_params or {})
         self._rows: dict[str, int] = {}   # document id -> qann id
-        if self.index is not None:
-            self._metric = {v: k for k, v in METRICS.items()}[self.index.metric]
-            if self.index.size() and ID not in self.index.metadata_schema:
-                raise ValueError("the index already holds vectors added outside a QANNVectorStore; "
-                                 "pass an empty index or one saved by QANNVectorStore.save")
-            self._load_ids()
+        self._keep: list = []   # wrapped indexes (a RefineIndex's base, a HybridIndex's sides) kept alive
+        self.index: qann.IndexBase | None = None
+        if isinstance(index, str):
+            return
+        if index.size() and ID not in index.metadata_schema:
+            raise ValueError("the index already holds vectors added outside a QANNVectorStore; "
+                             "pass an empty index or one saved by QANNVectorStore.save")
+        if self._sparse is not None and not isinstance(index, qann.HybridIndex):
+            if index.size():
+                raise ValueError("hybrid search needs an empty dense index to wrap, or a saved hybrid store")
+            index = self._hybrid(index)
+        self.index = index
+        self._keep += [d for d in (self._dense, getattr(self._dense, "base", None)) if d is not None]
+        self._metric = {v: k for k, v in METRICS.items()}[self._dense.metric]
+        self._load_ids()
+
+    @property
+    def _dense(self) -> qann.DenseIndex | None:
+        """The dense index: the HybridIndex's dense side in hybrid search."""
+        return self.index.dense if isinstance(self.index, qann.HybridIndex) else self.index
+
+    def _hybrid(self, dense: qann.DenseIndex) -> qann.HybridIndex:
+        self._keep.append(dense)
+        return qann.HybridIndex(dense, qann.InvertedIndex())
 
     @property
     def embeddings(self) -> Embeddings:
@@ -119,11 +153,19 @@ class QANNVectorStore(VectorStore):
             self.index = self._create(vectors)
         # adding an existing id replaces that document
         self.delete([i for i in ids if i in self._rows])
-        new = self.index.add(np.ascontiguousarray(vectors), metadata=self._columns(texts, metadatas, ids))
+        vectors, columns = np.ascontiguousarray(vectors), self._columns(texts, metadatas, ids)
+        if self._sparse is None:
+            new = self.index.add(vectors, metadata=columns)
+        else:
+            new = self.index.add(vectors, self._sparse.encode_documents(texts), metadata=columns)
         self._rows.update(zip(ids, (int(r) for r in new)))
         return ids
 
-    def _create(self, vectors: np.ndarray) -> qann.DenseIndex:
+    def _create(self, vectors: np.ndarray) -> qann.IndexBase:
+        dense = self._create_dense(vectors)
+        return dense if self._sparse is None else self._hybrid(dense)
+
+    def _create_dense(self, vectors: np.ndarray) -> qann.DenseIndex:
         n, dim = vectors.shape
         metric = METRICS[self._metric]
         if self._preset == "flat":
@@ -138,7 +180,7 @@ class QANNVectorStore(VectorStore):
         base = qann.IVFIndex(dim, max(100, round(math.sqrt(n))), metric=metric)
         base.enable_pq(dim // 2, fast_scan=True)
         base.train(np.ascontiguousarray(vectors))
-        self._base = base
+        self._keep.append(base)
         return qann.RefineIndex(base, k_factor=4)
 
     def _columns(self, texts, metadatas, ids) -> dict[str, list]:
@@ -165,13 +207,18 @@ class QANNVectorStore(VectorStore):
             ids = list(self._rows)
         rows = [self._rows.pop(i) for i in ids if i in self._rows]
         if rows:
+            if isinstance(self._sparse, BM25):
+                self._sparse.remove(self.index.get_metadata(rows, [TEXT])[TEXT])
             self.index.remove(rows)
         return True
 
     def _load_ids(self) -> None:
         live = self.index.ids()
         if len(live) and ID in self.index.metadata_schema:
-            self._rows = dict(zip(self.index.get_metadata(live, [ID])[ID], (int(r) for r in live)))
+            cols = self.index.get_metadata(live, [ID, TEXT])
+            self._rows = dict(zip(cols[ID], (int(r) for r in live)))
+            if isinstance(self._sparse, BM25):
+                self._sparse.rebuild(cols[TEXT])
 
     def _documents(self, rows: Sequence[int]) -> list[Document]:
         if not rows:
@@ -188,8 +235,10 @@ class QANNVectorStore(VectorStore):
     def similarity_search_with_score(
         self, query: str, k: int = 4, filter: Filter = None, **kwargs: Any
     ) -> list[tuple[Document, float]]:
-        """Documents with their qann distance (lower is closer)."""
-        return self.similarity_search_with_score_by_vector(self._embedding.embed_query(query), k, filter, **kwargs)
+        """Documents with their qann distance (lower is closer), or with hybrid search their
+        fused score (higher is better)."""
+        rows, scores = self._search(self._embedding.embed_query(query), k, filter, kwargs, text=query)
+        return list(zip(self._documents(rows), (float(d) for d in scores)))
 
     def similarity_search_by_vector(
         self, embedding: list[float], k: int = 4, filter: Filter = None, **kwargs: Any
@@ -206,30 +255,67 @@ class QANNVectorStore(VectorStore):
         self, query: str, k: int = 4, fetch_k: int = 20, lambda_mult: float = 0.5,
         filter: Filter = None, **kwargs: Any,
     ) -> list[Document]:
-        return self.max_marginal_relevance_search_by_vector(
-            self._embedding.embed_query(query), k, fetch_k, lambda_mult, filter, **kwargs)
+        return self._mmr(self._embedding.embed_query(query), k, fetch_k, lambda_mult, filter, kwargs, text=query)
 
     def max_marginal_relevance_search_by_vector(
         self, embedding: list[float], k: int = 4, fetch_k: int = 20, lambda_mult: float = 0.5,
         filter: Filter = None, **kwargs: Any,
     ) -> list[Document]:
-        rows, _ = self._search(embedding, fetch_k, filter, kwargs)
+        return self._mmr(embedding, k, fetch_k, lambda_mult, filter, kwargs)
+
+    def _mmr(self, embedding, k, fetch_k, lambda_mult, filter, params, text=None) -> list[Document]:
+        rows, _ = self._search(embedding, fetch_k, filter, params, text)
         if not rows:
             return []
         chosen = maximal_marginal_relevance(np.asarray(embedding, dtype=np.float32),
-                                            self.index.get_vectors(rows), lambda_mult=lambda_mult, k=k)
+                                            self._dense.get_vectors(rows), lambda_mult=lambda_mult, k=k)
         return self._documents([rows[i] for i in chosen])
 
-    def _search(self, embedding, k: int, filter: Filter, params: dict) -> tuple[list[int], list[float]]:
+    def _search(self, embedding, k: int, filter: Filter, params: dict, text: str | None = None):
+        """(qann ids, distances or fused scores); without text, hybrid search uses the dense side only."""
         if self.index is None or not self._rows:
             return [], []
         query = np.asarray(embedding, dtype=np.float32)
         with _settings(self.index, {**self.search_params, **params}):
-            rows, dists = self.index.query(query, k, where=_where(filter))
+            if self._sparse is None:
+                rows, dists = self.index.query(query, k, where=_where(filter))
+            else:
+                sq = self._sparse.encode_query(text) if text is not None else sp.csr_matrix((1, VOCAB), dtype=np.float32)
+                rows, dists = self.index.query(query, sq, k, where=_where(filter))
         keep = rows >= 0
         return [int(r) for r in rows[keep]], list(dists[keep])
 
+    def tune_hybrid_weights(
+        self,
+        queries: Sequence[str],
+        relevant: Sequence[set[str] | dict[str, float]],
+        k: int = 10,
+        *,
+        metric: str = "ndcg",
+        grid: Sequence[tuple[float, float]] | None = None,
+    ) -> dict[tuple[float, float], float]:
+        """Pick the hybrid (dense, sparse) weights from labeled queries and keep them (saved with the store).
+
+        relevant holds, per query, the relevant document ids as a set or as {id: grade}.
+        Scores metric@k ('ndcg', 'recall' or 'mrr') for each weight pair in grid
+        (qann's default grid if None) and returns {pair: mean score}. Tune on queries
+        you won't evaluate on, or the result is optimistic.
+        """
+        if not isinstance(self.index, qann.HybridIndex):
+            raise ValueError('tune_hybrid_weights needs hybrid search (sparse="bm25" or a sparse encoder)')
+        dense = np.asarray([self._embedding.embed_query(q) for q in queries], dtype=np.float32)
+        sparse = sp.vstack([self._sparse.encode_query(q) for q in queries]).tocsr()
+        rows = [({self._rows[i] for i in r if i in self._rows} if isinstance(r, (set, frozenset, list, tuple))
+                 else {self._rows[i]: g for i, g in r.items() if i in self._rows}) for r in relevant]
+        return self.index.tune_weights(dense, sparse, rows, k, metric=metric, grid=grid)
+
     def _select_relevance_score_fn(self) -> Callable[[float], float]:
+        if isinstance(self.index, qann.HybridIndex):
+            # fused scores are already "higher is better"; scale by their best possible value
+            def score(s: float) -> float:
+                top = sum(self.index.weights)
+                return s / (top / (self.index.rrf_k + 1) if self.index.method == "rrf" else top)
+            return score
         if self._metric == "cosine":
             return self._cosine_relevance_score_fn
         if self._metric == "l2":   # qann's L2 distance is squared
@@ -265,11 +351,13 @@ class QANNVectorStore(VectorStore):
         embedding: Embeddings,
         *,
         mmap: bool = False,
-        search_params: dict[str, int] | None = None,
+        search_params: dict[str, Any] | None = None,
+        sparse: str | SparseEncoder | None = None,
     ) -> QANNVectorStore:
-        """Open a store written by save(). mmap=True leaves a RefineIndex's full vectors on disk."""
-        index = qann.load(path, mmap=mmap)
-        return cls(embedding, index, search_params=search_params)
+        """Open a store written by save(). mmap=True leaves a RefineIndex's full vectors and the
+        BM25 posting lists on disk. A hybrid store uses BM25 unless sparse passes the custom
+        encoder it was built with."""
+        return cls(embedding, qann.load(path, mmap=mmap), search_params=search_params, sparse=sparse)
 
 
 def _where(filter: Filter):
@@ -312,17 +400,20 @@ def _fits(value, kind: str) -> bool:
 
 
 class _settings:
-    """Sets nprobe / ef_search / k_factor on the index or its base for one query, then restores them."""
+    """Sets search settings on the index or what it wraps (a HybridIndex's dense side, a
+    RefineIndex's base) for one query, then restores them."""
 
     def __init__(self, index, params: dict):
         self.changes = []
+        dense = getattr(index, "dense", None)
+        targets = [t for t in (index, dense, getattr(dense or index, "base", None)) if t is not None]
         for name, value in params.items():
             if name not in SEARCH_SETTINGS:
                 raise ValueError(f"unknown search setting {name!r}; expected one of {SEARCH_SETTINGS}")
-            target = next((t for t in (index, getattr(index, "base", None)) if t is not None and hasattr(t, name)), None)
+            target = next((t for t in targets if hasattr(t, name)), None)
             if target is None:
                 raise ValueError(f"{type(index).__name__} has no search setting {name!r}")
-            self.changes.append((target, name, value))
+            self.changes.append((target, name, tuple(value) if name == "weights" else value))
 
     def __enter__(self):
         self.saved = [(t, n, getattr(t, n)) for t, n, _ in self.changes]

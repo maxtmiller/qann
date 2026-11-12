@@ -471,7 +471,7 @@ RAM counts a `RefineIndex` loaded with `qann.load(path, mmap=True)`, which leave
 
 ## LangChain
 
-[`langchain-qann`](https://github.com/maxtmiller/qann/tree/main/integrations/langchain-qann) is a LangChain `VectorStore` on a qann index. It supports the presets `"hnsw"`, `"ivf-pq"` and `"flat"` or any qann index you build, metadata filters as dicts, SQL or `qann.Expr`, and saving to one file:
+[`langchain-qann`](https://github.com/maxtmiller/qann/tree/main/integrations/langchain-qann) is a LangChain `VectorStore` on a qann index. It supports the presets `"hnsw"`, `"ivf-pq"` and `"flat"` or any qann index you build, metadata filters as dicts, SQL or `qann.Expr`, hybrid search with BM25 or a SPLADE encoder (`sparse="bm25"`), and saving to one file:
 
 ```python
 from langchain_qann import QANNVectorStore

@@ -10,7 +10,7 @@ readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Maximilian Miller" }]
 requires-python = ">=3.10"
-dependencies = ["qann>=0.1.0a28", "langchain-core>=1.0,<2", "numpy"]
+dependencies = ["qann>=0.1.0a28", "langchain-core>=1.0,<2", "numpy", "scipy"]
 keywords = ["langchain", "vector store", "qann", "rag", "ann"]
 classifiers = [
     "Development Status :: 3 - Alpha",
