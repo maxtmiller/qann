@@ -81,7 +81,7 @@ def test_filters_match_llamaindex_reference():
         got = {n.node_id for n in query(ours, q, 200, filters=filters).nodes}
         want = set(ref.query(VectorStoreQuery(query_embedding=q, similarity_top_k=200, filters=filters)).ids)
         assert got == want, filters
-        # get_nodes / delete_nodes filter in Python with the same semantics
+        # get_nodes / delete_nodes filter through qann.ids(where=), with the same semantics
         assert {n.node_id for n in ours.get_nodes(filters=filters)} == want
 
 
@@ -106,6 +106,18 @@ def test_unsupported_operators_raise():
         with pytest.raises(NotImplementedError):
             query(store, vec("x"), 3, filters=MetadataFilters(filters=[F(key="source", value=["a"] if op in (FilterOperator.ANY, FilterOperator.ALL) else "a", operator=op)]))
 
+
+
+def test_get_and_delete_nodes_fall_back_to_python_for_text_filters():
+    store = QANNVectorStore(index="flat")
+    data = nodes(20)
+    store.add(data)
+    filters = MetadataFilters(filters=[F(key="source", value="b", operator=FilterOperator.TEXT_MATCH),
+                                       F(key="year", value=2004, operator=FilterOperator.GT)])
+    want = {n.node_id for n in data if n.metadata.get("source") == "b" and n.metadata["year"] > 2004}
+    assert want and {n.node_id for n in store.get_nodes(filters=filters)} == want
+    store.delete_nodes(filters=filters)
+    assert {n.node_id for n in store.get_nodes()} == {n.node_id for n in data} - want
 
 def test_nodes_round_trip_and_delete_by_document():
     data = nodes(20)

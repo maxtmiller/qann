@@ -210,10 +210,20 @@ class QANNVectorStore(BasePydanticVectorStore):
         rows = sorted(self._rows.values()) if node_ids is None else [self._rows[i] for i in node_ids if i in self._rows]
         if filters is None or not rows:
             return rows
-        # qann has no filter-only call, so these (rare) operations check each node's
-        # metadata in Python, with LlamaIndex's own filter semantics
-        metas = self._index.get_metadata(rows, [META])[META]
-        return [r for r, m in zip(rows, metas) if _matches(filters, json.loads(m))]
+        try:
+            where = _where(filters, self._index.metadata_schema)
+        except NotImplementedError:
+            # text match / contains aren't qann filters: check each node's metadata in
+            # Python, with LlamaIndex's own semantics
+            metas = self._index.get_metadata(rows, [META])[META]
+            return [r for r, m in zip(rows, metas) if _matches(filters, json.loads(m))]
+        if where is None:
+            return rows
+        matching = self._index.ids(where=where).tolist()
+        if node_ids is None:
+            return matching
+        keep = set(matching)
+        return [r for r in rows if r in keep]
 
     def _remove(self, rows: list[int]) -> None:
         if not rows:
