@@ -346,3 +346,65 @@ def test_loads_v11_saved_on_macos(name, mmap):
     ids, dists = index.batch_query(sp.load_npz(DATA / "v11_sparse_queries.npz"), 10)
     np.testing.assert_array_equal(ids, np.load(DATA / f"v11_{name}_ids.npy"))
     np.testing.assert_array_equal(dists, np.load(DATA / f"v11_{name}_dists.npy"))
+
+
+def _reference_bm25(docs, queries, k1=1.2, b=0.75):
+    """The pure-Python BM25 the integrations shipped before qann.BM25 (#159), for its exact outputs."""
+    import collections, math, re, zlib
+    stop = set("a an and are as at be but by for if in into is it no not of on or such that the their then "
+               "there these they this to was will with".split())
+    terms = lambda t: [zlib.crc32(w.encode()) & (2**31 - 1) for w in re.findall(r"[a-z0-9]+", t.lower()) if w not in stop]
+    counts = [collections.Counter(terms(t)) for t in docs]
+    df = collections.Counter(t for c in counts for t in c)
+    avgdl = sum(sum(c.values()) for c in counts) / max(len(docs), 1) or 1.0
+    d = {(i, t): np.float32(tf * (k1 + 1) / (tf + k1 * (1 - b + b * sum(c.values()) / avgdl)))
+         for i, c in enumerate(counts) for t, tf in c.items()}
+    q = {(i, t): np.float32(math.log(1 + (len(docs) - df[t] + 0.5) / (df[t] + 0.5)))
+         for i, text in enumerate(queries) for t in set(terms(text)) if df[t]}
+    return d, q
+
+
+def _entries(m):
+    m = m.tocoo()
+    return {(int(r), int(c)): v for r, c, v in zip(m.row, m.col, m.data)}
+
+
+def test_bm25_matches_reference():
+    docs = ["The quick brown fox", "Quick, quick! FOX-hunting in 2024", "naïve café: straße", "",
+            "İstanbul and \u212aelvin", "the of and", "brown brown brown dog " * 5]
+    queries = ["quick fox", "istanbul", "kelvin", "missing words", "the", "Brown dogs"]
+    bm = qann.BM25()
+    got_docs = bm.encode_documents(docs)
+    assert got_docs.shape == (len(docs), 2**31) and qann.BM25.vocab == 2**31
+    want_docs, want_queries = _reference_bm25(docs, queries)
+    assert _entries(got_docs) == want_docs
+    assert _entries(bm.encode_queries(queries)) == want_queries
+    for i, q in enumerate(queries):
+        assert _entries(bm.encode_query(q)) == {(0, t): v for (r, t), v in want_queries.items() if r == i}
+
+
+def test_bm25_remove_and_rebuild_match_a_fresh_count():
+    docs = [f"doc {i} shares words like apple and term{i % 7}" for i in range(50)]
+    queries = ["apple term3", "term6 doc"]
+    bm = qann.BM25()
+    bm.encode_documents(docs[:30])
+    bm.encode_documents(docs[30:])
+    bm.remove(docs[:10])
+    fresh = qann.BM25()
+    fresh.rebuild(docs[10:])
+    for a in (bm, fresh):
+        assert (a.num_documents, a.total_length, a.num_terms) == (fresh.num_documents, fresh.total_length, fresh.num_terms)
+        assert _entries(a.encode_queries(queries)) == _reference_bm25(docs[10:], queries)[1]
+
+
+def test_bm25_hybrid_search_with_removal():
+    texts = ["red apple pie", "green apple", "blue sky", "red car", "apple tree in the park"]
+    bm = qann.BM25()
+    index = qann.InvertedIndex(custom_ids=True)
+    index.add(bm.encode_documents(texts), ids=[10, 20, 30, 40, 50])
+    ids, _ = index.query(bm.encode_query("red apple"), 2)
+    assert ids.tolist() == [10, 40]   # red is rarer than apple
+    index.remove([10])
+    bm.remove([texts[0]])
+    ids, _ = index.query(bm.encode_query("red apple"), 5)
+    assert 10 not in ids.tolist() and ids[0] == 40

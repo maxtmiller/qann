@@ -219,6 +219,25 @@ index.list_depth = 2000          # faster, lower recall
 - Returned distances are exact; only which documents are found is approximate.
 - The defaults reached 0.96 recall@10 at about 14x the speed of exact search on 1M SPLADE passages. [Measurements](https://github.com/maxtmiller/qann/blob/main/ARCHITECTURE.md#sparse-indexes).
 
+### `BM25(k1=1.2, b=0.75)`
+
+Turns texts into BM25 sparse vectors for `InvertedIndex` or `HybridIndex`, and stays exact as documents come and go:
+
+```python
+bm25 = qann.BM25()
+index = qann.InvertedIndex(custom_ids=True)
+index.add(bm25.encode_documents(texts), ids=doc_ids)
+ids, dists = index.query(bm25.encode_query("rate limits on the api"), 10)
+
+index.remove(old_ids)
+bm25.remove(old_texts)                 # keep the counts in step with the index
+```
+
+- **Scores:** documents store saturated term frequencies and each query carries IDF from the current counts, so adds and removes keep scores the same as recomputing BM25 over the live documents, without re-encoding stored ones.
+- **Tokens:** lowercase ASCII letters and digits, Lucene's English stopwords removed, no stemming. FiQA nDCG@10 0.238, matching BEIR's Lucene BM25.
+- **No vocabulary:** a term's id is its 31-bit CRC-32 hash. The counts aren't saved with an index; after `qann.load`, call `bm25.rebuild(texts)` with the stored texts (about 5 s for 1M FiQA-sized documents on an M3).
+- `encode_queries(texts)` encodes a batch; `num_documents`, `num_terms` and `total_length` show the counts.
+
 ### `make_index(type, dim, opts=IndexOptions())`
 
 Builds any index from a type and an options object:
@@ -346,8 +365,9 @@ dense = qann.HNSWIndex(384, metric=qann.Metric.Cosine)
 sparse = qann.InvertedIndex()
 hybrid = qann.HybridIndex(dense, sparse, custom_ids=True)
 
-hybrid.add(embeddings, bm25_matrix, ids=doc_ids)          # row i of each is document doc_ids[i]
-ids, scores = hybrid.batch_query(q_embeddings, q_bm25, 10, where="lang = 'en'")   # highest score first
+bm25 = qann.BM25()
+hybrid.add(embeddings, bm25.encode_documents(texts), ids=doc_ids)   # row i of each is document doc_ids[i]
+ids, scores = hybrid.batch_query(q_embeddings, bm25.encode_queries(q_texts), 10, where="lang = 'en'")   # highest score first
 ```
 
 - **One index, one set of ids.** The `HybridIndex` keeps the ids and metadata, and both parts stay aligned because only it changes them. `add` checks both representations first, so a bad row adds nothing anywhere. `remove`, `compact`, `save` and `qann.load` cover both parts.

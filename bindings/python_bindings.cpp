@@ -18,6 +18,7 @@
 #include <shared_mutex>
 #include <span>
 
+#include "vecengine/bm25.hpp"
 #include "vecengine/distance.hpp"
 #include "vecengine/flat_index.hpp"
 #include "vecengine/fusion.hpp"
@@ -713,6 +714,17 @@ static float pq_distance_sdc(const vecengine::PQCodebook &self, ByteVector query
     return self.distance_sdc(as_span(query_code), as_span(code));
 }
 
+// BM25 rows as a scipy.sparse.csr_matrix with 2^31 columns (term ids).
+static nb::object bm25_csr(vecengine::BM25::Rows rows) {
+    nb::module_ sp = nb::module_::import_("scipy.sparse");
+    const std::size_t n = rows.indptr.size() - 1, nnz = rows.indices.size();
+    std::vector<int64_t> indptr(rows.indptr.begin(), rows.indptr.end());
+    std::vector<int32_t> indices(rows.indices.begin(), rows.indices.end());
+    return sp.attr("csr_matrix")(nb::make_tuple(to_numpy(std::move(rows.values), {nnz}), to_numpy(std::move(indices), {nnz}),
+                                                to_numpy(std::move(indptr), {n + 1})),
+                                 nb::arg("shape") = nb::make_tuple(n, vecengine::BM25::kVocab));
+}
+
 NB_MODULE(qann, m) {
     m.doc() = "qann: Quantized Approximate Nearest Neighbors (Flat, IVF, PQ, re-ranking)";
     m.attr("__version__") = QANN_VERSION;
@@ -1138,6 +1150,43 @@ NB_MODULE(qann, m) {
                      [](const vecengine::SparseApproxIndex& self) { return read_locked(self, [&] { return self.mapped(); }); },
                      "Whether the posting lists and forward index are read from a file (qann.load(path, mmap=True)) "
                      "rather than held in RAM");
+
+    nb::class_<vecengine::BM25>(
+        m, "BM25",
+        "BM25 sparse vectors for InvertedIndex / HybridIndex that stay exact as documents are added and removed: "
+        "documents store saturated term frequencies, queries carry IDF from the current counts. Tokens are "
+        "lowercase ASCII letters and digits minus Lucene's English stopwords, no stemming; term ids are 31-bit "
+        "CRC-32 hashes, so the counts can be rebuilt from the texts alone")
+        .def(nb::init<double, double>(), nb::arg("k1") = 1.2, nb::arg("b") = 0.75)
+        .def("encode_documents",
+             [](vecengine::BM25& self, const std::vector<std::string>& texts) { return bm25_csr(self.encode_documents(texts)); },
+             nb::arg("texts"),
+             "Count texts into the statistics and return their document vectors, one row each (scipy.sparse.csr_matrix)")
+        .def("encode_query",
+             [](const vecengine::BM25& self, const std::string& text) {
+                 return bm25_csr(self.encode_queries(std::span<const std::string>(&text, 1)));
+             },
+             nb::arg("text"), "One query vector (a 1-row csr_matrix): IDF of each term some document has")
+        .def("encode_queries",
+             [](const vecengine::BM25& self, const std::vector<std::string>& texts) { return bm25_csr(self.encode_queries(texts)); },
+             nb::arg("texts"), "Query vectors, one row per text")
+        .def("remove", [](vecengine::BM25& self, const std::vector<std::string>& texts) { self.remove(texts); },
+             nb::arg("texts"), "Take the texts of removed documents back out of the statistics")
+        .def("rebuild", [](vecengine::BM25& self, const std::vector<std::string>& texts) { self.rebuild(texts); },
+             nb::arg("texts"), "Reset the statistics to exactly these texts, e.g. every stored text after loading")
+        .def_static("terms",
+                    [](const std::string& text) {
+                        std::vector<uint32_t> t = vecengine::BM25::terms(text);
+                        const std::size_t n = t.size();
+                        return to_numpy(std::move(t), {n});
+                    },
+                    nb::arg("text"), "Term ids of text's tokens, in order (uint32)")
+        .def_prop_ro("k1", &vecengine::BM25::k1)
+        .def_prop_ro("b", &vecengine::BM25::b)
+        .def_prop_ro("num_documents", &vecengine::BM25::num_documents, "Documents counted")
+        .def_prop_ro("num_terms", &vecengine::BM25::num_terms, "Distinct terms in the counted documents")
+        .def_prop_ro("total_length", &vecengine::BM25::total_length, "Tokens in the counted documents")
+        .attr("vocab") = vecengine::BM25::kVocab;
 
     // Holds dense and sparse by reference; keep_alive ties their lifetimes to
     // the HybridIndex's, as for RefineIndex's base.

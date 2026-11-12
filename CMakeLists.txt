@@ -97,6 +97,7 @@ add_library(vecengine_core STATIC
   src/hybrid_index.cpp
   src/metrics.cpp
   src/vector_store.cpp
+  src/bm25.cpp
 )
 
 target_include_directories(vecengine_core PUBLIC

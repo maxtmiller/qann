@@ -1,5 +1,6 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include "vecengine/bm25.hpp"
 #include "vecengine/index_factory.hpp"
 #include "vecengine/inverted_index.hpp"
 #include "vecengine/sparse_approx_index.hpp"
@@ -546,4 +547,48 @@ TEST_CASE("SparseApproxIndex file saved on macOS (format 9) loads", "[sparse][ap
     index->save(s);
     s.seekg(0);
     REQUIRE(load_index(s)->size() == 1363);
+}
+
+TEST_CASE("BM25 terms are zlib CRC-32 of lowercased ASCII alphanumeric tokens, minus stopwords", "[sparse][bm25]") {
+    // zlib.crc32(token) & (2**31 - 1)
+    REQUIRE(BM25::terms("Hello, the WORLD!") == std::vector<uint32_t>{907060870, 980881731});
+    REQUIRE(BM25::terms("and of a").empty());
+    REQUIRE(BM25::terms("caf\xC3\xA9x").size() == 2);              // non-ASCII separates
+    REQUIRE(BM25::terms("\xE2\x84\xAA") == std::vector<uint32_t>{140662621});   // Kelvin sign -> "k"
+    // U+0130 lowercases to "i" plus a combining dot, which splits the token
+    REQUIRE(BM25::terms("\xC4\xB0stanbul") == std::vector<uint32_t>{1718367857, BM25::terms("stanbul")[0]});
+}
+
+TEST_CASE("BM25 statistics follow adds, removes and rebuilds", "[sparse][bm25]") {
+    const std::vector<std::string> docs = {"apple banana", "apple cherry cherry", "banana"};
+    BM25 bm;
+    const BM25::Rows rows = bm.encode_documents(docs);
+    REQUIRE(bm.num_documents() == 3);
+    REQUIRE(bm.total_length() == 6);
+    REQUIRE(bm.num_terms() == 3);
+    REQUIRE(rows.indptr == std::vector<uint64_t>{0, 2, 4, 5});
+
+    // doc 1: cherry tf 2, length 3, avgdl 2
+    const double norm = 1.2 * (1 - 0.75 + 0.75 * 3 / 2.0);
+    const uint32_t cherry = BM25::terms("cherry")[0];
+    for (uint64_t i = rows.indptr[1]; i < rows.indptr[2]; ++i)
+        if (rows.indices[i] == cherry) REQUIRE(rows.values[i] == static_cast<float>(2 * 2.2 / (2 + norm)));
+
+    const std::vector<std::string> q = {"cherry durian"};
+    BM25::Rows qr = bm.encode_queries(q);
+    REQUIRE(qr.indices == std::vector<uint32_t>{cherry});   // durian is in no document
+    REQUIRE(qr.values[0] == static_cast<float>(std::log(1 + (3 - 1 + 0.5) / 1.5)));
+
+    const std::vector<std::string> gone = {docs[1]};
+    bm.remove(gone);
+    REQUIRE(bm.num_documents() == 2);
+    REQUIRE(bm.num_terms() == 2);
+    REQUIRE(bm.encode_queries(q).indices.empty());
+
+    const std::vector<std::string> kept = {docs[0], docs[2]};
+    BM25 fresh;
+    fresh.rebuild(kept);
+    REQUIRE(fresh.num_documents() == bm.num_documents());
+    REQUIRE(fresh.total_length() == bm.total_length());
+    REQUIRE(fresh.num_terms() == bm.num_terms());
 }
