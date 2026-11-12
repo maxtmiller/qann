@@ -36,7 +36,7 @@ def corpus(n, seed=0):
 
 
 def stats(bm25):
-    return dict(+bm25.df), bm25.n_docs, bm25.total_len
+    return bm25.num_documents, bm25.num_terms, bm25.total_length
 
 
 def test_bm25_statistics_follow_adds_and_deletes(emb):

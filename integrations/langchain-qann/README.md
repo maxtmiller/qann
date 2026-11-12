@@ -67,7 +67,7 @@ store = QANNVectorStore.from_texts(texts, embeddings, sparse="bm25")
 docs = store.similarity_search("form 10-K filing deadline", k=10)
 ```
 
-- **`sparse="bm25"`** scores the texts with BM25: lowercase words and numbers, English stopwords removed, no stemming. Each query term's IDF comes from the current document counts, so adds and deletes update it without re-encoding stored documents. The counts are rebuilt from the stored texts on `load` (about 2 s for 58k documents).
+- **`sparse="bm25"`** scores the texts with BM25: lowercase words and numbers, English stopwords removed, no stemming. Each query term's IDF comes from the current document counts, so adds and deletes update it without re-encoding stored documents. It is `qann.BM25`, so the counts are rebuilt from the stored texts on `load` in C++ (0.15 s for 58k documents, about 5 s for 1M).
 - **A custom encoder**, e.g. SPLADE, is any object with `encode_documents(texts)` and `encode_query(text)` returning `scipy.sparse` rows with term ids below 2^31. Pass it again to `load(..., sparse=encoder)`, like the embeddings.
 - **Weights.** `weights=(dense, sparse)` sets the fusion, default `(1, 1)`. Set it in `search_params` or per query: `weights=(1, 0)` is dense only and `(0, 1)` sparse only. `method="rrf"` switches from linear fusion to reciprocal rank fusion.
 - **Tuning.** `store.tune_hybrid_weights(queries, relevant)` picks the weights from labeled queries and keeps them, and they're saved with the store. `relevant` holds the relevant document ids per query, as a set or `{id: grade}`. Tune on queries you won't evaluate on.

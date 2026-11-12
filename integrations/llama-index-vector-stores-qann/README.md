@@ -57,7 +57,7 @@ retriever = index.as_retriever(vector_store_kwargs={"nprobe": 64})
 | `"hybrid"` | both, fused; `alpha` weights dense against sparse as `(alpha, 1 - alpha)` |
 | `"mmr"` | dense side, then maximal marginal relevance |
 
-- **BM25 keeps up with the corpus.** Each query term's IDF comes from the current document counts, so adds and deletes stay exact without re-encoding stored nodes. The counts are rebuilt from the stored texts when the store is opened (about 2 s for 58k nodes).
+- **BM25 keeps up with the corpus.** Each query term's IDF comes from the current document counts, so adds and deletes stay exact without re-encoding stored nodes. It is `qann.BM25`, so the counts are rebuilt from the stored texts in C++ when the store is opened (0.15 s for 58k nodes, about 5 s for 1M).
 - **Default weights.** Without `alpha`, hybrid mode uses the store's weights, `(1, 1)` unless tuned.
 - **Tuning.** `store.tune_hybrid_weights(query_embeddings, query_strs, relevant)` picks the weights from labeled queries. `relevant` holds node ids per query, as a set or `{node id: grade}`. The weights are saved with the store. Tune on queries you won't evaluate on.
 - **Custom encoders on reopen.** Pass a custom encoder again when opening the store, like `from_persist_path(..., sparse=encoder)`.
@@ -76,7 +76,7 @@ Strings and numbers in node metadata become filterable columns; other values are
 
 ## Also supported
 
-- `delete(ref_doc_id)` removes all nodes of a source document, which is what `index.delete_ref_doc` uses. There's also `delete_nodes(node_ids, filters)`, `get_nodes(node_ids, filters)` and `clear()`. Adding an existing node id replaces that node.
+- `delete(ref_doc_id)` removes all nodes of a source document, which is what `index.delete_ref_doc` uses. There's also `delete_nodes(node_ids, filters)`, `get_nodes(node_ids, filters)` and `clear()`; their filters run in qann like a query's, except `text_match` and `contains`, which are checked in Python. Adding an existing node id replaces that node.
 - Queries restricted to `node_ids` or `doc_ids`.
 - Similarities where higher is closer: cosine similarity, the inner product, or minus the squared L2 distance; the fused score with hybrid search.
 - Async methods (LlamaIndex's defaults; qann releases the GIL during queries and adds).
