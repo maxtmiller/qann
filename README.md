@@ -480,6 +480,18 @@ store = QANNVectorStore.from_texts(texts, embeddings, metadatas=metadatas, index
 docs = store.similarity_search("query", k=10, filter="year >= 2020")
 ```
 
+## LlamaIndex
+
+[`llama-index-vector-stores-qann`](https://github.com/maxtmiller/qann/tree/main/integrations/llama-index-vector-stores-qann) is a LlamaIndex vector store on a qann index. It offers the same presets and your own qann index, translates `MetadataFilters` into qann filters, supports `delete_ref_doc` and hybrid query modes (`sparse="bm25"`), and persists to one file:
+
+```python
+from llama_index.vector_stores.qann import QANNVectorStore
+
+store = QANNVectorStore(index="ivf-pq", sparse="bm25")
+index = VectorStoreIndex.from_documents(documents, storage_context=StorageContext.from_defaults(vector_store=store))
+nodes = index.as_retriever(vector_store_query_mode="hybrid", alpha=0.6).retrieve("query")
+```
+
 ## More
 
 [ARCHITECTURE.md](https://github.com/maxtmiller/qann/blob/main/ARCHITECTURE.md) has the design, a file-by-file reference, the measurements behind this README and the benchmarks.
