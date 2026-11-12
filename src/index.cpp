@@ -68,6 +68,16 @@ vector<int64_t> IndexBase::ids() const {
     return out;
 }
 
+vector<int64_t> IndexBase::ids(const Expr& where) const {
+    const detail::SlotFilter filter = where_filter(where, nullptr);
+    const detail::IdMap& map = id_map();
+    vector<int64_t> out;
+    out.reserve(filter.count);
+    filter.for_each([&](uint32_t s) { out.push_back(map.label(s)); });
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
 vector<float> DenseIndex::get_vectors(span<const int64_t> ids) const {
     if (!stores_vectors())
         throw std::invalid_argument("this index stores PQ or SQ codes, not the vectors; a RefineIndex over it keeps them");

@@ -69,6 +69,11 @@ public:
     // Every live vector's id, in ascending order.
     vector<int64_t> ids() const;
 
+    // The ids of the live vectors whose metadata matches where, in ascending
+    // order. Throws std::invalid_argument on a column the index doesn't have,
+    // as query() does.
+    vector<int64_t> ids(const Expr& where) const;
+
     // Adds a metadata column with value for every vector, or null for every
     // vector without one; fill it further with update_metadata() or later
     // adds. Throws std::invalid_argument if the name is empty or taken, or the

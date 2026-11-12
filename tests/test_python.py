@@ -424,6 +424,44 @@ def test_sparse_index_lists_ids():
 
 
 @pytest.mark.parametrize("kind", ["flat", "ivf", "refine", "hnsw"])
+def test_ids_where(tmp_path, data, kind):
+    ids = np.arange(len(data))[::-1] * 10 + 7
+    index = make_custom_index(kind, data, ids)
+    group = np.arange(len(data)) % 5
+    index.add_metadata_column("group", "int", ids=ids, values=group)
+    want = np.sort(ids[group == 2])
+    for where in ("group = 2", qann.field("group") == 2, ("group = ?", [2])):
+        np.testing.assert_array_equal(index.ids(where=where), want)
+    assert index.ids(where="group = 9").size == 0
+
+    gone = ids[group == 2][::3]
+    index.remove(gone)
+    want = np.setdiff1d(want, gone)
+    np.testing.assert_array_equal(index.ids(where="group = 2"), want)
+    index.compact()
+    np.testing.assert_array_equal(index.ids(where="group = 2"), want)
+    index.save(tmp_path / "i.qann")
+    np.testing.assert_array_equal(qann.load(tmp_path / "i.qann").ids(where="group = 2"), want)
+
+    with pytest.raises(ValueError):
+        index.ids(where="missing = 1")
+
+
+def test_ids_where_sparse_and_hybrid():
+    sp = pytest.importorskip("scipy.sparse")
+    docs = sp.csr_array(np.eye(6, dtype=np.float32))
+    index = qann.InvertedIndex(custom_ids=True)
+    index.add(docs, ids=[60, 10, 50, 20, 40, 30], metadata={"tag": ["a", "b", "a", "b", "a", None]})
+    np.testing.assert_array_equal(index.ids(where="tag = 'a'"), [40, 50, 60])
+    np.testing.assert_array_equal(index.ids(where="tag IS NULL"), [30])
+
+    h = qann.HybridIndex(qann.FlatIndex(6), qann.InvertedIndex(), custom_ids=True)
+    h.add(np.eye(6, dtype=np.float32), docs, ids=[60, 10, 50, 20, 40, 30], metadata={"n": [1, 2, 3, 4, 5, 6]})
+    h.remove([50])
+    np.testing.assert_array_equal(h.ids(where="n >= 3"), [20, 30, 40])
+
+
+@pytest.mark.parametrize("kind", ["flat", "ivf", "refine", "hnsw"])
 def test_filtered_query(data, kind):
     ids = np.arange(len(data)) * 10 + 7
     index = make_custom_index(kind, data, ids)

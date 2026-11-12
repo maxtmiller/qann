@@ -71,7 +71,7 @@ Methods every dense index has (sparse indexes take `scipy.sparse` matrices inste
 | `remove(ids)` | Delete vectors by id. Returns how many were deleted. |
 | `compact()` | Free the memory of deleted vectors. Returns how many were freed. |
 | `size()`, `dim()` | Number of (non-deleted) vectors; vector dimension. |
-| `ids()` | Every live id, ascending (sparse indexes too). |
+| `ids(*, where=None)` | Every live id, ascending (sparse indexes too); with `where`, only those whose [metadata](#metadata) matches, with no vector search. |
 | `get_vectors(ids)` | Copies of the stored vectors, `(n, dim)`, in the order given. Not on PQ or SQ indexes, which keep only codes (`stores_vectors` is `False`); a `RefineIndex` over them works. With `Cosine` they come back unit-length. |
 | `save(path)` | Save to a file; see [Saving and loading](#saving-and-loading). |
 | `metadata_schema`, `get_metadata`, `update_metadata`, `add_metadata_column`, `drop_metadata_column` | See [Metadata](#metadata). |
@@ -323,6 +323,7 @@ ids, dists = index.batch_query(queries, 10, where=("user_id = ? AND year IN (?, 
 - **SQL:** comparisons, `[NOT] IN`, `IS [NOT] NULL`, `[NOT] BETWEEN`, `AND`, `OR`, `NOT` and parentheses. Bad syntax raises `ValueError`.
 - **Parameters:** pass values as `(sql, [values])` for `?` or `(sql, {name: value})` for `:name`, never pasted into the string. `qann.where(sql, params)` returns a reusable filter.
 - **Combining:** with both `where` and `allowed`, results must pass both.
+- **Without a query:** `index.ids(where=...)` returns every live id matching the filter, ascending, e.g. to delete by filter: `index.remove(index.ids(where="source = 'x'"))`.
 
 Reading and changing metadata:
 

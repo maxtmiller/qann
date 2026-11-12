@@ -882,12 +882,15 @@ NB_MODULE(qann, m) {
                      },
                      "Each metadata column's name and type ('int', 'float' or 'str'), in the order they were added")
         .def("ids",
-             [](const vecengine::IndexBase& self) {
-                 std::vector<int64_t> ids = read_locked(self, [&] { return self.ids(); });
+             [](const vecengine::IndexBase& self, std::optional<WhereArg> where_arg) {
+                 const std::optional<vecengine::Expr> where = to_expr(where_arg);
+                 std::vector<int64_t> ids = read_locked(self, [&] { return where ? self.ids(*where) : self.ids(); });
                  const std::size_t n = ids.size();
                  return to_numpy(std::move(ids), {n});
              },
-             "Every live vector's id (int64), in ascending order")
+             nb::kw_only(), nb::arg("where").none() = nb::none(),
+             "Every live vector's id (int64), in ascending order; with where= (as in query), only the ids "
+             "whose metadata matches it, with no vector search. A column the index doesn't have raises ValueError")
         .def("size", &index_size, "Get number of indexed vectors");
 
     nb::class_<vecengine::DenseIndex, vecengine::IndexBase>(m, "DenseIndex", "An index of dense float vectors")
