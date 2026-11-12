@@ -547,6 +547,8 @@ The README keeps to what each feature does and how to call it. This section hold
 
   On a 4-CPU x86 VM the defaults gave 0.955 recall at 10.6x exact search on one thread (614 vs 58 queries per second) and 8.0x on all threads (#59). `benchmarks/sparse_bigann.py --approx` measures it.
 
+- **`BM25`** (`bm25.hpp`, #159) moved here from the integrations, which had identical Python copies. It keeps the term ids and values of that Python class bit for bit, so stores saved with it still work: tokens are hashed with zlib's CRC-32 while scanning (no per-token string), stopwords are checked as one packed 64-bit word, and the two non-ASCII characters Python lowercases to ASCII (U+212A to `k`, U+0130 to `i` plus a combining dot) are special-cased. Documents are counted in parallel and merged into the `df` map serially. On FiQA (58k documents) a rebuild takes 0.15 s on all M3 threads, 0.53 s on one, against 3.3 s for the Python class; about 4.7 s at 1M documents. That is fast enough that the counts aren't saved in the index file.
+
 ### Hybrid search
 
 `benchmarks/hybrid_beir.py` ranks BEIR test queries with BM25 alone, dense alone (exact cosine) and a `HybridIndex`, against the human relevance labels. nDCG@10:
