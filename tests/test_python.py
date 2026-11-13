@@ -564,9 +564,9 @@ def test_hnsw_filter_ef_scaling(tmp_path):
     allowed = np.arange(5, 20000, 5)    # 20%, above the direct-scoring cutoff: a graph search
     on_ids, _ = hnsw.batch_query(queries, 10, allowed=allowed)
     assert np.isin(on_ids, allowed).all()
-    # the same graph search as the full beam scaled by sqrt(0.2): round(100 * 0.447) = 45
+    # the same graph search as the full beam scaled by cbrt(0.2): round(100 * 0.585) = 58
     hnsw.filter_ef_scaling = False
-    hnsw.ef_search = 45
+    hnsw.ef_search = 58
     np.testing.assert_array_equal(hnsw.batch_query(queries, 10, allowed=allowed)[0], on_ids)
 
     hnsw.filter_ef_scaling = False

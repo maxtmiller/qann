@@ -125,24 +125,26 @@ vector<Neighbor> HNSWIndex::query_impl(span<const float> vec, size_t k, const de
     // A filtered beam of ef keeps only allowed nodes, so it ends up nearer the
     // true neighbors than an unfiltered one: on SIFT1M at ef 64, recall 0.998
     // with 10% allowed against 0.953 unfiltered, at 6x the cost. Scaling the
-    // beam by sqrt(s) for a fraction s allowed brings recall back to about the
-    // unfiltered level (SIFT1M 0.964-0.972 for 4-50% allowed, GloVe-100 within
-    // 0.01 of unfiltered) at 1.3-4x less time; s^0.7 fell below it.
+    // beam by cbrt(s) for a fraction s allowed keeps recall at about the
+    // unfiltered level (#153). sqrt(s), the first choice (#89), was enough on
+    // SIFT1M but not on 768-d arxiv-nomic, where at ef 32 it cut the beam to k
+    // at 10% allowed and recall fell to 0.94 (0.958 unfiltered); cbrt(s) gave
+    // 0.958-0.965 there for 5-10%, and on SIFT1M costs up to 1.4x sqrt's time.
     size_t ef = std::max(ef_search_, k);
-    const bool scaled = filter && filter_ef_scaling_ && slots() > 0;
-    if (scaled) ef = std::max(k, static_cast<size_t>(std::lround(double(ef) * std::sqrt(double(filter->count) / double(slots())))));
+    if (filter && filter_ef_scaling_ && slots() > 0)
+        ef = std::max(k, static_cast<size_t>(std::lround(double(ef) * std::cbrt(double(filter->count) / double(slots())))));
 
     // With a fraction s of the vectors allowed, the beam passes about 1/s nodes
-    // per result it keeps, so a search costs about D / s distances (D: the
-    // unfiltered cost, ~ef * M), while scoring the allowed vectors directly
-    // costs s * slots. The two meet at count^2 = D * slots; below that, score
-    // the allowed vectors directly, which is also exact. Unscaled, the measured
-    // crossover on SIFT1M (ef 64, M 16) was 3-5% and the rule puts it at 3.2%.
-    // With the beam scaled as above, a filtered search costs about twice this
-    // model at small s (the beam can't shrink below k), so the cutoff doubles
-    // D: the measured crossovers were ~1.8% at ef 32, ~2% at ef 64 and ~2.5% at
-    // ef 128, where count^2 <= 2 * D * slots puts them at 1.8%, 1.8% and 2.5%.
-    const double graph_cost = (scaled ? 2.0 : 1.0) * double(ef) * double(M_);
+    // per result it keeps, so a search costs about ef * M / s, while scoring the
+    // allowed vectors directly costs s * slots and is exact. Score directly
+    // when count^2 <= ef * M * slots / 3 (ef: the beam actually used). The 1/3
+    // was measured with a different filter per query, so allowed vectors
+    // aren't already in cache (#153, M3): crossovers at 0.77% on SIFT1M and
+    // 0.66% on arxiv-nomic-768 at beam 10, 1.3% and 1.8% on SIFT1M unscaled at
+    // ef 32 and 64, all within c = 0.32-0.37. Dimension doesn't enter: both
+    // sides read whole vectors. A filter repeated on every query keeps a small
+    // allowed set cached and favors direct scoring (SIFT1M: ~1.8%).
+    const double graph_cost = double(ef) * double(M_) / 3.0;
     if (filter && double(filter->count) * double(filter->count) <= graph_cost * double(slots())) {
         detail::TopK top(k);
         filter->for_each([&](uint32_t slot) {

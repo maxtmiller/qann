@@ -1036,7 +1036,7 @@ NB_MODULE(qann, m) {
                      [](const vecengine::HNSWIndex& self) { return read_locked(self, [&] { return self.filter_ef_scaling(); }); },
                      [](vecengine::HNSWIndex& self, bool v) { write_locked(self, [&] { self.set_filter_ef_scaling(v); }); },
                      "Whether filtered queries narrow the search width as the filter narrows, to max(k, ef_search * "
-                     "sqrt(fraction allowed)), keeping recall near an unfiltered query's at a fraction of the cost "
+                     "cbrt(fraction allowed)), keeping recall near an unfiltered query's at a fraction of the cost "
                      "(on by default). Off uses the full ef_search: slower, higher recall. Not saved: a loaded index has it on")
         .def_prop_ro("M", [](const vecengine::HNSWIndex& self) { return self.M(); }, "Neighbors per node (fixed at construction)")
         .def_prop_ro("ef_construction", [](const vecengine::HNSWIndex& self) { return self.ef_construction(); },

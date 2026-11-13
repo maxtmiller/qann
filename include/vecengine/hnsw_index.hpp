@@ -72,7 +72,7 @@ public:
     void set_ef_search(size_t ef);
 
     // Whether a filtered query narrows its beam as the filter narrows, to
-    // max(k, ef * sqrt(s)) for a fraction s allowed: a filtered beam of ef
+    // max(k, ef * cbrt(s)) for a fraction s allowed: a filtered beam of ef
     // finds more of its true neighbors than an unfiltered one, so this keeps
     // recall near an unfiltered query's at a fraction of the cost. On by
     // default; off, filtered queries use the full ef (slower, higher recall).
