@@ -125,12 +125,15 @@ vector<Neighbor> HNSWIndex::query_impl(span<const float> vec, size_t k, const de
     // A filtered beam of ef keeps only allowed nodes, so it ends up nearer the
     // true neighbors than an unfiltered one: on SIFT1M at ef 64, recall 0.998
     // with 10% allowed against 0.953 unfiltered, at 6x the cost. Scaling the
-    // beam by sqrt(s) for a fraction s allowed brings recall back to about the
-    // unfiltered level (SIFT1M 0.964-0.972 for 4-50% allowed, GloVe-100 within
-    // 0.01 of unfiltered) at 1.3-4x less time; s^0.7 fell below it.
+    // beam by cbrt(s) for a fraction s allowed keeps recall at about the
+    // unfiltered level (#153). sqrt(s), the first choice (#89), was enough on
+    // SIFT1M but not on 768-d arxiv-nomic, where at ef 32 it cut the beam to k
+    // at 10% allowed and recall fell to 0.94 (0.958 unfiltered); cbrt(s) gave
+    // 0.958-0.965 there for 5-10%, and on SIFT1M costs up to 1.4x sqrt's time.
     size_t ef = std::max(ef_search_, k);
     const bool scaled = filter && filter_ef_scaling_ && slots() > 0;
-    if (scaled) ef = std::max(k, static_cast<size_t>(std::lround(double(ef) * std::sqrt(double(filter->count) / double(slots())))));
+    if (scaled)
+        ef = std::max(k, static_cast<size_t>(std::lround(double(ef) * std::cbrt(double(filter->count) / double(slots())))));
 
     // With a fraction s of the vectors allowed, the beam passes about 1/s nodes
     // per result it keeps, so a search costs about D / s distances (D: the
