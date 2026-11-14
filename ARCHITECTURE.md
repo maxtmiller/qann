@@ -522,7 +522,7 @@ The README keeps to what each feature does and how to call it. This section hold
   - 4 bits + `RefineIndex(k_factor=8)` matched the floats' recall at the same speed-up;
   - on one thread the gain mostly disappears: SQ helps because the float scan is limited by memory bandwidth.
   - When raw vectors fit in memory, fast-scan PQ + `RefineIndex` is still faster, and HNSW-SQ8 is faster at the same recall for about twice the memory.
-- **`precomputed_tables`** exist once PQ is enabled and trained, if `nlist * num_subspaces * centroids_per_subspace * 4` bytes fit in 256 MB. They're always off with `Metric.InnerProduct`, which needs only one table per query.
+- **`precomputed_tables`** exist once PQ is enabled and trained, if `nlist * num_subspaces * centroids_per_subspace * 4` bytes fit in 256 MB. They're always off with `Metric.InnerProduct` and `Metric.Cosine`, which need only one table per query.
 
 ### HNSW: `M`, deletes and SQ
 
