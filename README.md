@@ -99,7 +99,7 @@ Clusters vectors into `nlist` lists with k-means, and scans only the `nprobe` li
 | `enable_sq(bits=8)` | Store 8 or 4 bits per dimension instead of floats ([SQ](#sq)). Call before `train`; not with PQ. |
 | `nprobe` | Lists scanned per query: higher is slower and more accurate. |
 | `pq_distance` | `qann.PQDistance.ADC` (default, more accurate) or `SDC`. |
-| `precomputed_tables` | Lookup tables built at train time that speed up PQ queries. On by default; `False` frees them. |
+| `precomputed_tables` | Lookup tables built at train time that speed up L2 PQ queries. On by default; `False` frees them. Cosine and inner product don't need them. |
 | `fast_scan`, `sq_bits` | Read-only: the compression in use. |
 
 - `nlist` must be 100 to 65535. Start with `nlist` around `sqrt(n)` to `4 * sqrt(n)`, and `nprobe` at 1% to 5% of `nlist`.

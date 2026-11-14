@@ -1003,7 +1003,7 @@ NB_MODULE(qann, m) {
                      [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.precomputed_tables(); }); },
                      [](vecengine::IVFIndex& self, bool v) { write_locked(self, [&] { self.set_precomputed_tables(v); }); },
                      "Whether ADC queries use per-list tables precomputed at train time (on by default). "
-                     "True only once they exist: PQ enabled, trained, and within the 256 MB cap")
+                     "True only once they exist: PQ enabled, trained, Metric.L2, and within the 256 MB cap")
         .def_prop_rw("filter_probe_scaling",
                      [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.filter_probe_scaling(); }); },
                      [](vecengine::IVFIndex& self, bool v) { write_locked(self, [&] { self.set_filter_probe_scaling(v); }); },

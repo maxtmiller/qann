@@ -60,8 +60,8 @@ void IVFIndex::set_precomputed_tables(bool enabled) {
 
 void IVFIndex::build_precomputed() {
     precomputed_.clear();
-    // InnerProduct needs none: its table doesn't depend on the list (see scan)
-    if (!use_precomputed_ || !trained_ || !pq_enabled() || metric_ == Metric::InnerProduct) return;
+    // InnerProduct and Cosine need none: their table doesn't depend on the list (see scan)
+    if (!use_precomputed_ || !trained_ || !pq_enabled() || metric_ != Metric::L2) return;
 
     size_t list_size = pq_->num_subspaces() * pq_->centroids_per_subspace();
     if (nlist_ * list_size * sizeof(float) > kPrecomputedMaxBytes) return;
@@ -413,11 +413,19 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
     // The table of -(q_s . y_sj) is the same for every list, so it is built
     // (and for fast-scan rounded to bytes) once per query, and each list adds
     // its -(q . c), the probe's dist.
-    const bool ip_pq = pq_enabled() && metric_ == Metric::InnerProduct;
+    // Cosine (unit q and x) scores the same way, scaled to L2 between unit
+    // vectors: 2 - 2 q . x = (2 - 2 q . c) - 2 sum_s q_s . r_s (#148). L2 needs
+    // a table per list, since |x|^2 = |c + r|^2 depends on the list; on unit
+    // data that term is about 1 and dropping it is what FAISS does for cosine.
+    // On landmark-dino-768 (PQ384 fast-scan) building and rounding a table per
+    // list was 16% of the query.
+    const bool cos_pq = pq_enabled() && metric_ == Metric::Cosine && pq_distance_ == PQDistance::ADC;
+    const bool ip_pq = (pq_enabled() && metric_ == Metric::InnerProduct) || cos_pq;
     float ip_scale = 1.0f, ip_offset = 0.0f;
     if (ip_pq) {
         pq_->compute_inner_table(vec, table);
-        for (float& t : table) t *= 0.5f;
+        if (!cos_pq)
+            for (float& t : table) t *= 0.5f;
         if (fast_scan_) detail::quantize_lut(table.data(), m, lut.data(), ip_scale, ip_offset);
     }
 
@@ -537,11 +545,13 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
 
         if (ip_pq) {
             VECENGINE_PROF_START(t_scan);
+            // Cosine's A is |q - c|^2 = 1 + |c|^2 - 2 q . c; the list adds 2 - 2 q . c
+            const float base = cos_pq ? A + 1.0f - centroid_sqnorms_[probe.list] : A;
             if (fast_scan_) {
-                scan_fast(list, listSize, ip_scale, ip_offset + A, push);
+                scan_fast(list, listSize, ip_scale, ip_offset + base, push);
             } else {
                 pq_->distances_adc(table, list.codes.data(), listSize, dists.data());
-                for (size_t j = 0; j < listSize; ++j) push(dists[j] + A, j);
+                for (size_t j = 0; j < listSize; ++j) push(dists[j] + base, j);
             }
             VECENGINE_PROF_STOP(t_scan, kProfCodeScan);
             continue;

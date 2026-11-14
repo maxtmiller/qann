@@ -98,7 +98,8 @@ public:
     // is true only once the tables exist (PQ on, trained, and nlist * m * K
     // floats within kPrecomputedMaxBytes). Disabling frees them. Results
     // match the per-list path up to float rounding. Never built for
-    // Metric::InnerProduct, whose one table per query serves every list.
+    // Metric::InnerProduct or Metric::Cosine, whose one table per query
+    // serves every list.
     bool precomputed_tables() const noexcept { return !precomputed_.empty(); }
     void set_precomputed_tables(bool enabled);
 
