@@ -703,8 +703,13 @@ void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_i
         vectors = rot;
     }
 
-    // run kmeans
-    auto res = vecengine::detail::kmeans(vectors.data(), num_vectors, dim_, dim_, nlist_, max_iters, seed);
+    // Cosine clusters unit vectors, so the centroids are kept unit length too
+    // (spherical k-means, #148): plain means of a spread-out cluster are short,
+    // and L2 probing then passes over them. On landmark-dino-768 (VIBE, nlist
+    // 512, no PQ) it raised recall@100 at nprobe 16 from 0.951 to 0.966. The
+    // rotation is orthonormal, so rotated unit vectors stay unit.
+    auto res = vecengine::detail::kmeans(vectors.data(), num_vectors, dim_, dim_, nlist_, max_iters, seed,
+                                         metric_ == Metric::Cosine);
     coarse_centroids_ = std::move(res.centroids);
     update_centroid_sqnorms();
 
