@@ -5,6 +5,10 @@ From: base.sif
   qann-dist /opt/qann-dist
 
 %post
+  # OpenBLAS for k-means and batch coarse search: without it qann builds with the scalar
+  # fallback and its index builds take about 3x as long (#170)
+  apt-get update && apt-get install -y libopenblas-dev
   # Built from source for this CPU (AVX-512 where it has it), the way hnswlib builds itself here.
   CMAKE_ARGS="-DVECENGINE_NATIVE=ON" pip install --no-cache-dir --no-binary qann -r /opt/qann-dist/requirement.txt
   python -c 'import qann; print(qann.__version__)'
+  ldd "$(python -c 'import qann; print(qann.__file__)')" | grep -q openblas || { echo "qann built without OpenBLAS" >&2; exit 1; }
