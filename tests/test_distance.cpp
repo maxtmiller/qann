@@ -1048,3 +1048,28 @@ TEST_CASE("cosine_distance_avx2 matches scalar", "[cosine][avx2]") {
     REQUIRE_THAT(fast, WithinRel(ref, 1e-4f));
 }
 #endif
+
+TEST_CASE("kmeans: spherical keeps centroids unit length", "[kmeans]") {
+    const size_t n = 2000, dim = 16, k = 20;
+    std::mt19937 rng(5);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::vector<float> data(n * dim);
+    for (size_t i = 0; i < n; ++i) {
+        float sq = 0;
+        for (size_t j = 0; j < dim; ++j) sq += (data[i * dim + j] = nd(rng)) * data[i * dim + j];
+        for (size_t j = 0; j < dim; ++j) data[i * dim + j] /= std::sqrt(sq);
+    }
+    auto plain = vecengine::detail::kmeans(data.data(), n, dim, dim, k, 10, 7u);
+    auto sph = vecengine::detail::kmeans(data.data(), n, dim, dim, k, 10, 7u, true);
+    double plain_min = 1;
+    for (size_t c = 0; c < k; ++c) {
+        double a = 0, b = 0;
+        for (size_t j = 0; j < dim; ++j) {
+            a += double(sph.centroids[c * dim + j]) * sph.centroids[c * dim + j];
+            b += double(plain.centroids[c * dim + j]) * plain.centroids[c * dim + j];
+        }
+        REQUIRE(std::abs(a - 1.0) < 1e-4);
+        plain_min = std::min(plain_min, b);
+    }
+    REQUIRE(plain_min < 0.9);   // plain means of spread-out unit vectors are shorter
+}

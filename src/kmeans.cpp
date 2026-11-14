@@ -1,6 +1,7 @@
 #include "kmeans.hpp"
 #include "vecengine/distance.hpp"
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -155,7 +156,8 @@ void reseed_empty_clusters(const float* data, size_t n, size_t stride, size_t di
     }
 }
 
-KMeansResult kmeans(const float* data, size_t n, size_t stride, size_t d, size_t k, size_t max_iters, std::optional<uint32_t> seed) {
+KMeansResult kmeans(const float* data, size_t n, size_t stride, size_t d, size_t k, size_t max_iters, std::optional<uint32_t> seed,
+                    bool spherical) {
     if (n < k) throw std::invalid_argument("kmeans: need at least k points");
 
     std::mt19937 rng(seed ? *seed : std::random_device{}());
@@ -211,6 +213,14 @@ KMeansResult kmeans(const float* data, size_t n, size_t stride, size_t d, size_t
 
                 for (size_t l = 0; l < d; ++l) {
                     sum_ptr[l] /= count;
+                }
+                if (spherical) {
+                    double sq = 0;
+                    for (size_t l = 0; l < d; ++l) sq += double(sum_ptr[l]) * sum_ptr[l];
+                    if (sq > 0) {
+                        const float scale = static_cast<float>(1.0 / std::sqrt(sq));
+                        for (size_t l = 0; l < d; ++l) sum_ptr[l] *= scale;
+                    }
                 }
             }
         }

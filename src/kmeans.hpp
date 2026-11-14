@@ -20,8 +20,11 @@ struct KMeansResult {
 // data + i * stride. stride == d for packed vectors (IVF); stride > d lets
 // PQ cluster one subspace slice of every row without copying it out.
 // Requires n >= k. Without a seed, initial centroids come from std::random_device.
+// spherical scales every centroid to unit length after each update, for unit
+// input points (cosine): assigning by L2 to unit centroids is assigning by
+// cosine, where plain means would be shorter for spread-out clusters.
 KMeansResult kmeans(const float* data, size_t n, size_t stride, size_t d, size_t k, size_t max_iters,
-                    std::optional<uint32_t> seed = std::nullopt);
+                    std::optional<uint32_t> seed = std::nullopt, bool spherical = false);
 
 // Index in [0, k) of the centroid closest (squared L2) to the d-float point.
 // centroids is k * d, row-major.
