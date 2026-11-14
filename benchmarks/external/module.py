@@ -23,6 +23,7 @@ class _Qann(BaseANN):
         if metric not in METRICS:
             raise NotImplementedError(f"qann does not support metric {metric!r}")
         self.metric = METRICS[metric]
+        self.cosine_like = metric in ("angular", "cosine", "normalized")
         self.normalize = metric in ("angular", "cosine")
         self.pad = 0
         self.buf = None
@@ -32,7 +33,7 @@ class _Qann(BaseANN):
         # cosine were 0.5, so it would outrank true neighbors below that. Inner product gives
         # it 0, cosine's value, and ranks unit vectors by cosine too; only used when needed so
         # other datasets keep the L2 path.
-        if self.normalize and not np.all(np.any(X != 0, axis=1)):
+        if self.cosine_like and not np.all(np.any(X != 0, axis=1)):
             return qann.Metric.InnerProduct
         return self.metric
 
@@ -119,6 +120,12 @@ class QannIVFFastScan(_Qann):
         self.pad = -X.shape[1] % 8
         X = self._prep(X)
         self.metric = self._metric_for(X)
+        # Metric.Cosine trains spherical k-means (unit centroids), which probes the right lists
+        # more often on unit vectors than L2 centroids do: landmark-dino-768 plain IVF recall@100
+        # at nprobe 16 went from 0.951 to 0.967 (#148). Ranking is the same as L2 on unit vectors;
+        # _metric_for already moved datasets with zero vectors, which Cosine rejects, to InnerProduct.
+        if self.cosine_like and self.metric == qann.Metric.L2:
+            self.metric = qann.Metric.Cosine
         dim = X.shape[1]
         self.m = _pq_subspaces(dim, self.dims_per_subspace)
         # qann needs 100 <= nlist <= training vectors; small datasets get fewer clusters.
