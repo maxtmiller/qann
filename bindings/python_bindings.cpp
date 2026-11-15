@@ -960,8 +960,9 @@ NB_MODULE(qann, m) {
         .def(nb::init<std::size_t, std::size_t, std::size_t, bool, vecengine::Metric>(), nb::arg("dim"), nb::arg("nlist"),
              nb::arg("nprobe") = 10, nb::kw_only(), nb::arg("custom_ids") = false, nb::arg("metric") = vecengine::Metric::L2,
              "Construct IVFIndex with vector dimension, number of coarse clusters, and search breadth")
-        .def("train", &ivf_train, nb::arg("data"), nb::arg("max_iters") = 25, nb::arg("seed") = nb::none(),
-             "Run k-means over sample vectors to compute coarse centroids")
+        .def("train", &ivf_train, nb::arg("data"), nb::arg("max_iters") = 10, nb::arg("seed") = nb::none(),
+             "Run k-means over sample vectors to compute coarse centroids (max_iters iterations; the PQ codebook, "
+             "if enabled, always runs 25)")
         .def("enable_pq",
              [](vecengine::IVFIndex& self, std::size_t num_subspaces, std::optional<std::size_t> centroids_per_subspace,
                 bool fast_scan, bool rotate) {

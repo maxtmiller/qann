@@ -735,7 +735,10 @@ void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_i
             }
         }
 
-        pq_->train(residuals, num_vectors, max_iters, seed ? std::optional<uint32_t>(*seed + 1) : std::nullopt);
+        // Coarse k-means defaults to 10 iterations as in FAISS (recall@100 -0.003 on
+        // landmark-dino-768 for 2.3x faster training, #170); PQ keeps 25, which is cheap
+        // on its capped sample.
+        pq_->train(residuals, num_vectors, 25, seed ? std::optional<uint32_t>(*seed + 1) : std::nullopt);
     }
     if (sq_bits_) sq_.train(vectors, num_vectors, dim_);
     trained_ = true;
