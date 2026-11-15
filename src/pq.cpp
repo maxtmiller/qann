@@ -9,6 +9,8 @@
 #include <span>
 #include <stdexcept>
 #include <algorithm>
+#include <numeric>
+#include <random>
 
 namespace vecengine {
 
@@ -34,6 +36,25 @@ PQCodebook::PQCodebook(size_t dim, size_t num_subspaces, size_t centroids_per_su
 void PQCodebook::train(span<const float> vectors, size_t num_vectors, size_t max_iters, std::optional<uint32_t> seed) {
     assert(vectors.size() == num_vectors * dim_);
     if (num_vectors < centroids_per_subspace_) throw std::invalid_argument("training set must have at least centroids_per_subspace_ vectors");
+
+    // Train on at most 256 points per centroid, as FAISS does: on landmark-dino-768
+    // (PQ384x4) the full 131k sample made training ~5x slower than FAISS (#170)
+    // without a better codebook.
+    const size_t cap = 256 * centroids_per_subspace_;
+    vector<float> subset;
+    if (num_vectors > cap) {
+        std::mt19937 rng(seed ? *seed : std::random_device{}());
+        vector<size_t> rows(num_vectors);
+        std::iota(rows.begin(), rows.end(), 0);
+        subset.resize(cap * dim_);
+        for (size_t i = 0; i < cap; ++i) {
+            std::uniform_int_distribution<size_t> pick(i, num_vectors - 1);
+            std::swap(rows[i], rows[pick(rng)]);
+            std::copy_n(vectors.data() + rows[i] * dim_, dim_, subset.data() + i * dim_);
+        }
+        vectors = subset;
+        num_vectors = cap;
+    }
 
     // run kmeans on each subspace
     detail::parallel_for(num_subspaces_, [&](size_t i) {
