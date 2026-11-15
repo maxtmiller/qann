@@ -85,7 +85,7 @@ template <size_t K>
 void encode_subspaces(const float* centroids_t, const float* vec, size_t m, size_t sub_dim, size_t k, uint8_t* out) {
     const size_t kk = K ? K : k;
     float dist[256];
-    uint32_t bits[256];
+    int32_t bits[256];
     for (size_t i = 0; i < m; ++i) {
         const float* cent = centroids_t + i * sub_dim * kk;
         const float q0 = vec[i * sub_dim];
@@ -103,10 +103,11 @@ void encode_subspaces(const float* centroids_t, const float* vec, size_t m, size
         }
 
         // First index of the minimum. Distances are sums of squares (>= +0), whose
-        // bit patterns order like the floats, and an integer min vectorizes where a
-        // float min can't (NaN rules).
+        // bit patterns order like the floats as int32, and an integer min vectorizes
+        // where a float min can't (NaN rules); signed, because baseline x86-64 (SSE2)
+        // has no unsigned 32-bit min.
         std::memcpy(bits, dist, kk * sizeof(float));
-        uint32_t min_bits = bits[0];
+        int32_t min_bits = bits[0];
         for (size_t c = 1; c < kk; ++c) min_bits = std::min(min_bits, bits[c]);
         size_t best = 0;
         if constexpr (K > 0 && K <= 32) {
