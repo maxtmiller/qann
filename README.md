@@ -94,7 +94,7 @@ Clusters vectors into `nlist` lists with k-means, and scans only the `nprobe` li
 
 | Member | Description |
 | --- | --- |
-| `train(data, max_iters=25, seed=None)` | Learn the centroids from at least `nlist` vectors. Call once, before `add`. |
+| `train(data, max_iters=10, seed=None)` | Learn the centroids from at least `nlist` vectors. Call once, before `add`. `max_iters` bounds the coarse k-means; a PQ codebook always runs 25. |
 | `enable_pq(num_subspaces, centroids_per_subspace=None, *, fast_scan=False, rotate=False)` | Compress vectors with [product quantization](#product-quantization). Call before `train`. |
 | `enable_sq(bits=8)` | Store 8 or 4 bits per dimension instead of floats ([SQ](#sq)). Call before `train`; not with PQ. |
 | `nprobe` | Lists scanned per query: higher is slower and more accurate. |
