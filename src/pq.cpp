@@ -68,25 +68,38 @@ void PQCodebook::train(span<const float> vectors, size_t num_vectors, size_t max
 }
 
 vector<uint8_t> PQCodebook::encode(span<const float> vec) const {
-    assert(vec.size() == dim_);
-
-    // converts a full dimensional vector into array of cluster IDs
-    vector<float> table(num_subspaces_ * centroids_per_subspace_);
-    compute_adc_table(vec, table);
-
-    // finds closest centroid to vec in each subspace using adc table
-    vector<uint8_t> res(num_subspaces_, 0);
-    for (size_t i = 0; i < num_subspaces_; ++i) {
-        const float* cur_dist = table.data() + (i * centroids_per_subspace_);
-        float min_dist = cur_dist[0];
-        for (size_t j = 0; j < centroids_per_subspace_; ++j) min_dist = std::min(min_dist, cur_dist[j]);
-
-        size_t closest_index = 0;
-        while (cur_dist[closest_index] != min_dist) ++closest_index;
-        res[i] = static_cast<uint8_t>(closest_index);
-    }
-
+    vector<uint8_t> res(num_subspaces_);
+    encode(vec, res.data());
     return res;
+}
+
+void PQCodebook::encode(span<const float> vec, uint8_t* out) const {
+    assert(vec.size() == dim_);
+    const size_t k = centroids_per_subspace_;
+    float dist[256];
+    for (size_t i = 0; i < num_subspaces_; ++i) {
+        const float* cent = centroids_t_.data() + i * sub_dim_ * k;
+        const float q0 = vec[i * sub_dim_];
+        for (size_t c = 0; c < k; ++c) {
+            const float diff = q0 - cent[c];
+            dist[c] = diff * diff;
+        }
+        for (size_t j = 1; j < sub_dim_; ++j) {
+            const float q = vec[i * sub_dim_ + j];
+            const float* cent_d = cent + j * k;
+            for (size_t c = 0; c < k; ++c) {
+                const float diff = q - cent_d[c];
+                dist[c] += diff * diff;
+            }
+        }
+
+        // first index of the minimum, as the two-pass search before it
+        float min_dist = dist[0];
+        for (size_t c = 1; c < k; ++c) min_dist = std::min(min_dist, dist[c]);
+        size_t best = 0;
+        while (dist[best] != min_dist) ++best;
+        out[i] = static_cast<uint8_t>(best);
+    }
 }
 
 void PQCodebook::compute_adc_table(span<const float> query, span<float> out) const {
