@@ -9,6 +9,8 @@
 #include <span>
 #include <stdexcept>
 #include <algorithm>
+#include <bit>
+#include <cstring>
 #include <numeric>
 #include <random>
 
@@ -73,33 +75,59 @@ vector<uint8_t> PQCodebook::encode(span<const float> vec) const {
     return res;
 }
 
-void PQCodebook::encode(span<const float> vec, uint8_t* out) const {
-    assert(vec.size() == dim_);
-    const size_t k = centroids_per_subspace_;
+namespace {
+
+// PQCodebook::encode with the centroid count K fixed at compile time (0 = runtime k),
+// so the distance, min and position loops vectorize. With the branchless position
+// search for K <= 32, PQ384x4 encoding went from 10.0 to 2.4 us per vector on an M3
+// (#170).
+template <size_t K>
+void encode_subspaces(const float* centroids_t, const float* vec, size_t m, size_t sub_dim, size_t k, uint8_t* out) {
+    const size_t kk = K ? K : k;
     float dist[256];
-    for (size_t i = 0; i < num_subspaces_; ++i) {
-        const float* cent = centroids_t_.data() + i * sub_dim_ * k;
-        const float q0 = vec[i * sub_dim_];
-        for (size_t c = 0; c < k; ++c) {
+    uint32_t bits[256];
+    for (size_t i = 0; i < m; ++i) {
+        const float* cent = centroids_t + i * sub_dim * kk;
+        const float q0 = vec[i * sub_dim];
+        for (size_t c = 0; c < kk; ++c) {
             const float diff = q0 - cent[c];
             dist[c] = diff * diff;
         }
-        for (size_t j = 1; j < sub_dim_; ++j) {
-            const float q = vec[i * sub_dim_ + j];
-            const float* cent_d = cent + j * k;
-            for (size_t c = 0; c < k; ++c) {
+        for (size_t j = 1; j < sub_dim; ++j) {
+            const float q = vec[i * sub_dim + j];
+            const float* cent_d = cent + j * kk;
+            for (size_t c = 0; c < kk; ++c) {
                 const float diff = q - cent_d[c];
                 dist[c] += diff * diff;
             }
         }
 
-        // first index of the minimum, as the two-pass search before it
-        float min_dist = dist[0];
-        for (size_t c = 1; c < k; ++c) min_dist = std::min(min_dist, dist[c]);
+        // First index of the minimum. Distances are sums of squares (>= +0), whose
+        // bit patterns order like the floats, and an integer min vectorizes where a
+        // float min can't (NaN rules).
+        std::memcpy(bits, dist, kk * sizeof(float));
+        uint32_t min_bits = bits[0];
+        for (size_t c = 1; c < kk; ++c) min_bits = std::min(min_bits, bits[c]);
         size_t best = 0;
-        while (dist[best] != min_dist) ++best;
+        if constexpr (K > 0 && K <= 32) {
+            uint32_t hit = 0;
+            for (size_t c = 0; c < K; ++c) hit |= uint32_t(bits[c] == min_bits) << c;
+            best = static_cast<size_t>(std::countr_zero(hit));
+        } else {
+            while (bits[best] != min_bits) ++best;
+        }
         out[i] = static_cast<uint8_t>(best);
     }
+}
+
+} // namespace
+
+void PQCodebook::encode(span<const float> vec, uint8_t* out) const {
+    assert(vec.size() == dim_);
+    const float* c = centroids_t_.data();
+    if (centroids_per_subspace_ == 16) encode_subspaces<16>(c, vec.data(), num_subspaces_, sub_dim_, 16, out);
+    else if (centroids_per_subspace_ == 256) encode_subspaces<256>(c, vec.data(), num_subspaces_, sub_dim_, 256, out);
+    else encode_subspaces<0>(c, vec.data(), num_subspaces_, sub_dim_, centroids_per_subspace_, out);
 }
 
 void PQCodebook::compute_adc_table(span<const float> query, span<float> out) const {
