@@ -23,6 +23,12 @@ using std::vector;
 using std::span;
 
 // The vectors assigned to one coarse cluster.
+// How IVFIndex::train learns the coarse centroids.
+enum class Clustering : uint8_t {
+    EMeans = 0,  // e-means (arXiv 2611.09501): mini-batch k-means with EMA centroids, in passes
+    Lloyd = 1,   // Lloyd's k-means, in iterations
+};
+
 struct InvertedList {
     vector<uint32_t> ids; // slot of each vector; id_map_ maps slots to user ids. In a mapped list,
                           // compaction marks removed vectors detail::IdMap::kRemoved instead of moving rows.
@@ -121,13 +127,14 @@ public:
 
     // Learns the nlist coarse centroids (and the PQ codebook or SQ ranges, if enabled) from
     // num_vectors sample vectors (at least nlist). Call once, before any add.
-    // max_iters bounds the coarse k-means; the PQ codebook always runs 25.
-    // emeans_passes > 0 trains the coarse centroids with e-means instead, in
-    // that many passes over the sample (max_iters then unused).
-    // A seed makes training reproducible: coarse k-means uses seed, the PQ
+    // clustering picks the coarse algorithm: e-means in `passes` passes over the
+    // sample (default), or Lloyd's k-means in max_iters iterations. The PQ
+    // codebook always runs 25 Lloyd iterations per subspace.
+    // A seed makes training reproducible: coarse clustering uses seed, the PQ
     // codebook (if enabled) uses seed + 1 onward.
     void train(span<const float> vectors, size_t num_vectors, size_t max_iters = 10,
-               std::optional<uint32_t> seed = std::nullopt, size_t emeans_passes = 0);
+               std::optional<uint32_t> seed = std::nullopt, Clustering clustering = Clustering::EMeans,
+               size_t passes = 2);
 
     void save(std::ostream& out) const override;
 

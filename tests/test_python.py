@@ -89,6 +89,32 @@ def test_ivf_pq_refine_finds_self(data):
     assert np.mean(ids[:, 0] == np.arange(50)) >= 0.9
 
 
+@pytest.mark.parametrize("clustering", [qann.Clustering.EMeans, qann.Clustering.Lloyd])
+def test_ivf_clustering(data, clustering):
+    ivf = qann.IVFIndex(32, nlist=100, nprobe=100)
+    ivf.train(data, seed=1, clustering=clustering)
+    ivf.add(data)
+    ids, _ = ivf.batch_query(data[:50], 1)
+    assert np.array_equal(ids[:, 0], np.arange(50))  # nprobe = nlist: exact
+    again = qann.IVFIndex(32, nlist=100, nprobe=4)
+    again.train(data, seed=1, clustering=clustering)
+    ivf.nprobe = 4
+    again.add(data)
+    assert np.array_equal(again.batch_query(data[:50], 10)[0], ivf.batch_query(data[:50], 10)[0])  # seeded
+
+
+def test_ivf_clustering_options(data):
+    a = qann.IVFIndex(32, nlist=100, nprobe=4)
+    a.train(data, seed=1, passes=1)
+    b = qann.IVFIndex(32, nlist=100, nprobe=4)
+    b.train(data, seed=1, passes=3)
+    a.add(data)
+    b.add(data)
+    assert not np.array_equal(a.batch_query(data[:50], 10)[0], b.batch_query(data[:50], 10)[0])
+    with pytest.raises(ValueError):
+        qann.IVFIndex(32, nlist=100).train(data, passes=0)
+
+
 @pytest.fixture(scope="module")
 def refine_index(data):
     ivf = qann.IVFIndex(32, nlist=100, nprobe=8)
