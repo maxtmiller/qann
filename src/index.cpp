@@ -39,7 +39,7 @@ vector<int64_t> DenseIndex::add_batch(span<const float> vecs, size_t n, const in
     if (metric_ != Metric::Cosine) {
         add_batch_impl(vecs, n, ids);
     } else {
-        const vector<float> unit = normalize_rows(vecs, n);
+        const detail::FloatRows unit = normalize_rows(vecs, n);
         add_batch_impl(unit, n, ids);
     }
     metadata_.append(rows, n, metadata);
@@ -171,7 +171,7 @@ vector<vector<Neighbor>> DenseIndex::query_prepared(span<const float> queries, s
     };
     if (metric_ != Metric::Cosine) return run(queries);
 
-    const vector<float> unit = normalize_rows(queries, num_queries);
+    const detail::FloatRows unit = normalize_rows(queries, num_queries);
     vector<vector<Neighbor>> results = run(unit);
     for (auto& row : results) l2_to_cosine(row);
     return results;
@@ -184,9 +184,9 @@ vector<vector<Neighbor>> DenseIndex::query_batch_impl(span<const float> queries,
     return results;
 }
 
-vector<float> DenseIndex::normalize_rows(span<const float> vecs, size_t n) const {
+detail::FloatRows DenseIndex::normalize_rows(span<const float> vecs, size_t n) const {
     size_t d = dim();
-    vector<float> res;
+    detail::FloatRows res;
     res.resize(n * d);
 
     // The double sum is a serial chain per row, so rows go in parallel blocks:

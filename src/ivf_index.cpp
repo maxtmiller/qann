@@ -716,7 +716,7 @@ void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_i
     if (num_vectors < nlist_) throw std::invalid_argument("training set must have at least nlist vectors");
 
     // learn the clusters on the same unit vectors that adds and queries will use
-    vector<float> unit;
+    detail::FloatRows unit;
     if (metric_ == Metric::Cosine) {
         unit = normalize_rows(vectors, num_vectors);
         vectors = unit;

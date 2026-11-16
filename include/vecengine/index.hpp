@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <string>
 #include <utility>
+#include <memory>
 
 #include "vecengine/distance.hpp"
 #include "vecengine/metadata.hpp"
@@ -18,6 +19,25 @@ namespace vecengine {
 namespace detail {
 class IdMap;
 struct SlotFilter;
+
+// Allocator whose value-construction leaves elements uninitialized, for buffers
+// that are fully overwritten in parallel right after allocation: a std::vector
+// resize zero-fills on one thread, ~1.1 s for 2.3 GB on a 4-core VM (#170).
+template <class T>
+struct NoInitAllocator : std::allocator<T> {
+    using value_type = T;
+    NoInitAllocator() noexcept = default;
+    template <class U>
+    NoInitAllocator(const NoInitAllocator<U>&) noexcept {}
+    template <class U, class... Args>
+    void construct(U* p, Args&&... args) {
+        if constexpr (sizeof...(Args) == 0) ::new (static_cast<void*>(p)) U;
+        else ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
+    }
+};
+
+// Rows of floats from normalize_rows().
+using FloatRows = std::vector<float, NoInitAllocator<float>>;
 }
 
 using std::size_t;
@@ -229,7 +249,7 @@ protected:
     // A copy of the n rows of vecs (dim() floats each), each scaled to unit
     // length. Throws std::invalid_argument on a zero row. Used for
     // Metric::Cosine, by the public methods and by IVFIndex::train.
-    vector<float> normalize_rows(span<const float> vecs, size_t n) const;
+    detail::FloatRows normalize_rows(span<const float> vecs, size_t n) const;
 
     // The exact score *_impl methods rank by, smallest first: squared L2, or
     // -(a . b) for InnerProduct, over n floats.
