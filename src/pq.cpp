@@ -10,6 +10,9 @@
 #include <stdexcept>
 #include <algorithm>
 #include <bit>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #include <cstring>
 #include <numeric>
 #include <random>
@@ -84,6 +87,35 @@ namespace {
 template <size_t K>
 void encode_subspaces(const float* centroids_t, const float* vec, size_t m, size_t sub_dim, size_t k, uint8_t* out) {
     const size_t kk = K ? K : k;
+#if defined(__AVX2__) && defined(__FMA__)
+    // 16 distances fit two registers. GCC's code for the generic loops below kept
+    // x86 at ~10 us per PQ384x4 vector; this path writes the same codes (the FMA
+    // matches how the compiler contracts dist += diff * diff).
+    if constexpr (K == 16) {
+        for (size_t i = 0; i < m; ++i) {
+            const float* cent = centroids_t + i * sub_dim * 16;
+            __m256 q = _mm256_set1_ps(vec[i * sub_dim]);
+            __m256 dlo = _mm256_sub_ps(q, _mm256_loadu_ps(cent));
+            __m256 dhi = _mm256_sub_ps(q, _mm256_loadu_ps(cent + 8));
+            __m256 lo = _mm256_mul_ps(dlo, dlo), hi = _mm256_mul_ps(dhi, dhi);
+            for (size_t j = 1; j < sub_dim; ++j) {
+                q = _mm256_set1_ps(vec[i * sub_dim + j]);
+                dlo = _mm256_sub_ps(q, _mm256_loadu_ps(cent + j * 16));
+                dhi = _mm256_sub_ps(q, _mm256_loadu_ps(cent + j * 16 + 8));
+                lo = _mm256_fmadd_ps(dlo, dlo, lo);
+                hi = _mm256_fmadd_ps(dhi, dhi, hi);
+            }
+            __m256 mn = _mm256_min_ps(lo, hi);
+            mn = _mm256_min_ps(mn, _mm256_permute2f128_ps(mn, mn, 1));
+            mn = _mm256_min_ps(mn, _mm256_shuffle_ps(mn, mn, _MM_SHUFFLE(1, 0, 3, 2)));
+            mn = _mm256_min_ps(mn, _mm256_shuffle_ps(mn, mn, _MM_SHUFFLE(2, 3, 0, 1)));
+            const uint32_t hit = static_cast<uint32_t>(_mm256_movemask_ps(_mm256_cmp_ps(lo, mn, _CMP_EQ_OQ))) |
+                                 static_cast<uint32_t>(_mm256_movemask_ps(_mm256_cmp_ps(hi, mn, _CMP_EQ_OQ))) << 8;
+            out[i] = static_cast<uint8_t>(std::countr_zero(hit));
+        }
+        return;
+    }
+#endif
     float dist[256];
     int32_t bits[256];
     for (size_t i = 0; i < m; ++i) {
@@ -104,8 +136,7 @@ void encode_subspaces(const float* centroids_t, const float* vec, size_t m, size
 
         // First index of the minimum. Distances are sums of squares (>= +0), whose
         // bit patterns order like the floats as int32, and an integer min vectorizes
-        // where a float min can't (NaN rules); signed, because baseline x86-64 (SSE2)
-        // has no unsigned 32-bit min.
+        // where a float min can't (NaN rules).
         std::memcpy(bits, dist, kk * sizeof(float));
         int32_t min_bits = bits[0];
         for (size_t c = 1; c < kk; ++c) min_bits = std::min(min_bits, bits[c]);
