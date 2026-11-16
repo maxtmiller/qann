@@ -140,31 +140,50 @@ void IVFIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* i
         });
     }
 
-    for (size_t i = 0; i < n; ++i) {
-        InvertedList& list = data_[static_cast<uint16_t>(assign[i])];
-        list.ids.push_back(first_slot + static_cast<uint32_t>(i));
-        if (lookup) {
-            slot_list_[first_slot + i] = static_cast<uint16_t>(assign[i]);
-            slot_pos_[first_slot + i] = static_cast<uint32_t>(list.ids.size() - 1);
-        }
-
-        if (sq_bits_) {
-            const size_t w = sq_code_bytes();
-            list.codes.insert(list.codes.end(), codes.begin() + i * w, codes.begin() + (i + 1) * w);
-        } else if (use_pq) {
-            if (fast_scan_) {
-            const size_t m = pq_->num_subspaces(), pos = list.ids.size() - 1;
-            if (pos % 32 == 0) list.codes.resize(list.codes.size() + m * 16, 0);
-            uint8_t* block = list.codes.data() + (pos / 32) * m * 16;
-            for (size_t s = 0; s < m; ++s) detail::fs_set(block, pos % 32, s, codes[i * code_bytes + s]);
-            } else {
-                list.codes.insert(list.codes.end(), codes.begin() + i * code_bytes, codes.begin() + (i + 1) * code_bytes);
-            }
-        } else {
-            const float* src = vecs.data() + i * dim_;
-            list.vecs.insert(list.vecs.end(), src, src + dim_);
-        }
+    // Fill each list from its own thread, in input order within the list: one
+    // thread copying every vector was ~1.7 s of a 760k x 768 add (#170). The
+    // lists are created first, as the map can't be modified concurrently.
+    vector<uint32_t> start(nlist_ + 1, 0);
+    for (size_t i = 0; i < n; ++i) ++start[assign[i] + 1];
+    for (size_t l = 0; l < nlist_; ++l) start[l + 1] += start[l];
+    vector<uint32_t> order(n);
+    {
+        vector<uint32_t> cursor(start.begin(), start.end() - 1);
+        for (size_t i = 0; i < n; ++i) order[cursor[assign[i]]++] = static_cast<uint32_t>(i);
     }
+    vector<std::pair<uint16_t, InvertedList*>> touched;
+    for (size_t l = 0; l < nlist_; ++l)
+        if (start[l + 1] > start[l]) touched.emplace_back(static_cast<uint16_t>(l), &data_[static_cast<uint16_t>(l)]);
+
+    detail::parallel_for(touched.size(), [&](size_t t) {
+        const uint16_t l = touched[t].first;
+        InvertedList& list = *touched[t].second;
+        for (uint32_t r = start[l]; r < start[l + 1]; ++r) {
+            const size_t i = order[r];
+            list.ids.push_back(first_slot + static_cast<uint32_t>(i));
+            if (lookup) {
+                slot_list_[first_slot + i] = l;
+                slot_pos_[first_slot + i] = static_cast<uint32_t>(list.ids.size() - 1);
+            }
+
+            if (sq_bits_) {
+                const size_t w = sq_code_bytes();
+                list.codes.insert(list.codes.end(), codes.begin() + i * w, codes.begin() + (i + 1) * w);
+            } else if (use_pq) {
+                if (fast_scan_) {
+                    const size_t m = pq_->num_subspaces(), pos = list.ids.size() - 1;
+                    if (pos % 32 == 0) list.codes.resize(list.codes.size() + m * 16, 0);
+                    uint8_t* block = list.codes.data() + (pos / 32) * m * 16;
+                    for (size_t s = 0; s < m; ++s) detail::fs_set(block, pos % 32, s, codes[i * code_bytes + s]);
+                } else {
+                    list.codes.insert(list.codes.end(), codes.begin() + i * code_bytes, codes.begin() + (i + 1) * code_bytes);
+                }
+            } else {
+                const float* src = vecs.data() + i * dim_;
+                list.vecs.insert(list.vecs.end(), src, src + dim_);
+            }
+        }
+    });
 }
 
 vector<Neighbor> IVFIndex::query_impl(span<const float> vec, size_t k, const detail::SlotFilter* filter) const {
