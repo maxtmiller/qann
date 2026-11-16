@@ -67,7 +67,7 @@ vector<int64_t> HybridIndex::add_batch(span<const float> dense_vecs, const Spars
                                     ") and sparse rows (" + std::to_string(n) + ") must be the same documents");
     id_map_.check(n, ids);
     metadata_.check(n, metadata);
-    vector<float> unit;
+    detail::FloatRows unit;
     if (dense_.metric() == Metric::Cosine) unit = dense_.normalize_rows(dense_vecs, n);
 
     // the dense add can still refuse (an untrained IVFIndex), but before it changes anything

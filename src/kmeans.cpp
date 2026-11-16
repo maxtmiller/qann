@@ -1,4 +1,5 @@
 #include "kmeans.hpp"
+#include "parallel.hpp"
 #include "vecengine/distance.hpp"
 
 #include <cmath>
@@ -61,9 +62,9 @@ void assign_nearest(const float* data, size_t n, size_t stride, const float* cen
             );
 
             // Find min (||c||^2 - 2 * dot) for each point in the block
-            for (size_t j = 0; j < b; ++j) {
+            auto nearest = [&](size_t j) {
                 const float* row_dots = dots.data() + j * k;
-                
+
                 uint32_t best_c = 0;
                 float best_score = cent_norms[0] - 2.0f * row_dots[0];
 
@@ -75,6 +76,18 @@ void assign_nearest(const float* data, size_t n, size_t stride, const float* cen
                 }
 
                 out[i + j] = best_c;
+            };
+            // Coarse assignment (IVF add, k-means over nlist) splits the scan
+            // across threads; OpenBLAS's idle threads spin while it runs (#170).
+            // Small ones stay serial: PQ training calls this per subspace from
+            // inside its own parallel_for.
+            constexpr size_t kRows = 128;
+            if (b * k >= (size_t{1} << 18)) {
+                detail::parallel_for((b + kRows - 1) / kRows, [&](size_t r) {
+                    for (size_t j = r * kRows; j < std::min(b, (r + 1) * kRows); ++j) nearest(j);
+                });
+            } else {
+                for (size_t j = 0; j < b; ++j) nearest(j);
             }
         }
     #else

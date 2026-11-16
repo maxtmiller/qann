@@ -78,7 +78,7 @@ void HNSWIndex::train(span<const float> vectors, size_t num_vectors) {
 
     // learn the ranges of the same unit vectors that adds and queries will use
     if (metric_ == Metric::Cosine) {
-        const vector<float> unit = normalize_rows(vectors, num_vectors);
+        const detail::FloatRows unit = normalize_rows(vectors, num_vectors);
         quant_.train(unit, num_vectors, dim_);
     } else {
         quant_.train(vectors, num_vectors, dim_);
