@@ -9,6 +9,11 @@
 #include <span>
 #include <stdexcept>
 #include <algorithm>
+#include <bit>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+#include <cstring>
 #include <numeric>
 #include <random>
 
@@ -68,25 +73,93 @@ void PQCodebook::train(span<const float> vectors, size_t num_vectors, size_t max
 }
 
 vector<uint8_t> PQCodebook::encode(span<const float> vec) const {
-    assert(vec.size() == dim_);
-
-    // converts a full dimensional vector into array of cluster IDs
-    vector<float> table(num_subspaces_ * centroids_per_subspace_);
-    compute_adc_table(vec, table);
-
-    // finds closest centroid to vec in each subspace using adc table
-    vector<uint8_t> res(num_subspaces_, 0);
-    for (size_t i = 0; i < num_subspaces_; ++i) {
-        const float* cur_dist = table.data() + (i * centroids_per_subspace_);
-        float min_dist = cur_dist[0];
-        for (size_t j = 0; j < centroids_per_subspace_; ++j) min_dist = std::min(min_dist, cur_dist[j]);
-
-        size_t closest_index = 0;
-        while (cur_dist[closest_index] != min_dist) ++closest_index;
-        res[i] = static_cast<uint8_t>(closest_index);
-    }
-
+    vector<uint8_t> res(num_subspaces_);
+    encode(vec, res.data());
     return res;
+}
+
+namespace {
+
+// PQCodebook::encode with the centroid count K fixed at compile time (0 = runtime k),
+// so the distance, min and position loops vectorize. With the branchless position
+// search for K <= 32, PQ384x4 encoding went from 10.0 to 2.4 us per vector on an M3
+// (#170).
+template <size_t K>
+void encode_subspaces(const float* centroids_t, const float* vec, size_t m, size_t sub_dim, size_t k, uint8_t* out) {
+    const size_t kk = K ? K : k;
+#if defined(__AVX2__) && defined(__FMA__)
+    // 16 distances fit two registers. GCC's code for the generic loops below kept
+    // x86 at ~10 us per PQ384x4 vector; this path writes the same codes (the FMA
+    // matches how the compiler contracts dist += diff * diff).
+    if constexpr (K == 16) {
+        for (size_t i = 0; i < m; ++i) {
+            const float* cent = centroids_t + i * sub_dim * 16;
+            __m256 q = _mm256_set1_ps(vec[i * sub_dim]);
+            __m256 dlo = _mm256_sub_ps(q, _mm256_loadu_ps(cent));
+            __m256 dhi = _mm256_sub_ps(q, _mm256_loadu_ps(cent + 8));
+            __m256 lo = _mm256_mul_ps(dlo, dlo), hi = _mm256_mul_ps(dhi, dhi);
+            for (size_t j = 1; j < sub_dim; ++j) {
+                q = _mm256_set1_ps(vec[i * sub_dim + j]);
+                dlo = _mm256_sub_ps(q, _mm256_loadu_ps(cent + j * 16));
+                dhi = _mm256_sub_ps(q, _mm256_loadu_ps(cent + j * 16 + 8));
+                lo = _mm256_fmadd_ps(dlo, dlo, lo);
+                hi = _mm256_fmadd_ps(dhi, dhi, hi);
+            }
+            __m256 mn = _mm256_min_ps(lo, hi);
+            mn = _mm256_min_ps(mn, _mm256_permute2f128_ps(mn, mn, 1));
+            mn = _mm256_min_ps(mn, _mm256_shuffle_ps(mn, mn, _MM_SHUFFLE(1, 0, 3, 2)));
+            mn = _mm256_min_ps(mn, _mm256_shuffle_ps(mn, mn, _MM_SHUFFLE(2, 3, 0, 1)));
+            const uint32_t hit = static_cast<uint32_t>(_mm256_movemask_ps(_mm256_cmp_ps(lo, mn, _CMP_EQ_OQ))) |
+                                 static_cast<uint32_t>(_mm256_movemask_ps(_mm256_cmp_ps(hi, mn, _CMP_EQ_OQ))) << 8;
+            out[i] = static_cast<uint8_t>(std::countr_zero(hit));
+        }
+        return;
+    }
+#endif
+    float dist[256];
+    int32_t bits[256];
+    for (size_t i = 0; i < m; ++i) {
+        const float* cent = centroids_t + i * sub_dim * kk;
+        const float q0 = vec[i * sub_dim];
+        for (size_t c = 0; c < kk; ++c) {
+            const float diff = q0 - cent[c];
+            dist[c] = diff * diff;
+        }
+        for (size_t j = 1; j < sub_dim; ++j) {
+            const float q = vec[i * sub_dim + j];
+            const float* cent_d = cent + j * kk;
+            for (size_t c = 0; c < kk; ++c) {
+                const float diff = q - cent_d[c];
+                dist[c] += diff * diff;
+            }
+        }
+
+        // First index of the minimum. Distances are sums of squares (>= +0), whose
+        // bit patterns order like the floats as int32, and an integer min vectorizes
+        // where a float min can't (NaN rules).
+        std::memcpy(bits, dist, kk * sizeof(float));
+        int32_t min_bits = bits[0];
+        for (size_t c = 1; c < kk; ++c) min_bits = std::min(min_bits, bits[c]);
+        size_t best = 0;
+        if constexpr (K > 0 && K <= 32) {
+            uint32_t hit = 0;
+            for (size_t c = 0; c < K; ++c) hit |= uint32_t(bits[c] == min_bits) << c;
+            best = static_cast<size_t>(std::countr_zero(hit));
+        } else {
+            while (bits[best] != min_bits) ++best;
+        }
+        out[i] = static_cast<uint8_t>(best);
+    }
+}
+
+} // namespace
+
+void PQCodebook::encode(span<const float> vec, uint8_t* out) const {
+    assert(vec.size() == dim_);
+    const float* c = centroids_t_.data();
+    if (centroids_per_subspace_ == 16) encode_subspaces<16>(c, vec.data(), num_subspaces_, sub_dim_, 16, out);
+    else if (centroids_per_subspace_ == 256) encode_subspaces<256>(c, vec.data(), num_subspaces_, sub_dim_, 256, out);
+    else encode_subspaces<0>(c, vec.data(), num_subspaces_, sub_dim_, centroids_per_subspace_, out);
 }
 
 void PQCodebook::compute_adc_table(span<const float> query, span<float> out) const {

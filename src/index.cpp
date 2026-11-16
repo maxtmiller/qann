@@ -189,20 +189,25 @@ vector<float> DenseIndex::normalize_rows(span<const float> vecs, size_t n) const
     vector<float> res;
     res.resize(n * d);
 
-    for (size_t i = 0; i < n; ++i) {
-        double sqr_sum = 0;
-        for (size_t j = 0; j < d; ++j) {
-            float curr = vecs[i * d + j];
-            sqr_sum += double(curr) * curr;
+    // The double sum is a serial chain per row, so rows go in parallel blocks:
+    // single-threaded it was the largest cost of a cosine IVF add (#170).
+    constexpr size_t kBlock = 256;
+    detail::parallel_for((n + kBlock - 1) / kBlock, [&](size_t b) {
+        for (size_t i = b * kBlock; i < std::min(n, (b + 1) * kBlock); ++i) {
+            double sqr_sum = 0;
+            for (size_t j = 0; j < d; ++j) {
+                float curr = vecs[i * d + j];
+                sqr_sum += double(curr) * curr;
+            }
+            double length = std::sqrt(sqr_sum);
+            if (length == 0) throw std::invalid_argument("cosine metric needs non-zero vectors");
+            float scale = static_cast<float>(1.0 / length);
+            for (size_t j = 0; j < d; ++j) {
+                res[i * d + j] = vecs[i * d + j] * scale;
+            }
         }
-        double length = std::sqrt(sqr_sum);
-        if (length == 0) throw std::invalid_argument("cosine metric needs non-zero vectors");
-        float scale = static_cast<float>(1.0 / length);
-        for (size_t j = 0; j < d; ++j) {
-            res[i * d + j] = vecs[i * d + j] * scale;
-        }
-    }
-    
+    });
+
     return res;
 }
 

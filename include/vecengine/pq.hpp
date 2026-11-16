@@ -37,6 +37,9 @@ public:
     // Encodes one full vector into num_subspaces_ codes (one byte each).
     vector<uint8_t> encode(span<const float> vec) const;
 
+    // Same codes, written to out (num_subspaces_ bytes) without allocating.
+    void encode(span<const float> vec, uint8_t* out) const;
+
     // ADC step 1: distances from each query slice to every centroid in its
     // subspace. Returns num_subspaces_ * centroids_per_subspace_ floats,
     // table[s * K + c]. Build once per query (per probed list in IVF) and

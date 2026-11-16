@@ -136,8 +136,7 @@ void IVFIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* i
             vector<float> residual(dim_);
             for (size_t d = 0; d < dim_; ++d) residual[d] = src_vec[d] - centroid[d];
 
-            auto code = pq_->encode(residual);
-            std::copy_n(code.data(), code_bytes, codes.data() + i * code_bytes);
+            pq_->encode(residual, codes.data() + i * code_bytes);
         });
     }
 
