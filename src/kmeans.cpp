@@ -10,6 +10,8 @@
 #include <limits>
 #include <random>
 #include <algorithm>
+#include <numbers>
+#include <functional>
 #include <numeric>
 #include <utility>
 #include <queue>
@@ -247,6 +249,168 @@ KMeansResult kmeans(const float* data, size_t n, size_t stride, size_t d, size_t
     assign_nearest(data, n, stride, test_centroids.data(), k, d, assignments.data());
 
     return { std::move(test_centroids), std::move(assignments) };
+}
+
+namespace {
+
+// Unit-length copy of each row of c (k x d); zero rows stay zero.
+void unit_rows(const float* c, size_t k, size_t d, float* out) {
+    for (size_t j = 0; j < k; ++j) {
+        double sq = 0;
+        for (size_t l = 0; l < d; ++l) sq += double(c[j * d + l]) * c[j * d + l];
+        const float scale = sq > 0 ? static_cast<float>(1.0 / std::sqrt(sq)) : 0.0f;
+        for (size_t l = 0; l < d; ++l) out[j * d + l] = c[j * d + l] * scale;
+    }
+}
+
+size_t round_power_of_two(double v) {
+    if (v <= 1) return 1;
+    const size_t low = size_t{1} << static_cast<int>(std::floor(std::log2(v)));
+    const size_t high = 2 * low;
+    return v / double(low) < double(high) / v ? low : high;
+}
+
+} // namespace
+
+// e-means (Bessa et al. 2026, arXiv 2611.09501; reference code in faiss/contrib/e_means):
+// mini-batch k-means with EMA centroids. Constants are those of faiss's NumpyEmeans:
+// the throughput (d > 16) or quality batch law, the step law, a cosine-annealed step
+// down to 0.1 alpha0, initial mass 2^-16, and every 5 updates clusters under 0.1x the
+// mean mass are refilled by splitting donors drawn in proportion to their mass.
+KMeansResult emeans(const float* data, size_t n, size_t stride, size_t d, size_t k, size_t passes,
+                    std::optional<uint32_t> seed, bool spherical) {
+    if (n < k) throw std::invalid_argument("emeans: need at least k points");
+    if (passes == 0) throw std::invalid_argument("emeans: need at least one pass");
+    std::mt19937 rng(seed ? *seed : std::random_device{}());
+
+    const double T = double(passes), nd = double(n), kd = double(k);
+    const bool quality = d <= 16;
+    size_t batch = round_power_of_two((quality ? 0.00439175 : 0.035134) * std::pow(kd, 0.134749) *
+                                      std::pow(nd, 0.876473) * std::pow(T, 0.813344));
+    batch = quality ? std::min(batch, n / 2) : std::min(batch, round_power_of_two(nd / 2));
+    batch = std::max<size_t>(1, std::min(batch, n));
+    const double alpha0 = std::clamp(0.8244 * std::pow(kd, -0.4617) * std::pow(double(batch), 0.9003) *
+                                         std::pow(nd, -0.4498) * std::pow(T, -0.1057),
+                                     1e-4, 1.0);
+    const size_t steps_per_pass = (n + batch - 1) / batch, total_steps = passes * steps_per_pass;
+    const float tau = d <= 2 ? 0.0f : 0.1f;
+
+    // initial centroids: k distinct random rows
+    vector<size_t> order(n);
+    std::iota(order.begin(), order.end(), 0);
+    for (size_t i = 0; i < k; ++i) {
+        std::uniform_int_distribution<size_t> pick(i, n - 1);
+        std::swap(order[i], order[pick(rng)]);
+    }
+    vector<float> pos(k * d);
+    for (size_t j = 0; j < k; ++j) std::copy_n(data + order[j] * stride, d, pos.data() + j * d);
+    if (spherical) unit_rows(pos.data(), k, d, pos.data());
+    vector<float> mass(k, 1.0f / 65536.0f);
+
+    vector<float> readout(spherical ? k * d : 0), rows(batch * d), sums(k * d), pass_sums(k * d, 0.0f);
+    vector<double> pass_counts(k, 0.0);
+    vector<uint32_t> counts(k), labels(batch);
+    std::uniform_real_distribution<double> unif(0.0, 1.0);
+
+    size_t step = 0;
+    for (size_t pass = 0; pass < passes; ++pass) {
+        std::shuffle(order.begin(), order.end(), rng);
+        const bool last = pass + 1 == passes;
+        for (size_t start = 0; start < n; start += batch, ++step) {
+            const size_t b = std::min(batch, n - start);
+            for (size_t r = 0; r < b; ++r) std::copy_n(data + order[start + r] * stride, d, rows.data() + r * d);
+            const float* cent = pos.data();
+            if (spherical) {
+                unit_rows(pos.data(), k, d, readout.data());
+                cent = readout.data();
+            }
+            assign_nearest(rows.data(), b, d, cent, k, d, labels.data());
+
+            std::fill(counts.begin(), counts.end(), 0u);
+            for (size_t r = 0; r < b; ++r) ++counts[labels[r]];
+            std::fill(sums.begin(), sums.end(), 0.0f);
+            // each thread sums a slice of the dimensions over every row
+            constexpr size_t kDims = 64;
+            parallel_for((d + kDims - 1) / kDims, [&](size_t c) {
+                const size_t lo = c * kDims, hi = std::min(d, lo + kDims);
+                for (size_t r = 0; r < b; ++r) {
+                    float* dst = sums.data() + labels[r] * d;
+                    const float* src = rows.data() + r * d;
+                    for (size_t l = lo; l < hi; ++l) dst[l] += src[l];
+                }
+            });
+            if (last) {
+                for (size_t j = 0; j < k; ++j) pass_counts[j] += counts[j];
+                for (size_t i = 0; i < k * d; ++i) pass_sums[i] += sums[i];
+            }
+
+            const double frac = double(std::min(step, total_steps)) / double(std::max<size_t>(1, total_steps));
+            const double alpha = alpha0 * (0.1 + 0.9 * 0.5 * (1.0 + std::cos(std::numbers::pi * frac)));
+            const bool replace = alpha == 1.0;
+            if (!replace)
+                for (float& m : mass) m = static_cast<float>(m * (1.0 - alpha));
+            for (size_t j = 0; j < k; ++j) {
+                if (counts[j] == 0) continue;
+                const float nj = static_cast<float>(counts[j]);
+                const float new_mass = (replace ? 0.0f : mass[j]) + static_cast<float>(alpha) * nj;
+                const float w = static_cast<float>(alpha) * nj / new_mass;
+                float* c = pos.data() + j * d;
+                const float* s = sums.data() + j * d;
+                for (size_t l = 0; l < d; ++l) {
+                    const float mean = s[l] / nj;
+                    c[l] = w == 1.0f ? mean : c[l] + w * (mean - c[l]);
+                }
+                mass[j] = new_mass;
+            }
+
+            // revival: split heavy donors into clusters that lost their mass
+            if (tau > 0 && (step + 1) % 5 == 0) {
+                float total = 0;
+                for (float m : mass) total += m;
+                const float threshold = total * tau / static_cast<float>(k);
+                vector<size_t> unused;
+                vector<std::pair<double, size_t>> donors;
+                for (size_t j = 0; j < k; ++j) {
+                    if (mass[j] < threshold) unused.push_back(j);
+                    else if (mass[j] > 0) donors.emplace_back(0.0, j);
+                }
+                const size_t nsplit = std::min(unused.size(), donors.size());
+                if (nsplit > 0) {
+                    // Gumbel top-k: sampling without replacement, proportional to mass
+                    for (auto& [key, j] : donors)
+                        key = std::log(double(mass[j])) - std::log(-std::log(std::max(unif(rng), 1e-300)));
+                    std::partial_sort(donors.begin(), donors.begin() + nsplit, donors.end(), std::greater<>());
+                    for (size_t t = 0; t < nsplit; ++t) {
+                        const size_t src = donors[t].second, dst = unused[t];
+                        float* a = pos.data() + src * d;
+                        float* c = pos.data() + dst * d;
+                        bool same = true;
+                        for (size_t l = 0; l < d; ++l) {
+                            const float off = (l % 2 == 0 ? 1e-4f : -1e-4f);
+                            const float v = a[l];
+                            a[l] = v * (1.0f - off);
+                            c[l] = v * (1.0f + off);
+                            same = same && a[l] == c[l];
+                        }
+                        if (same) c[0] = std::nextafter(c[0], std::numeric_limits<float>::infinity());
+                        mass[src] = mass[dst] = mass[src] / 2.0f;
+                    }
+                }
+            }
+        }
+    }
+
+    // closing: means of the last pass's assignments; unassigned clusters keep their position
+    for (size_t j = 0; j < k; ++j) {
+        if (pass_counts[j] <= 0) continue;
+        const float cnt = static_cast<float>(pass_counts[j]);
+        for (size_t l = 0; l < d; ++l) pos[j * d + l] = pass_sums[j * d + l] / cnt;
+    }
+    if (spherical) unit_rows(pos.data(), k, d, pos.data());
+
+    vector<uint32_t> assignments(n);
+    assign_nearest(data, n, stride, pos.data(), k, d, assignments.data());
+    return { std::move(pos), std::move(assignments) };
 }
 
 } // namespace vecengine::detail

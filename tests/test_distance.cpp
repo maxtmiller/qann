@@ -1073,3 +1073,57 @@ TEST_CASE("kmeans: spherical keeps centroids unit length", "[kmeans]") {
     }
     REQUIRE(plain_min < 0.9);   // plain means of spread-out unit vectors are shorter
 }
+
+TEST_CASE("emeans: same seed gives identical results", "[kmeans][emeans]") {
+    const size_t n = 4000, dim = 32, k = 40;
+    auto data = random_vectors(n, dim, /*seed=*/11);
+    auto a = vecengine::detail::emeans(data.data(), n, dim, dim, k, 2, 1234u);
+    auto b = vecengine::detail::emeans(data.data(), n, dim, dim, k, 2, 1234u);
+    REQUIRE(a.centroids == b.centroids);
+    REQUIRE(a.assignments == b.assignments);
+}
+
+// 20k points around 300 centers, k = 100: two e-means passes reached 0.95-0.99x
+// the loss of 10 Lloyd iterations over five seeds. (On tiny, perfectly separated
+// blobs e-means merges blobs more often than Lloyd, as faiss's reference does.)
+TEST_CASE("emeans: two passes reach Lloyd's loss on clustered data", "[kmeans][emeans]") {
+    const size_t n = 20000, d = 32, k = 100;
+    std::mt19937 rng(1);
+    std::normal_distribution<float> g;
+    std::vector<float> centers(300 * d);
+    for (auto& v : centers) v = 4 * g(rng);
+    std::vector<float> x(n * d);
+    std::uniform_int_distribution<size_t> pick(0, 299);
+    for (size_t i = 0; i < n; ++i) {
+        const size_t c = pick(rng);
+        for (size_t j = 0; j < d; ++j) x[i * d + j] = centers[c * d + j] + g(rng);
+    }
+    auto mse = [&](const vecengine::detail::KMeansResult& r) {
+        double s = 0;
+        for (size_t i = 0; i < n; ++i)
+            for (size_t j = 0; j < d; ++j) {
+                const double t = x[i * d + j] - r.centroids[r.assignments[i] * d + j];
+                s += t * t;
+            }
+        return s / n;
+    };
+    const double lloyd = mse(vecengine::detail::kmeans(x.data(), n, d, d, k, 10, 1u));
+    const double em = mse(vecengine::detail::emeans(x.data(), n, d, d, k, 2, 1u));
+    REQUIRE(em < 1.02 * lloyd);
+}
+
+TEST_CASE("emeans: spherical keeps centroids unit length", "[kmeans][emeans]") {
+    const size_t n = 4000, dim = 32, k = 30;
+    auto data = random_vectors(n, dim, /*seed=*/9);
+    for (size_t i = 0; i < n; ++i) {
+        float sq = 0;
+        for (size_t j = 0; j < dim; ++j) sq += data[i * dim + j] * data[i * dim + j];
+        for (size_t j = 0; j < dim; ++j) data[i * dim + j] /= std::sqrt(sq);
+    }
+    auto res = vecengine::detail::emeans(data.data(), n, dim, dim, k, 2, 7u, true);
+    for (size_t c = 0; c < k; ++c) {
+        double sq = 0;
+        for (size_t j = 0; j < dim; ++j) sq += double(res.centroids[c * dim + j]) * res.centroids[c * dim + j];
+        REQUIRE(std::abs(sq - 1.0) < 1e-4);
+    }
+}

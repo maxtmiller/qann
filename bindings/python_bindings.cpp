@@ -673,10 +673,11 @@ static void hnsw_train(vecengine::HNSWIndex &self, FloatMatrix data) {
     write_locked(self, [&] { self.train(std::span<const float>(data.data(), data.size()), data.shape(0)); });
 }
 
-static void ivf_train(vecengine::IVFIndex &self, FloatMatrix data, std::size_t max_iters, std::optional<uint32_t> seed) {
+static void ivf_train(vecengine::IVFIndex &self, FloatMatrix data, std::size_t max_iters, std::optional<uint32_t> seed,
+                      vecengine::Clustering clustering, std::size_t passes) {
     if (data.shape(1) != self.dim())
         throw std::invalid_argument("training vector dimension does not match index dimension");
-    write_locked(self, [&] { self.train(std::span<const float>(data.data(), data.size()), data.shape(0), max_iters, seed); });
+    write_locked(self, [&] { self.train(std::span<const float>(data.data(), data.size()), data.shape(0), max_iters, seed, clustering, passes); });
 }
 
 static void pq_train(vecengine::PQCodebook &self, FloatMatrix data, std::size_t max_iters, std::optional<uint32_t> seed) {
@@ -952,6 +953,10 @@ NB_MODULE(qann, m) {
              nb::arg("dim"), nb::kw_only(), nb::arg("custom_ids") = false, nb::arg("metric") = vecengine::Metric::L2,
              "Construct FlatIndex with vector dimension; custom_ids=True makes add() take your own ids");
 
+    nb::enum_<vecengine::Clustering>(m, "Clustering", "How IVFIndex.train learns the coarse centroids")
+        .value("EMeans", vecengine::Clustering::EMeans, "e-means: mini-batch k-means with EMA centroids (default)")
+        .value("Lloyd", vecengine::Clustering::Lloyd, "Lloyd's k-means");
+
     nb::enum_<vecengine::PQDistance>(m, "PQDistance")
         .value("ADC", vecengine::PQDistance::ADC)
         .value("SDC", vecengine::PQDistance::SDC);
@@ -961,8 +966,10 @@ NB_MODULE(qann, m) {
              nb::arg("nprobe") = 10, nb::kw_only(), nb::arg("custom_ids") = false, nb::arg("metric") = vecengine::Metric::L2,
              "Construct IVFIndex with vector dimension, number of coarse clusters, and search breadth")
         .def("train", &ivf_train, nb::arg("data"), nb::arg("max_iters") = 10, nb::arg("seed") = nb::none(),
-             "Run k-means over sample vectors to compute coarse centroids (max_iters iterations; the PQ codebook, "
-             "if enabled, always runs 25)")
+             nb::kw_only(), nb::arg("clustering") = vecengine::Clustering::EMeans, nb::arg("passes") = 2,
+             "Learn the coarse centroids from sample vectors. clustering=Clustering.EMeans (default) runs "
+             "e-means for `passes` passes over the sample; Clustering.Lloyd runs Lloyd's k-means for max_iters "
+             "iterations. The PQ codebook, if enabled, always runs 25 Lloyd iterations per subspace")
         .def("enable_pq",
              [](vecengine::IVFIndex& self, std::size_t num_subspaces, std::optional<std::size_t> centroids_per_subspace,
                 bool fast_scan, bool rotate) {
