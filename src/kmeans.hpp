@@ -26,6 +26,13 @@ struct KMeansResult {
 KMeansResult kmeans(const float* data, size_t n, size_t stride, size_t d, size_t k, size_t max_iters,
                     std::optional<uint32_t> seed = std::nullopt, bool spherical = false);
 
+// e-means (arXiv 2611.09501): mini-batch k-means with EMA centroids, batch size
+// and step set from n, k and passes by the paper's fitted laws. Same inputs and
+// result as kmeans(); passes over the data instead of iterations (2 matched 25
+// Lloyd iterations on landmark-dino-768, #174). spherical keeps unit centroids.
+KMeansResult emeans(const float* data, size_t n, size_t stride, size_t d, size_t k, size_t passes,
+                    std::optional<uint32_t> seed = std::nullopt, bool spherical = false);
+
 // Index in [0, k) of the centroid closest (squared L2) to the d-float point.
 // centroids is k * d, row-major.
 size_t nearest_centroid(const float* point, const float* centroids, size_t k, size_t d);

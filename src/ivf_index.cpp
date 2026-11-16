@@ -710,7 +710,8 @@ void IVFIndex::compact_storage(const vector<uint32_t>& remap) {
         file_.reset();
 }
 
-void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_iters, std::optional<uint32_t> seed) {
+void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_iters, std::optional<uint32_t> seed,
+                     size_t emeans_passes) {
     if (id_map_.slots() > 0) throw std::logic_error("train() cannot be called after add()");
     if (trained_) throw std::logic_error("train() has already been called");
     if (num_vectors < nlist_) throw std::invalid_argument("training set must have at least nlist vectors");
@@ -736,8 +737,11 @@ void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_i
     // and L2 probing then passes over them. On landmark-dino-768 (VIBE, nlist
     // 512, no PQ) it raised recall@100 at nprobe 16 from 0.951 to 0.966. The
     // rotation is orthonormal, so rotated unit vectors stay unit.
-    auto res = vecengine::detail::kmeans(vectors.data(), num_vectors, dim_, dim_, nlist_, max_iters, seed,
-                                         metric_ == Metric::Cosine);
+    auto res = emeans_passes > 0
+                   ? detail::emeans(vectors.data(), num_vectors, dim_, dim_, nlist_, emeans_passes, seed,
+                                    metric_ == Metric::Cosine)
+                   : detail::kmeans(vectors.data(), num_vectors, dim_, dim_, nlist_, max_iters, seed,
+                                    metric_ == Metric::Cosine);
     coarse_centroids_ = std::move(res.centroids);
     update_centroid_sqnorms();
 

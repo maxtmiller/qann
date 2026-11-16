@@ -673,10 +673,11 @@ static void hnsw_train(vecengine::HNSWIndex &self, FloatMatrix data) {
     write_locked(self, [&] { self.train(std::span<const float>(data.data(), data.size()), data.shape(0)); });
 }
 
-static void ivf_train(vecengine::IVFIndex &self, FloatMatrix data, std::size_t max_iters, std::optional<uint32_t> seed) {
+static void ivf_train(vecengine::IVFIndex &self, FloatMatrix data, std::size_t max_iters, std::optional<uint32_t> seed,
+                      std::size_t emeans_passes) {
     if (data.shape(1) != self.dim())
         throw std::invalid_argument("training vector dimension does not match index dimension");
-    write_locked(self, [&] { self.train(std::span<const float>(data.data(), data.size()), data.shape(0), max_iters, seed); });
+    write_locked(self, [&] { self.train(std::span<const float>(data.data(), data.size()), data.shape(0), max_iters, seed, emeans_passes); });
 }
 
 static void pq_train(vecengine::PQCodebook &self, FloatMatrix data, std::size_t max_iters, std::optional<uint32_t> seed) {
@@ -961,6 +962,7 @@ NB_MODULE(qann, m) {
              nb::arg("nprobe") = 10, nb::kw_only(), nb::arg("custom_ids") = false, nb::arg("metric") = vecengine::Metric::L2,
              "Construct IVFIndex with vector dimension, number of coarse clusters, and search breadth")
         .def("train", &ivf_train, nb::arg("data"), nb::arg("max_iters") = 10, nb::arg("seed") = nb::none(),
+             nb::kw_only(), nb::arg("emeans_passes") = 0,
              "Run k-means over sample vectors to compute coarse centroids (max_iters iterations; the PQ codebook, "
              "if enabled, always runs 25)")
         .def("enable_pq",

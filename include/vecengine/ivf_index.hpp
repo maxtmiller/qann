@@ -122,10 +122,12 @@ public:
     // Learns the nlist coarse centroids (and the PQ codebook or SQ ranges, if enabled) from
     // num_vectors sample vectors (at least nlist). Call once, before any add.
     // max_iters bounds the coarse k-means; the PQ codebook always runs 25.
+    // emeans_passes > 0 trains the coarse centroids with e-means instead, in
+    // that many passes over the sample (max_iters then unused).
     // A seed makes training reproducible: coarse k-means uses seed, the PQ
     // codebook (if enabled) uses seed + 1 onward.
     void train(span<const float> vectors, size_t num_vectors, size_t max_iters = 10,
-               std::optional<uint32_t> seed = std::nullopt);
+               std::optional<uint32_t> seed = std::nullopt, size_t emeans_passes = 0);
 
     void save(std::ostream& out) const override;
 
