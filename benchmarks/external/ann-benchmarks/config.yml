@@ -8,8 +8,9 @@ float:
     name: qann-hnsw
     run_groups:
       base:
-        # up to 96 like hnswlib's sweep, so both reach the same top recall (issue #129)
-        args: [[8, 16, 24, 32, 48, 64, 96], [500]]
+        # the same M values as hnswlib's sweep: with M=36 missing, hnswlib's M=36 ef 40
+        # point decided the 0.9-recall comparison on nytimes (issue #128)
+        args: [[4, 8, 12, 16, 24, 36, 48, 64, 96], [500]]
         query_args: [[10, 20, 40, 80, 120, 200, 400, 600, 800]]
   - base_args: ['@metric']
     constructor: QannHNSW
