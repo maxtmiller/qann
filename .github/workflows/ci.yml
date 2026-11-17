@@ -90,8 +90,11 @@ jobs:
       - name: Install OpenBLAS
         run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
 
+      # ctest runs every test case as its own process under SDE: one process
+      # for the whole suite hit SDE's limit on threads created (parallel_for
+      # starts new ones on each call) and hung.
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE="$(which python)"
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE="$(which python)" "-DCMAKE_CROSSCOMPILING_EMULATOR=$SDE_PATH/sde64;-spr;--"
 
       - name: Build
         run: cmake --build build -j 4 --target test_vecengine
@@ -99,10 +102,12 @@ jobs:
       - name: C++ tests on the AVX-512 kernels
         env:
           QANN_EXPECT_AVX512: "1"
-        run: $SDE_PATH/sde64 -spr -- ./build/test_vecengine
+          OPENBLAS_NUM_THREADS: "1"
+        run: ctest --test-dir build -j 4 --output-on-failure
 
       - name: QANN_DISABLE_AVX512 keeps the AVX2 kernels
         env:
           QANN_DISABLE_AVX512: "1"
           QANN_EXPECT_AVX512: "0"
+          OPENBLAS_NUM_THREADS: "1"
         run: $SDE_PATH/sde64 -spr -- ./build/test_vecengine "[simd],[sq]"
