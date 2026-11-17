@@ -1011,7 +1011,7 @@ NB_MODULE(qann, m) {
                      [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.precomputed_tables(); }); },
                      [](vecengine::IVFIndex& self, bool v) { write_locked(self, [&] { self.set_precomputed_tables(v); }); },
                      "Whether ADC queries use per-list tables precomputed at train time (on by default). "
-                     "True only once they exist: PQ enabled, trained, Metric.L2, and within the 256 MB cap")
+                     "True only once they exist: PQ enabled, trained, Metric.L2 (or Cosine scored with L2 tables), and within the 256 MB cap")
         .def_prop_rw("cosine_inner_product",
                      [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.cosine_inner_product(); }); },
                      [](vecengine::IVFIndex& self, bool v) { write_locked(self, [&] { self.set_cosine_inner_product(v); }); },

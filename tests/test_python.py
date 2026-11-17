@@ -969,6 +969,44 @@ def test_inner_product_flat_ranks_by_dot_product(data):
 
 
 @pytest.mark.parametrize("fast_scan", [False, True])
+def test_cosine_ivf_pq_scoring_choice(tmp_path, fast_scan):
+    rng = np.random.default_rng(5)
+    x = rng.standard_normal((6000, 32)).astype(np.float32)
+    ivf = qann.IVFIndex(32, nlist=100, nprobe=100, metric=qann.Metric.Cosine)
+    ivf.enable_pq(16, fast_scan=fast_scan)
+    ivf.train(x, seed=1)
+    picked = ivf.cosine_inner_product
+    again = qann.IVFIndex(32, nlist=100, nprobe=100, metric=qann.Metric.Cosine)
+    again.enable_pq(16, fast_scan=fast_scan)
+    again.train(x, seed=1)
+    assert again.cosine_inner_product == picked   # the choice is reproducible with a seed
+    refined = qann.RefineIndex(again, k_factor=10)
+    refined.add(x)
+    ivf.add(x)
+    for forced in (True, False):
+        ivf.cosine_inner_product = forced
+        assert ivf.cosine_inner_product == forced
+        assert ivf.precomputed_tables == (not forced)   # L2 tables use the precomputed terms
+        again.cosine_inner_product = forced
+        ids, _ = refined.batch_query(x[:50], 1)
+        assert np.mean(ids[:, 0] == np.arange(50)) >= 0.9
+        path = tmp_path / f"cos-{forced}.qann"
+        ivf.save(path)
+        loaded = qann.load(path)
+        assert loaded.cosine_inner_product == forced
+        np.testing.assert_array_equal(loaded.batch_query(x[:20], 5)[0], ivf.batch_query(x[:20], 5)[0])
+
+
+def test_cosine_inner_product_ignored_for_l2(data):
+    ivf = qann.IVFIndex(32, nlist=100)
+    ivf.enable_pq(8)
+    ivf.train(data, seed=1)
+    assert ivf.precomputed_tables
+    ivf.cosine_inner_product = True   # only Cosine uses it: L2 keeps its tables
+    assert ivf.precomputed_tables
+
+
+@pytest.mark.parametrize("fast_scan", [False, True])
 def test_inner_product_ivf_pq_with_refine(fast_scan):
     scaled, queries, truth = _ip_clustered()
     ivf = qann.IVFIndex(32, nlist=100, nprobe=20, metric=qann.Metric.InnerProduct)
@@ -1733,6 +1771,18 @@ def test_loads_v11_ivf_saved_on_macos(name, mmap):
     ids, dists = index.batch_query(np.load(DATA / "v11_queries.npy"), 10)
     np.testing.assert_array_equal(ids, np.load(DATA / f"v11_{name}_ids.npy"))
     np.testing.assert_allclose(dists, np.load(DATA / f"v11_{name}_dists.npy"), rtol=1e-5, atol=1e-5)
+
+
+def test_loads_v11_cosine_ivf_pq_with_inner_product_scoring():
+    # Saved by 0.1.0a31 on macOS (format version 11): cosine fast-scan IVF-PQ, which
+    # scored codes by inner product; a file from before the per-index choice (#148)
+    # keeps that scoring and its results.
+    index = qann.load(DATA / "v11_ivf_cos_fs.qann")
+    assert index.metric == qann.Metric.Cosine and index.cosine_inner_product
+    assert not index.precomputed_tables
+    ids, dists = index.batch_query(np.load(DATA / "v11_cos_queries.npy"), 10)
+    np.testing.assert_array_equal(ids, np.load(DATA / "v11_ivf_cos_fs_ids.npy"))
+    np.testing.assert_allclose(dists, np.load(DATA / "v11_ivf_cos_fs_dists.npy"), rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("name", ["flat", "hnsw_sq8", "refine_ivf_fs"])
