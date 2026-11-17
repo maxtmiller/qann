@@ -1012,6 +1012,13 @@ NB_MODULE(qann, m) {
                      [](vecengine::IVFIndex& self, bool v) { write_locked(self, [&] { self.set_precomputed_tables(v); }); },
                      "Whether ADC queries use per-list tables precomputed at train time (on by default). "
                      "True only once they exist: PQ enabled, trained, Metric.L2, and within the 256 MB cap")
+        .def_prop_rw("cosine_inner_product",
+                     [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.cosine_inner_product(); }); },
+                     [](vecengine::IVFIndex& self, bool v) { write_locked(self, [&] { self.set_cosine_inner_product(v); }); },
+                     "How Metric.Cosine PQ queries score codes: by inner product with one table per query (True), "
+                     "or by L2 between unit vectors with each list's table (False). Neither ranks better on all "
+                     "data, so train() scores part of its sample both ways and keeps the better one; set it to "
+                     "override. Indexes saved before 0.1.0a32 load as True")
         .def_prop_rw("filter_probe_scaling",
                      [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.filter_probe_scaling(); }); },
                      [](vecengine::IVFIndex& self, bool v) { write_locked(self, [&] { self.set_filter_probe_scaling(v); }); },
