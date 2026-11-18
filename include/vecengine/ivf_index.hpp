@@ -104,10 +104,18 @@ public:
     // is true only once the tables exist (PQ on, trained, and nlist * m * K
     // floats within kPrecomputedMaxBytes). Disabling frees them. Results
     // match the per-list path up to float rounding. Never built for
-    // Metric::InnerProduct or Metric::Cosine, whose one table per query
-    // serves every list.
+    // Metric::InnerProduct, or for Metric::Cosine scored by inner product
+    // (cosine_inner_product()), whose one table per query serves every list.
     bool precomputed_tables() const noexcept { return !precomputed_.empty(); }
     void set_precomputed_tables(bool enabled);
+
+    // How Metric::Cosine PQ queries (ADC) score codes: by inner product with
+    // one table per query (true), or by L2 between unit vectors with each
+    // list's table (false). Neither ranks better on all data (#148), so
+    // train() scores part of its sample both ways and keeps the better one;
+    // set it to override. Files from before format 12 load as true.
+    bool cosine_inner_product() const noexcept { return cosine_ip_; }
+    void set_cosine_inner_product(bool enabled);
 
     // Whether a filtered query probes more lists as its filter narrows, about
     // 0.75 * nprobe * s^(-1/3) for a fraction s allowed, so its recall stays
@@ -196,6 +204,13 @@ private:
     // Fills centroid_sqnorms_ from coarse_centroids_. Called by train() and load_body().
     void update_centroid_sqnorms();
 
+    // Whether Cosine PQ ranks the training sample better by inner product than
+    // by L2 tables: up to 200 sample rows query up to 10,000 others, scored as
+    // queries score them (fast-scan's rounded tables included), and each way's
+    // share of the exact top 10 in its own top 20 is compared. assign holds
+    // each sample row's coarse list. Called by train().
+    bool pick_cosine_inner_product(span<const float> vectors, size_t n, const vector<uint32_t>& assign) const;
+
     // One probed list: its exact coarse distance ||q - c||^2 (term A of the
     // precomputed tables), or -(q . c) for InnerProduct, and its cluster id.
     // InnerProduct still clusters and assigns vectors by L2 k-means and only
@@ -261,6 +276,7 @@ private:
     detail::SQ sq_; // SQ ranges, learned by train() when SQ is enabled
     PQDistance pq_distance_ = PQDistance::ADC; // type of quantization used
     bool use_precomputed_ = true; // set_precomputed_tables() setting
+    bool cosine_ip_ = true; // cosine_inner_product(): Cosine PQ scored by inner product
     bool filter_probe_scaling_ = true; // set_filter_probe_scaling() setting
     vector<float> precomputed_; // term B: nlist * m * K floats, list-major; empty when not in use
     detail::IdMap id_map_;

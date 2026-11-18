@@ -58,10 +58,18 @@ void IVFIndex::set_precomputed_tables(bool enabled) {
     else vector<float>().swap(precomputed_);
 }
 
+void IVFIndex::set_cosine_inner_product(bool enabled) {
+    cosine_ip_ = enabled;
+    build_precomputed();
+}
+
 void IVFIndex::build_precomputed() {
     precomputed_.clear();
-    // InnerProduct and Cosine need none: their table doesn't depend on the list (see scan)
-    if (!use_precomputed_ || !trained_ || !pq_enabled() || metric_ != Metric::L2) return;
+    // InnerProduct, and Cosine scored by inner product, need none: their table
+    // doesn't depend on the list (see scan)
+    if (!use_precomputed_ || !trained_ || !pq_enabled() || metric_ == Metric::InnerProduct ||
+        (metric_ == Metric::Cosine && cosine_ip_))
+        return;
 
     size_t list_size = pq_->num_subspaces() * pq_->centroids_per_subspace();
     if (nlist_ * list_size * sizeof(float) > kPrecomputedMaxBytes) return;
@@ -437,7 +445,7 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
     // data that term is about 1 and dropping it is what FAISS does for cosine.
     // On landmark-dino-768 (PQ384 fast-scan) building and rounding a table per
     // list was 16% of the query.
-    const bool cos_pq = pq_enabled() && metric_ == Metric::Cosine && pq_distance_ == PQDistance::ADC;
+    const bool cos_pq = pq_enabled() && metric_ == Metric::Cosine && pq_distance_ == PQDistance::ADC && cosine_ip_;
     const bool ip_pq = (pq_enabled() && metric_ == Metric::InnerProduct) || cos_pq;
     float ip_scale = 1.0f, ip_offset = 0.0f;
     if (ip_pq) {
@@ -763,10 +771,108 @@ void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_i
         // landmark-dino-768 for 2.3x faster training, #170); PQ keeps 25, which is cheap
         // on its capped sample.
         pq_->train(residuals, num_vectors, 25, seed ? std::optional<uint32_t>(*seed + 1) : std::nullopt);
+        if (metric_ == Metric::Cosine && pq_distance_ == PQDistance::ADC)
+            cosine_ip_ = pick_cosine_inner_product(vectors, num_vectors, assignments);
     }
     if (sq_bits_) sq_.train(vectors, num_vectors, dim_);
     trained_ = true;
     build_precomputed();
+}
+
+bool IVFIndex::pick_cosine_inner_product(span<const float> vectors, size_t n, const vector<uint32_t>& assign) const {
+    // Measured on VM2 (nlist 512, m = d/2 fast-scan, nprobe 8, k_factor 2), inner
+    // product against L2 tables: recall@100 0.842 vs 0.946 on imagenet-clip-512,
+    // 0.918 vs 0.944 on landmark-nomic-768, but 0.629 vs 0.592 on glove-200 and
+    // equal or better on yahoo-384, gooaq-768, landmark-dino-768, at 5-16% more
+    // QPS. So it is decided per index, on its own sample.
+    constexpr size_t kQueries = 200, kRows = 20000, kCandidates = 2000, kTop = 10, kKept = 20;
+    if (n < kQueries + kCandidates) return true;   // too small a sample to tell: keep inner product
+    const size_t nq = kQueries, nd = std::min(kRows, n - nq);
+    const size_t m = pq_->num_subspaces(), K = pq_->centroids_per_subspace(), T = m * K;
+
+    // rows [0, nd) are scored, rows [n - nq, n) query them
+    vector<uint8_t> codes(nd * m);
+    vector<vector<uint32_t>> by_list(nlist_);
+    for (size_t i = 0; i < nd; ++i) by_list[assign[i]].push_back(static_cast<uint32_t>(i));
+    detail::parallel_for(nd, [&](size_t i) {
+        vector<float> r(dim_);
+        const float* x = vectors.data() + i * dim_;
+        const float* c = coarse_centroids_.data() + size_t{assign[i]} * dim_;
+        for (size_t d = 0; d < dim_; ++d) r[d] = x[d] - c[d];
+        pq_->encode(r, codes.data() + i * m);
+    });
+
+    vector<size_t> hits_ip(nq, 0), hits_l2(nq, 0);
+    detail::parallel_for(nq, [&](size_t qi) {
+        const float* q = vectors.data() + (n - nq + qi) * dim_;
+        // probe lists nearest first until about kCandidates rows, as nprobe would
+        vector<std::pair<float, uint32_t>> lists(nlist_);
+        for (size_t l = 0; l < nlist_; ++l)
+            lists[l] = {-inner_product(q, coarse_centroids_.data() + l * dim_, dim_), static_cast<uint32_t>(l)};
+        std::sort(lists.begin(), lists.end());
+        vector<uint32_t> probed;
+        size_t rows = 0;
+        for (size_t p = 0; p < nlist_ && rows < kCandidates; ++p) {
+            if (by_list[lists[p].second].empty()) continue;
+            probed.push_back(lists[p].second);
+            rows += by_list[lists[p].second].size();
+        }
+
+        vector<std::pair<float, uint32_t>> exact, ip, l2;
+        vector<float> table(T), resid(dim_);
+        vector<uint8_t> lut(T);
+        // inner product: one table for every list, as queries build it
+        pq_->compute_inner_table({q, dim_}, table);
+        float ip_scale = 1.0f, ip_offset = 0.0f;
+        if (fast_scan_) detail::quantize_lut(table.data(), m, lut.data(), ip_scale, ip_offset);
+        const vector<float> ip_table = table;
+        for (uint32_t l : probed) {
+            const float* c = coarse_centroids_.data() + size_t{l} * dim_;
+            const float base = 2.0f - 2.0f * inner_product(q, c, dim_);
+            // L2 tables: this list's own table of (q - c), rounded on its own scale
+            for (size_t d = 0; d < dim_; ++d) resid[d] = q[d] - c[d];
+            vector<uint8_t> list_lut(fast_scan_ ? T : 0);
+            pq_->compute_adc_table(resid, table);
+            float l2_scale = 1.0f, l2_offset = 0.0f;
+            if (fast_scan_) detail::quantize_lut(table.data(), m, list_lut.data(), l2_scale, l2_offset);
+            for (uint32_t i : by_list[l]) {
+                const uint8_t* code = codes.data() + size_t{i} * m;
+                float s_ip = 0.0f, s_l2 = 0.0f;
+                if (fast_scan_) {
+                    uint32_t a = 0, b = 0;
+                    for (size_t s = 0; s < m; ++s) {
+                        a += lut[s * K + code[s]];
+                        b += list_lut[s * K + code[s]];
+                    }
+                    s_ip = static_cast<float>(a) / ip_scale + ip_offset;
+                    s_l2 = static_cast<float>(b) / l2_scale + l2_offset;
+                } else {
+                    for (size_t s = 0; s < m; ++s) {
+                        s_ip += ip_table[s * K + code[s]];
+                        s_l2 += table[s * K + code[s]];
+                    }
+                }
+                exact.emplace_back(-inner_product(q, vectors.data() + size_t{i} * dim_, dim_), i);
+                ip.emplace_back(base + s_ip, i);
+                l2.emplace_back(s_l2, i);
+            }
+        }
+        const size_t top = std::min(kTop, exact.size()), kept = std::min(kKept, exact.size());
+        std::partial_sort(exact.begin(), exact.begin() + top, exact.end());
+        std::partial_sort(ip.begin(), ip.begin() + kept, ip.end());
+        std::partial_sort(l2.begin(), l2.begin() + kept, l2.end());
+        for (size_t t = 0; t < top; ++t) {
+            const uint32_t want = exact[t].second;
+            for (size_t j = 0; j < kept; ++j) hits_ip[qi] += ip[j].second == want;
+            for (size_t j = 0; j < kept; ++j) hits_l2[qi] += l2[j].second == want;
+        }
+    });
+    size_t total_ip = 0, total_l2 = 0;
+    for (size_t qi = 0; qi < nq; ++qi) {
+        total_ip += hits_ip[qi];
+        total_l2 += hits_l2[qi];
+    }
+    return total_ip >= total_l2;   // L2 tables only when they rank strictly better
 }
 
 void IVFIndex::save(std::ostream& out) const {
@@ -835,6 +941,8 @@ void IVFIndex::save(std::ostream& out) const {
     write_pod(out, static_cast<uint8_t>(use_precomputed_));
     write_pod(out, static_cast<uint8_t>(metric_));
     metadata_.save(out);
+    // version 12: how Cosine PQ is scored
+    write_pod(out, static_cast<uint8_t>(cosine_ip_));
 }
 
 std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version, const detail::LoadContext* ctx) {
@@ -965,6 +1073,11 @@ std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version
     }
     if (version >= 5) index->metric_ = read_metric(in);
     if (version >= 9) index->metadata_ = MetadataStore::load(in, n_total);
+    if (version >= 12) {
+        const auto cosine_ip = read_pod<uint8_t>(in);
+        if (cosine_ip > 1) throw std::runtime_error("corrupt file: invalid IVFIndex shape");
+        index->cosine_ip_ = cosine_ip;
+    }
     index->build_precomputed();
     index->rebuild_slot_lookup();
 
