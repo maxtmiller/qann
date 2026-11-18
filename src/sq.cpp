@@ -1,10 +1,11 @@
 #include "vecengine/sq.hpp"
+#include "vecengine/distance.hpp"
 
 #include <algorithm>
 #include <cassert>
 #include <cmath>
 
-#if defined(__AVX2__) || defined(__AVX512F__)
+#if defined(__AVX2__) || defined(__AVX512F__) || VECENGINE_AVX512_DISPATCH
 #  include <immintrin.h>
 #elif defined(__ARM_NEON)
 #  include <arm_neon.h>
@@ -19,6 +20,75 @@ inline uint8_t code_at(const uint8_t* code, size_t d, int bits) noexcept {
     if (bits == 8) return code[d];
     return static_cast<uint8_t>((code[d / 2] >> ((d & 1) * 4)) & 0x0F);
 }
+
+// The rest of the dimensions from d on, one at a time.
+template <bool InnerProduct>
+float score_tail(const float* q, const uint8_t* code, const float* lo, const float* st, size_t d, size_t n, int bits,
+                 float sum) noexcept {
+    for (; d < n; ++d) {
+        const float x = lo[d] + static_cast<float>(code_at(code, d, bits)) * st[d];
+        if constexpr (InnerProduct) {
+            sum += q[d] * x;
+        } else {
+            const float diff = q[d] - x;
+            sum += diff * diff;
+        }
+    }
+    return sum;
+}
+
+#if defined(__AVX512F__) || VECENGINE_AVX512_DISPATCH
+// Built for AVX-512 (VECENGINE_NATIVE on such a CPU), or per function on other
+// x86 builds and picked at run time (detail::kAvx512), as distance.cpp's
+// kernels are. Plain functions, not lambdas: GCC doesn't apply a target
+// attribute to lambdas.
+#  if VECENGINE_AVX512_DISPATCH
+#    define VECENGINE_SQ_AVX512 __attribute__((target("avx512f")))
+#  else
+#    define VECENGINE_SQ_AVX512
+#  endif
+
+// Scores the 16 dimensions at `at` from one byte code each in c16 into acc.
+template <bool InnerProduct>
+VECENGINE_SQ_AVX512 inline __m512 sq_step16(__m512 acc, __m128i c16, const float* q, const float* lo, const float* st,
+                                            size_t at) noexcept {
+    const __m512 c = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(c16));
+    const __m512 x = _mm512_fmadd_ps(c, _mm512_loadu_ps(st + at), _mm512_loadu_ps(lo + at));
+    if constexpr (InnerProduct) return _mm512_fmadd_ps(_mm512_loadu_ps(q + at), x, acc);
+    const __m512 diff = _mm512_sub_ps(_mm512_loadu_ps(q + at), x);
+    return _mm512_fmadd_ps(diff, diff, acc);
+}
+
+// SQ::score with AVX-512: 4-bit codes are spread to one byte per dimension
+// first, then both widths are scored the same way.
+template <bool InnerProduct>
+VECENGINE_SQ_AVX512 float score_avx512(const float* q, const uint8_t* code, const float* lo, const float* st, size_t n,
+                                       int bits) noexcept {
+    size_t d = 0;
+    // two accumulators halve the FMA dependency chain
+    __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
+    if (bits == 8) {
+        for (; d + 32 <= n; d += 32) {
+            acc0 = sq_step16<InnerProduct>(acc0, _mm_loadu_si128(reinterpret_cast<const __m128i*>(code + d)), q, lo, st, d);
+            acc1 = sq_step16<InnerProduct>(acc1, _mm_loadu_si128(reinterpret_cast<const __m128i*>(code + d + 16)), q, lo, st,
+                                           d + 16);
+        }
+        for (; d + 16 <= n; d += 16)
+            acc0 = sq_step16<InnerProduct>(acc0, _mm_loadu_si128(reinterpret_cast<const __m128i*>(code + d)), q, lo, st, d);
+    } else {
+        const __m128i nibble = _mm_set1_epi8(0x0F);
+        for (; d + 32 <= n; d += 32) {
+            const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i*>(code + d / 2));
+            const __m128i low = _mm_and_si128(c, nibble);
+            const __m128i high = _mm_and_si128(_mm_srli_epi16(c, 4), nibble);
+            acc0 = sq_step16<InnerProduct>(acc0, _mm_unpacklo_epi8(low, high), q, lo, st, d);
+            acc1 = sq_step16<InnerProduct>(acc1, _mm_unpackhi_epi8(low, high), q, lo, st, d + 16);
+        }
+    }
+    const float sum = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+    return score_tail<InnerProduct>(q, code, lo, st, d, n, bits, sum);
+}
+#endif
 
 } // namespace
 
@@ -62,43 +132,18 @@ float SQ::score(const float* q, const uint8_t* code) const noexcept {
     const size_t n = dim();
     const float* lo = vmin.data();
     const float* st = step.data();
+
+#if defined(__AVX512F__)
+    return score_avx512<InnerProduct>(q, code, lo, st, n, bits);
+#else
+#  if VECENGINE_AVX512_DISPATCH
+    if (kAvx512) return score_avx512<InnerProduct>(q, code, lo, st, n, bits);
+#  endif
     size_t d = 0;
     float sum = 0.0f;
-
     // The SIMD loops first spread 4-bit codes out to one byte per dimension,
     // then score bytes the same way for both widths.
-#if defined(__AVX512F__)
-    __m512 acc0 = _mm512_setzero_ps(), acc1 = _mm512_setzero_ps();
-    // two accumulators halve the FMA dependency chain
-    // scores the 16 dimensions at `at` from one byte code each in c16
-    auto step16 = [&](__m512& acc, __m128i c16, size_t at) {
-        const __m512 c = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(c16));
-        const __m512 x = _mm512_fmadd_ps(c, _mm512_loadu_ps(st + at), _mm512_loadu_ps(lo + at));
-        if constexpr (InnerProduct) {
-            acc = _mm512_fmadd_ps(_mm512_loadu_ps(q + at), x, acc);
-        } else {
-            const __m512 diff = _mm512_sub_ps(_mm512_loadu_ps(q + at), x);
-            acc = _mm512_fmadd_ps(diff, diff, acc);
-        }
-    };
-    if (bits == 8) {
-        for (; d + 32 <= n; d += 32) {
-            step16(acc0, _mm_loadu_si128(reinterpret_cast<const __m128i*>(code + d)), d);
-            step16(acc1, _mm_loadu_si128(reinterpret_cast<const __m128i*>(code + d + 16)), d + 16);
-        }
-        for (; d + 16 <= n; d += 16) step16(acc0, _mm_loadu_si128(reinterpret_cast<const __m128i*>(code + d)), d);
-    } else {
-        const __m128i nibble = _mm_set1_epi8(0x0F);
-        for (; d + 32 <= n; d += 32) {
-            const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i*>(code + d / 2));
-            const __m128i low = _mm_and_si128(c, nibble);
-            const __m128i high = _mm_and_si128(_mm_srli_epi16(c, 4), nibble);
-            step16(acc0, _mm_unpacklo_epi8(low, high), d);
-            step16(acc1, _mm_unpackhi_epi8(low, high), d + 16);
-        }
-    }
-    sum = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
-#elif defined(__AVX2__)
+#  if defined(__AVX2__)
     __m256 acc = _mm256_setzero_ps();
     // scores the 8 dimensions at `at` from one byte code each, in the low 8 bytes of c8
     auto step8 = [&](__m128i c8, size_t at) {
@@ -125,7 +170,7 @@ float SQ::score(const float* q, const uint8_t* code) const noexcept {
     const __m128 half = _mm_add_ps(_mm256_castps256_ps128(acc), _mm256_extractf128_ps(acc, 1));
     const __m128 pair = _mm_add_ps(half, _mm_movehl_ps(half, half));
     sum = _mm_cvtss_f32(_mm_add_ss(pair, _mm_shuffle_ps(pair, pair, 1)));
-#elif defined(__ARM_NEON)
+#  elif defined(__ARM_NEON)
     float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = vdupq_n_f32(0.0f);
     // two accumulators halve the FMA dependency chain
     auto step4 = [&](float32x4_t& acc, uint32x4_t c, size_t at) {
@@ -158,18 +203,9 @@ float SQ::score(const float* q, const uint8_t* code) const noexcept {
         }
     }
     sum = vaddvq_f32(vaddq_f32(acc0, acc1));
+#  endif
+    return score_tail<InnerProduct>(q, code, lo, st, d, n, bits, sum);
 #endif
-
-    for (; d < n; ++d) {
-        const float x = lo[d] + static_cast<float>(code_at(code, d, bits)) * st[d];
-        if constexpr (InnerProduct) {
-            sum += q[d] * x;
-        } else {
-            const float diff = q[d] - x;
-            sum += diff * diff;
-        }
-    }
-    return sum;
 }
 
 } // namespace vecengine::detail

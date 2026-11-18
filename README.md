@@ -21,7 +21,7 @@ pip install qann
 pip install scipy   # only for the sparse indexes
 ```
 
-- Wheels: Linux (x86_64, aarch64) and macOS (Apple Silicon, Intel), Python 3.10 to 3.14. x86_64 needs AVX2 and FMA.
+- Wheels: Linux (x86_64, aarch64) and macOS (Apple Silicon, Intel), Python 3.10 to 3.14. x86_64 needs AVX2 and FMA, and uses AVX-512 kernels at run time on CPUs that have it; set `QANN_DISABLE_AVX512=1` to keep the AVX2 ones.
 - From source: `pip install .` in a checkout. Needs CMake 3.20+, a C++20 compiler and, on Linux, optionally OpenBLAS (much faster training).
 
 ## Quick start

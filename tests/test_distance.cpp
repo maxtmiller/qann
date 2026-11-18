@@ -12,6 +12,7 @@
 #include "vecengine/threads.hpp"
 
 #include <atomic>
+#include <cstdlib>
 #include <cmath>
 #include <set>
 #include <stdexcept>
@@ -91,6 +92,8 @@ TEST_CASE("x86 builds call the AVX-512 kernels exactly when the CPU has AVX-512"
     // the kernels sum in different orders, so the result is bit-identical to the chosen one;
     // the AVX-512 kernel is only called where it can run
     CAPTURE(vecengine::detail::kAvx512);
+    // CI's Intel SDE job sets this to check which path was actually picked
+    if (const char* expect = std::getenv("QANN_EXPECT_AVX512")) REQUIRE(vecengine::detail::kAvx512 == (expect[0] == '1'));
     const float want = vecengine::detail::kAvx512 ? vecengine::l2_distance_avx512(a, b, 100)
                                                   : vecengine::l2_distance_avx2(a, b, 100);
     REQUIRE(vecengine::l2_distance(a, b, 100) == want);

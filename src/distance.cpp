@@ -2,6 +2,8 @@
 
 #include <cmath>
 #include <numeric>
+#include <cstdlib>
+#include <string_view>
 
 #if defined(__AVX2__) || defined(__AVX512F__) || VECENGINE_AVX512_DISPATCH
 #  include <immintrin.h>
@@ -173,7 +175,11 @@ float inner_product_avx2(const float* a, const float* b, std::size_t n) { return
 // of them, and those would crash on CPUs without it.
 #  define VECENGINE_TARGET_AVX512 __attribute__((target("avx512f")))
 namespace detail {
+// QANN_DISABLE_AVX512 (set and not "0") keeps the AVX2 kernels: to compare the
+// two, or on CPUs that lower their clock under AVX-512.
 const bool kAvx512 = [] {
+    const char* off = std::getenv("QANN_DISABLE_AVX512");
+    if (off && *off && std::string_view(off) != "0") return false;
     __builtin_cpu_init();
     return __builtin_cpu_supports("avx512f") != 0;
 }();
