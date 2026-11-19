@@ -21,6 +21,18 @@ store.save("store.qann")
 store = QANNVectorStore.load("store.qann", embeddings, mmap=True)
 ```
 
+### Durable writes
+
+`save()` writes the whole index each time. With `persist_directory`, every `add_texts` and `delete` is logged to disk before it returns, and the store reopens from the same directory after a restart or crash:
+
+```python
+store = QANNVectorStore(embeddings, persist_directory="store/")   # opens the store there, or creates it on the first add
+store.add_texts(texts, metadatas=metadatas)                       # durable when it returns: no save() needed
+store = QANNVectorStore.load("store/", embeddings, mmap=True)     # also opens a persist_directory
+```
+
+The index is checkpointed as the log grows, and tuned hybrid weights are checkpointed when `tune_hybrid_weights` returns. Needs qann 0.1.0a33 or later.
+
 ## Choosing the index
 
 Three levels, from simplest to full control.

@@ -218,6 +218,32 @@ def test_persist_and_load(tmp_path, mmap):
     assert loaded.get_nodes(node_ids=["n20"]) == []
 
 
+@pytest.mark.parametrize("preset", ["hnsw", "ivf-pq"])
+def test_persist_directory(tmp_path, preset):
+    data = nodes(1200)
+    path = tmp_path / "store"
+    store = QANNVectorStore(index=preset, sparse="bm25", persist_directory=path)
+    store.add(data)
+    assert store.client.persist_path == path
+    store.delete("doc3")
+    q = VectorStoreQuery(query_embedding=data[0].embedding, query_str="alpha kilo", similarity_top_k=5,
+                         mode=VectorStoreQueryMode.HYBRID)
+    expected = store.query(q).ids
+    del store   # no persist(): every write is already in the store
+
+    reopened = QANNVectorStore(persist_directory=path)
+    assert isinstance(reopened.client, qann.HybridIndex)
+    assert reopened.query(q).ids == expected
+    assert reopened.get_nodes(node_ids=["n16"]) == []   # doc3 stayed deleted
+    reopened.delete("doc4")
+    del reopened
+
+    loaded = QANNVectorStore.from_persist_path(str(path), mmap=True)
+    assert loaded.get_nodes(node_ids=["n20"]) == []
+    with pytest.raises(ValueError, match="already holds a store"):
+        QANNVectorStore(qann.FlatIndex(DIM), persist_directory=path)
+
+
 def test_vector_store_index_end_to_end(tmp_path):
     Settings.embed_model = MockEmbedding(embed_dim=DIM)
     docs = [Document(text=f"document {i} about {WORDS[i % len(WORDS)]}", id_=f"d{i}", metadata={"i": i}) for i in range(30)]
