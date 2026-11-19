@@ -30,6 +30,7 @@
 #include "vecengine/pq.hpp"
 #include "vecengine/refine_index.hpp"
 #include "vecengine/inverted_index.hpp"
+#include "vecengine/journal.hpp"
 #include "vecengine/sparse_approx_index.hpp"
 #include "vecengine/index_factory.hpp"
 #include "vecengine/threads.hpp"
@@ -127,6 +128,34 @@ static auto write_locked(const vecengine::IndexBase& index, F&& f) {
     nb::gil_scoped_release release;
     auto locks = lock_chain<std::unique_lock<std::shared_mutex>>(index);
     return f();
+}
+
+// For a persisted index (persist() / qann.open), every write is applied, then
+// logged under the same lock; finish_logged then waits for the record to reach
+// disk and checkpoints once the log has grown enough. Throws if the store failed
+// earlier, before the write changes anything. Call with the index locked.
+static vecengine::Journal* journal_for_write(const vecengine::IndexBase& index) {
+    vecengine::Journal* j = index.journal();
+    if (j) j->check();
+    return j;
+}
+
+// After a write logged as record seq (0 when the index isn't persisted). Call
+// without the index locked, so other writers can join the same fsync.
+static void finish_logged(const vecengine::IndexBase& index, uint64_t seq) {
+    vecengine::Journal* j = index.journal();
+    if (!j || seq == 0) return;
+    nb::gil_scoped_release release;
+    j->sync(seq);
+    if (!j->checkpoint_due()) return;
+    auto locks = lock_chain<std::shared_lock<std::shared_mutex>>(index);
+    if (j->checkpoint_due()) j->checkpoint(index);
+}
+
+// Checkpoints a persisted index after a change the log doesn't record:
+// training, enable_pq / enable_sq and compact(). Call with the index locked.
+static void checkpoint_if_persisted(const vecengine::IndexBase& index) {
+    if (vecengine::Journal* j = journal_for_write(index)) j->checkpoint(index);
 }
 
 // Converts any sequence of integers (NumPy array of any int dtype, list,
@@ -405,10 +434,16 @@ static NumpyArray<int64_t> index_add(vecengine::DenseIndex &self, FloatMatrix da
 
     const vecengine::Metadata md = metadata ? as_metadata(*metadata, data.shape(0), "row of data") : vecengine::Metadata{};
     const int64_t* id_ptr = id_array ? id_array->data() : nullptr;
+    uint64_t seq = 0;
     std::vector<int64_t> added = write_locked(self, [&] {
         refuse_if_wrapped(self, "add");
-        return self.add_batch(std::span<const float>(data.data(), data.size()), data.shape(0), id_ptr, md);
+        vecengine::Journal* j = journal_for_write(self);
+        const std::span<const float> vecs(data.data(), data.size());
+        std::vector<int64_t> out = self.add_batch(vecs, data.shape(0), id_ptr, md);
+        if (j) seq = j->log_add(vecs, data.shape(0), out, md);
+        return out;
     });
+    finish_logged(self, seq);
     const std::size_t n = added.size();
     return to_numpy(std::move(added), {n});
 }
@@ -417,10 +452,15 @@ static NumpyArray<int64_t> index_add(vecengine::DenseIndex &self, FloatMatrix da
 static void index_update_metadata(vecengine::IndexBase& self, IdsArg ids, nb::dict metadata) {
     IdVector id_array = as_ids(ids);
     const vecengine::Metadata md = as_metadata(metadata, id_array.shape(0), "id");
+    uint64_t seq = 0;
     write_locked(self, [&] {
         refuse_if_wrapped(self, "update metadata");
-        self.update_metadata(std::span<const int64_t>(id_array.data(), id_array.shape(0)), md);
+        vecengine::Journal* j = journal_for_write(self);
+        const std::span<const int64_t> id_span(id_array.data(), id_array.shape(0));
+        self.update_metadata(id_span, md);
+        if (j) seq = j->log_update_metadata(id_span, md);
     });
+    finish_logged(self, seq);
 }
 
 // Read metadata back as {name: values}: int and float columns as NumPy masked
@@ -468,36 +508,57 @@ static void index_add_metadata_column(vecengine::IndexBase& self, std::string na
     else throw std::invalid_argument("metadata column type must be 'int', 'float' or 'str'; got '" + type + "'");
     if (ids.has_value() != !values.is_none()) throw nb::type_error("ids and values must be passed together");
     if (fill && ids) throw nb::type_error("pass either default or ids and values, not both");
+    uint64_t seq = 0;
     if (!ids) {
         write_locked(self, [&] {
             refuse_if_wrapped(self, "add a metadata column");
-            self.add_metadata_column(std::move(name), t, std::move(fill));
+            vecengine::Journal* j = journal_for_write(self);
+            self.add_metadata_column(name, t, fill);
+            if (j) seq = j->log_add_column(name, t, fill);
         });
+        finish_logged(self, seq);
         return;
     }
     IdVector id_array = as_ids(*ids);
     vecengine::MetadataColumn col = as_column(name, values, id_array.shape(0), "id");
     write_locked(self, [&] {
         refuse_if_wrapped(self, "add a metadata column");
-        self.add_metadata_column(std::move(name), t, std::span<const int64_t>(id_array.data(), id_array.shape(0)),
-                                 std::move(col.values), std::move(col.valid));
+        vecengine::Journal* j = journal_for_write(self);
+        const std::span<const int64_t> id_span(id_array.data(), id_array.shape(0));
+        if (!j) {
+            self.add_metadata_column(std::move(name), t, id_span, std::move(col.values), std::move(col.valid));
+            return;
+        }
+        self.add_metadata_column(name, t, id_span, col.values, col.valid);  // copies: the log needs them after
+        seq = j->log_add_column(name, t, id_span, col.values, col.valid);
     });
+    finish_logged(self, seq);
 }
 
 // Delete the vectors with these ids; returns how many were deleted.
 static std::size_t index_remove(vecengine::IndexBase& self, IdsArg ids) {
     IdVector id_array = as_ids(ids);
-    return write_locked(self, [&] {
+    uint64_t seq = 0;
+    const std::size_t removed = write_locked(self, [&] {
         refuse_if_wrapped(self, "remove");
-        return self.remove(std::span<const int64_t>(id_array.data(), id_array.shape(0)));
+        vecengine::Journal* j = journal_for_write(self);
+        const std::span<const int64_t> id_span(id_array.data(), id_array.shape(0));
+        const std::size_t count = self.remove(id_span);
+        if (j && count > 0) seq = j->log_remove(id_span);
+        return count;
     });
+    finish_logged(self, seq);
+    return removed;
 }
 
 // Free the storage of deleted vectors; returns how many slots were reclaimed.
 static std::size_t index_compact(vecengine::IndexBase& self) {
     return write_locked(self, [&] {
         refuse_if_wrapped(self, "compact");
-        return self.compact();
+        journal_for_write(self);
+        const std::size_t freed = self.compact();
+        if (freed > 0) checkpoint_if_persisted(self);
+        return freed;
     });
 }
 
@@ -624,10 +685,15 @@ static NumpyArray<int64_t> sparse_add(vecengine::SparseIndex& self, nb::handle d
         if (id_array->shape(0) != rows.view().rows()) throw std::invalid_argument("ids must have one entry per row of data");
     }
     const vecengine::Metadata md = metadata ? as_metadata(*metadata, rows.view().rows(), "row of data") : vecengine::Metadata{};
+    uint64_t seq = 0;
     std::vector<int64_t> added = write_locked(self, [&] {
         refuse_if_wrapped(self, "add");
-        return self.add_batch(rows.view(), id_array ? id_array->data() : nullptr, md);
+        vecengine::Journal* j = journal_for_write(self);
+        std::vector<int64_t> out = self.add_batch(rows.view(), id_array ? id_array->data() : nullptr, md);
+        if (j) seq = j->log_add_sparse(rows.view(), out, md);
+        return out;
     });
+    finish_logged(self, seq);
     const std::size_t n = added.size();
     return to_numpy(std::move(added), {n});
 }
@@ -670,14 +736,22 @@ hybrid_search(const vecengine::HybridIndex& self, std::span<const float> q, cons
 static void hnsw_train(vecengine::HNSWIndex &self, FloatMatrix data) {
     if (data.shape(1) != self.dim())
         throw std::invalid_argument("training vector dimension does not match index dimension");
-    write_locked(self, [&] { self.train(std::span<const float>(data.data(), data.size()), data.shape(0)); });
+    write_locked(self, [&] {
+        journal_for_write(self);
+        self.train(std::span<const float>(data.data(), data.size()), data.shape(0));
+        checkpoint_if_persisted(self);
+    });
 }
 
 static void ivf_train(vecengine::IVFIndex &self, FloatMatrix data, std::size_t max_iters, std::optional<uint32_t> seed,
                       vecengine::Clustering clustering, std::size_t passes) {
     if (data.shape(1) != self.dim())
         throw std::invalid_argument("training vector dimension does not match index dimension");
-    write_locked(self, [&] { self.train(std::span<const float>(data.data(), data.size()), data.shape(0), max_iters, seed, clustering, passes); });
+    write_locked(self, [&] {
+        journal_for_write(self);
+        self.train(std::span<const float>(data.data(), data.size()), data.shape(0), max_iters, seed, clustering, passes);
+        checkpoint_if_persisted(self);
+    });
 }
 
 static void pq_train(vecengine::PQCodebook &self, FloatMatrix data, std::size_t max_iters, std::optional<uint32_t> seed) {
@@ -855,6 +929,37 @@ NB_MODULE(qann, m) {
                  read_locked(self, [&] { vecengine::save_index(self, path); });
              },
              nb::arg("path"), "Save the index to a file; load it back with qann.load(path)")
+        .def("persist",
+             [](vecengine::IndexBase& self, const std::filesystem::path& path, bool sync) {
+                 write_locked(self, [&] {
+                     refuse_if_wrapped(self, "persist");
+                     if (self.journal()) throw std::invalid_argument("index is already persisted");
+                     self.attach_journal(vecengine::Journal::create(path, self, sync));
+                 });
+             },
+             nb::arg("path"), nb::kw_only(), nb::arg("sync") = true,
+             "Make every later write durable: saves the index into the directory path (created if missing, "
+             "otherwise it must be empty), then logs each add, remove and metadata change there before the call "
+             "returns. Reopen with qann.open(path) after a restart or crash. sync=True waits until each write is "
+             "on disk (concurrent writers share one fsync); sync=False leaves flushing to the OS, so a crash can "
+             "lose the last writes but never corrupts the store. Training, enable_pq / enable_sq and compact() "
+             "save a checkpoint; query settings such as nprobe are saved only by the next checkpoint")
+        .def("checkpoint",
+             [](const vecengine::IndexBase& self) {
+                 read_locked(self, [&] {
+                     vecengine::Journal* j = self.journal();
+                     if (!j) throw std::invalid_argument("index is not persisted; call persist(path) first");
+                     j->checkpoint(self);
+                 });
+             },
+             "Save the whole index into its store and start an empty log, so reopening replays nothing. Happens "
+             "on its own once the log passes 64 MiB and a quarter of the index's size. Writes wait meanwhile")
+        .def_prop_ro("persist_path",
+                     [](const vecengine::IndexBase& self) -> std::optional<std::filesystem::path> {
+                         vecengine::Journal* j = self.journal();
+                         return j ? std::optional(j->dir()) : std::nullopt;
+                     },
+                     "The store directory of a persisted index, or None")
         .def("update_metadata", &index_update_metadata, nb::arg("ids"), nb::arg("metadata"),
              "Overwrite metadata in place: metadata is {name: one value per id}, None sets a value to null, and "
              "columns left out keep their values. Unknown, deleted or repeated ids, and columns the index "
@@ -873,10 +978,14 @@ NB_MODULE(qann, m) {
              "Later adds that leave the column out store null. Raises ValueError, changing nothing, if the "
              "name is taken, a value doesn't fit the type, or an id is unknown, deleted or repeated")
         .def("drop_metadata_column", [](vecengine::IndexBase& self, const std::string& name) {
+                 uint64_t seq = 0;
                  write_locked(self, [&] {
                      refuse_if_wrapped(self, "drop a metadata column");
+                     vecengine::Journal* j = journal_for_write(self);
                      self.drop_metadata_column(name);
+                     if (j) seq = j->log_drop_column(name);
                  });
+                 finish_logged(self, seq);
              },
              nb::arg("name"), "Remove a metadata column and its values from every vector; raises ValueError if there is none")
         .def("remove", &index_remove, nb::arg("ids"),
@@ -974,7 +1083,11 @@ NB_MODULE(qann, m) {
              [](vecengine::IVFIndex& self, std::size_t num_subspaces, std::optional<std::size_t> centroids_per_subspace,
                 bool fast_scan, bool rotate) {
                  const std::size_t k = centroids_per_subspace.value_or(fast_scan ? 16 : 256);
-                 write_locked(self, [&] { self.enable_pq(num_subspaces, k, fast_scan, rotate); });
+                 write_locked(self, [&] {
+                     journal_for_write(self);
+                     self.enable_pq(num_subspaces, k, fast_scan, rotate);
+                     checkpoint_if_persisted(self);
+                 });
              },
              nb::arg("num_subspaces"), nb::arg("centroids_per_subspace").none() = nb::none(), nb::kw_only(),
              nb::arg("fast_scan") = false, nb::arg("rotate") = false,
@@ -987,7 +1100,11 @@ NB_MODULE(qann, m) {
         .def_prop_ro("pq_rotate",
                      [](const vecengine::IVFIndex& self) { return read_locked(self, [&] { return self.pq_rotate(); }); },
                      "Whether enable_pq(..., rotate=True) was used")
-        .def("enable_sq", [](vecengine::IVFIndex& self, int bits) { write_locked(self, [&] { self.enable_sq(bits); }); },
+        .def("enable_sq", [](vecengine::IVFIndex& self, int bits) { write_locked(self, [&] {
+                 journal_for_write(self);
+                 self.enable_sq(bits);
+                 checkpoint_if_persisted(self);
+             }); },
              nb::arg("bits") = 8,
              "Store vectors as scalar codes of 8 bits (4x smaller than floats) or 4 bits (8x smaller) per "
              "dimension instead of raw floats. Call before train()/add(); not with enable_pq(). Distances become "
@@ -1033,7 +1150,11 @@ NB_MODULE(qann, m) {
              "Construct an HNSW graph index. add() builds the graph on all cores; no training unless enable_sq() is "
              "used. M is the neighbors per node (2 * M on the bottom level); ef_construction the search width while "
              "inserting. A seed makes the build reproducible when qann.set_num_threads(1) is set")
-        .def("enable_sq", [](vecengine::HNSWIndex& self, int bits) { write_locked(self, [&] { self.enable_sq(bits); }); },
+        .def("enable_sq", [](vecengine::HNSWIndex& self, int bits) { write_locked(self, [&] {
+                 journal_for_write(self);
+                 self.enable_sq(bits);
+                 checkpoint_if_persisted(self);
+             }); },
              nb::arg("bits") = 8,
              "Store vectors as scalar codes of 8 bits (4x smaller than floats) or 4 bits (8x smaller) per "
              "dimension. Call before train()/add(). Distances become approximate; wrap the index in a "
@@ -1236,10 +1357,15 @@ NB_MODULE(qann, m) {
                      if (id_array->shape(0) != n) throw std::invalid_argument("ids must have one entry per document");
                  }
                  const vecengine::Metadata md = metadata ? as_metadata(*metadata, n, "document") : vecengine::Metadata{};
+                 uint64_t seq = 0;
                  std::vector<int64_t> added = write_locked(self, [&] {
-                     return self.add_batch(std::span<const float>(dense.data(), dense.size()), rows.view(),
-                                           id_array ? id_array->data() : nullptr, md);
+                     vecengine::Journal* j = journal_for_write(self);
+                     const std::span<const float> vecs(dense.data(), dense.size());
+                     std::vector<int64_t> out = self.add_batch(vecs, rows.view(), id_array ? id_array->data() : nullptr, md);
+                     if (j) seq = j->log_add_hybrid(vecs, rows.view(), out, md);
+                     return out;
                  });
+                 finish_logged(self, seq);
                  const std::size_t count = added.size();
                  return to_numpy(std::move(added), {count});
              },
@@ -1408,6 +1534,18 @@ NB_MODULE(qann, m) {
     m.def("make_index", &vecengine::make_index, nb::arg("type"), nb::arg("dim"), nb::arg("opts") = vecengine::IndexOptions{},
           "Construct a FlatIndex, IVFIndex, HNSWIndex, InvertedIndex or SparseApproxIndex from an IndexType and "
           "IndexOptions (dim is unused for the sparse ones)");
+
+    m.def("open",
+          [](const std::filesystem::path& path, bool mmap, bool sync) {
+              auto [index, journal] = vecengine::Journal::open(path, mmap, sync);
+              index->attach_journal(std::move(journal));
+              return std::move(index);
+          },
+          nb::arg("path"), nb::kw_only(), nb::arg("mmap") = false, nb::arg("sync") = true,
+          nb::call_guard<nb::gil_scoped_release>(),
+          "Open a store made by index.persist(path): loads its last checkpoint (mmap as in qann.load), replays "
+          "the writes logged since, and returns the index, persisted to the same store. A write cut off by a "
+          "crash is dropped. sync as in persist()");
 
     m.def("load", nb::overload_cast<const std::filesystem::path&, bool>(&vecengine::load_index), nb::arg("path"),
           nb::kw_only(), nb::arg("mmap") = false, nb::call_guard<nb::gil_scoped_release>(),

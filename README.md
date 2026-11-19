@@ -419,6 +419,22 @@ index = qann.load("vectors.qann")   # returns the saved class, e.g. IVFIndex or 
 - **Safe:** an interrupted save never leaves a partial file, and a corrupt or foreign file raises `RuntimeError`.
 - **Versioned:** newer releases load files from older ones. [Details](https://github.com/maxtmiller/qann/blob/main/ARCHITECTURE.md#saving-and-loading).
 
+### Durable writes
+
+`save()` rewrites the whole file, so saving after every change costs the whole index. `persist` logs each change instead:
+
+```python
+index.persist("store/")        # saves the index into the directory, then logs every write there
+index.add(vectors, ids=ids)    # returns once the write is on disk
+index.remove([3, 7])
+index = qann.open("store/")    # after a restart or crash: last checkpoint + the logged writes
+```
+
+- **Every write is logged:** adds, removes and metadata changes are appended to a write-ahead log with a CRC per record, and `persist(path, sync=True)` (the default) waits for each to reach disk. Concurrent writers share one fsync. `sync=False` leaves flushing to the OS: a crash can then lose the last writes, but never corrupts the store.
+- **Checkpoints keep the log short:** once the log passes 64 MiB and a quarter of the index's size, or on `index.checkpoint()`, the index is saved as a new checkpoint and the log starts empty. Training, `enable_pq` / `enable_sq` and `compact()` also checkpoint.
+- **Crash-safe:** `qann.open` replays the log onto the checkpoint and drops a record a crash cut short. `qann.open(path, mmap=True)` maps the checkpoint as `qann.load` does.
+- Query settings such as `nprobe` are saved by the next checkpoint, not logged. Persist a `RefineIndex` or `HybridIndex` itself, not the index it wraps.
+
 A standalone `PQCodebook` has its own file: `pq.save(path)` and `qann.PQCodebook.load(path)`. `qann.load` is for indexes and refuses a codebook file (and the other way round).
 
 ## Product quantization

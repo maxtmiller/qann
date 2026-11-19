@@ -44,6 +44,8 @@ using std::size_t;
 using std::vector;
 using std::span;
 
+class Journal;
+
 // One query result: the vector's id and its distance to the query under the
 // index's metric (squared L2, 1 - cosine similarity, or -inner product).
 struct Neighbor {
@@ -154,6 +156,16 @@ public:
     // add_batch() and remove() here.
     bool wrapped() const noexcept { return wrapped_.load(); }
 
+    // The write-ahead log this index's writes go to, or nullptr (see
+    // journal.hpp). Like the mutex, the library doesn't use it itself: the
+    // Python bindings log each write here after applying it.
+    Journal* journal() const noexcept { return journal_.get(); }
+
+    // Attaches a journal made for this index by Journal::create or
+    // Journal::open. Throws std::invalid_argument if the index already has
+    // one, or is wrapped (its writes go through the wrapper).
+    void attach_journal(std::shared_ptr<Journal> journal);
+
 protected:
     IndexBase() = default;
 
@@ -175,6 +187,7 @@ private:
 
     mutable std::shared_mutex mutex_;
     std::atomic<bool> wrapped_{false};
+    std::shared_ptr<Journal> journal_;
 };
 
 // An index of dense vectors: dim() floats each, compared by a Metric.
