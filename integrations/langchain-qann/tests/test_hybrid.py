@@ -157,3 +157,20 @@ def test_wrapping_and_errors(emb):
         QANNVectorStore.from_texts(["x"], emb).tune_hybrid_weights(["x"], [{"x"}])
     with pytest.raises(ValueError, match="no search setting"):
         QANNVectorStore.from_texts(["x"], emb).similarity_search("x", weights=(1, 0))
+
+
+def test_hybrid_persist_directory(emb, tmp_path):
+    texts = corpus(300)
+    path = tmp_path / "store"
+    store = QANNVectorStore.from_texts(texts, emb, ids=[str(i) for i in range(300)], sparse="bm25",
+                                       persist_directory=path)
+    store.delete(["5"])
+    store.tune_hybrid_weights([f"unique{i}" for i in range(0, 300, 10)], [{str(i)} for i in range(0, 300, 10)])
+    weights = store.index.weights
+    expected = {q: [d.id for d in store.similarity_search(q, k=5)] for q in ["alpha kilo", "unique77", texts[3]]}
+    del store
+    reopened = QANNVectorStore(emb, persist_directory=path)
+    assert isinstance(reopened.index, qann.HybridIndex) and reopened.index.weights == weights
+    assert reopened.get_by_ids(["5"]) == []
+    for q, ids in expected.items():
+        assert [d.id for d in reopened.similarity_search(q, k=5)] == ids

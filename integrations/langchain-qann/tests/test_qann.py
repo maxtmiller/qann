@@ -108,6 +108,32 @@ def test_save_and_load(emb, tmp_path, mmap):
     assert loaded.similarity_search("new", k=1, filter={"year": 1999})[0].id == "new"
 
 
+@pytest.mark.parametrize("preset", ["hnsw", "ivf-pq"])
+def test_persist_directory(emb, tmp_path, preset):
+    texts, metas = corpus(1200)
+    path = tmp_path / "store"
+    store = QANNVectorStore.from_texts(texts, emb, metas, ids=[f"id{i}" for i in range(1200)], index=preset,
+                                       persist_directory=path)
+    assert store.index.persist_path == path
+    store.delete(["id3"])
+    store.add_texts(["doc 5 again"], [{"year": 1999}], ids=["id5"])   # replaces id5
+    q = "doc 42"
+    expected = [d.id for d in store.similarity_search(q, k=5)]
+    del store   # no save(): every write is already in the store
+
+    reopened = QANNVectorStore(emb, persist_directory=path)
+    assert reopened.get_by_ids(["id3"]) == []
+    assert reopened.get_by_ids(["id5"])[0].page_content == "doc 5 again"
+    assert [d.id for d in reopened.similarity_search(q, k=5)] == expected
+    reopened.add_texts(["new"], [{"year": 1998}], ids=["new"])
+    del reopened
+
+    loaded = QANNVectorStore.load(path, emb, mmap=True)
+    assert loaded.similarity_search("new", k=1, filter={"year": 1998})[0].id == "new"
+    with pytest.raises(ValueError, match="already holds a store"):
+        QANNVectorStore(emb, index=qann.FlatIndex(DIM), persist_directory=path)
+
+
 def test_own_index_and_scores(emb):
     store = QANNVectorStore(emb, index=qann.HNSWIndex(DIM, M=8, metric=qann.Metric.L2))
     store.add_texts(["x", "y"], ids=["x", "y"])

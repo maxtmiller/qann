@@ -25,6 +25,18 @@ store = QANNVectorStore.from_persist_path("store.qann", mmap=True)
 index = VectorStoreIndex.from_vector_store(store)
 ```
 
+### Durable writes
+
+`persist()` writes the whole index each time. With `persist_directory`, every add and delete is logged to disk before it returns, and the store reopens from the same directory after a restart or crash:
+
+```python
+store = QANNVectorStore(index="hnsw", sparse="bm25", persist_directory="store/")   # opens the store there, or creates it on the first add
+index = VectorStoreIndex.from_documents(documents, storage_context=StorageContext.from_defaults(vector_store=store))
+store = QANNVectorStore.from_persist_path("store/", mmap=True)                     # also opens a persist_directory
+```
+
+The index is checkpointed as the log grows, and tuned hybrid weights are checkpointed when `tune_hybrid_weights` returns. Needs qann 0.1.0a33 or later.
+
 ## Choosing the index
 
 **1. Presets.** Pass `index=` by name. The parameters follow qann's [configuration guide](https://github.com/maxtmiller/qann#choosing-a-configuration).

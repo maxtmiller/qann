@@ -54,6 +54,11 @@ class QANNVectorStore(BasePydanticVectorStore):
     "text_search" the sparse side, and "hybrid" both, fused with weights
     (alpha, 1 - alpha) when the query sets alpha.
 
+    persist_directory makes every add and delete durable: the store opens the qann store
+    in that directory if there is one (index must then be left as a preset name), or
+    creates it there on the first add. Each write is logged before add or delete returns,
+    and a restart or crash keeps every write that returned.
+
     search_params sets search options for every query: nprobe, ef_search, k_factor and,
     with hybrid search, weights, method, depth_factor and rrf_k. Queries take the same
     names as keyword arguments (vector_store_kwargs on a retriever).
@@ -70,6 +75,7 @@ class QANNVectorStore(BasePydanticVectorStore):
     _rows: dict = PrivateAttr(default_factory=dict)   # node id -> qann id
     _docs: dict = PrivateAttr(default_factory=dict)   # ref doc id -> set of qann ids
     _keep: list = PrivateAttr(default_factory=list)   # wrapped indexes kept alive
+    _persist_directory: str | None = PrivateAttr(default=None)
     search_params: dict = {}
 
     def __init__(
@@ -79,9 +85,15 @@ class QANNVectorStore(BasePydanticVectorStore):
         metric: str = "cosine",
         search_params: dict[str, Any] | None = None,
         sparse: str | SparseEncoder | None = None,
+        persist_directory: str | os.PathLike | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(search_params=dict(search_params or {}), **kwargs)
+        self._persist_directory = persist_directory
+        if persist_directory is not None and _is_store(persist_directory):
+            if not isinstance(index, str):
+                raise ValueError(f"{persist_directory} already holds a store; leave index out to open it")
+            index = qann.open(persist_directory)
         if isinstance(index, str) and index not in PRESETS:
             raise ValueError(f"index must be one of {PRESETS} or a qann index, got {index!r}")
         if metric not in METRICS:
@@ -108,7 +120,13 @@ class QANNVectorStore(BasePydanticVectorStore):
         self._index = index
         self._keep += [d for d in (self._dense, getattr(self._dense, "base", None)) if d is not None]
         self._metric = {v: k for k, v in METRICS.items()}[self._dense.metric]
+        self._persist()
         self._load_ids()
+
+    def _persist(self) -> None:
+        """Logs the index's writes to persist_directory, unless they already go to a store."""
+        if self._persist_directory is not None and self._index.persist_path is None:
+            self._index.persist(self._persist_directory)
 
     @classmethod
     def class_name(cls) -> str:
@@ -139,6 +157,7 @@ class QANNVectorStore(BasePydanticVectorStore):
         vectors = np.ascontiguousarray(np.asarray([n.get_embedding() for n in nodes], dtype=np.float32))
         if self._index is None:
             self._index = self._create(vectors)
+            self._persist()
         # adding an existing node id replaces that node
         self.delete_nodes([i for i in ids if i in self._rows])
         texts = [n.get_content() for n in nodes]
@@ -351,7 +370,10 @@ class QANNVectorStore(BasePydanticVectorStore):
         sparse = sp.vstack([self._sparse.encode_query(q) for q in query_strs]).tocsr()
         rows = [({self._rows[i] for i in r if i in self._rows} if isinstance(r, (set, frozenset, list, tuple))
                  else {self._rows[i]: g for i, g in r.items() if i in self._rows}) for r in relevant]
-        return self._index.tune_weights(dense, sparse, rows, k, metric=metric, grid=grid)
+        scores = self._index.tune_weights(dense, sparse, rows, k, metric=metric, grid=grid)
+        if self._index.persist_path is not None:
+            self._index.checkpoint()  # weights are a setting, which only a checkpoint saves
+        return scores
 
     # ---- persisting ----
 
@@ -373,10 +395,16 @@ class QANNVectorStore(BasePydanticVectorStore):
         search_params: dict[str, Any] | None = None,
         sparse: str | SparseEncoder | None = None,
     ) -> QANNVectorStore:
-        """Open a store written by persist(). mmap=True leaves a RefineIndex's full vectors and the
-        BM25 posting lists on disk. A hybrid store uses BM25 unless sparse passes the custom
-        encoder it was built with."""
-        return cls(qann.load(persist_path, mmap=mmap), search_params=search_params, sparse=sparse)
+        """Open a store written by persist(), or a persist_directory (later writes then keep going
+        to it). mmap=True leaves a RefineIndex's full vectors and the BM25 posting lists on disk.
+        A hybrid store uses BM25 unless sparse passes the custom encoder it was built with."""
+        index = qann.open(persist_path, mmap=mmap) if _is_store(persist_path) else qann.load(persist_path, mmap=mmap)
+        return cls(index, search_params=search_params, sparse=sparse)
+
+
+def _is_store(path: str | os.PathLike) -> bool:
+    """Whether path is a directory made by qann's persist()."""
+    return os.path.isfile(os.path.join(path, "MANIFEST"))
 
 
 def _where(filters: MetadataFilters | None, schema: dict):
