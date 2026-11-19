@@ -33,6 +33,7 @@ qann/
 │   ├── pq.hpp                      # PQCodebook + PQDistance
 │   ├── sq.hpp                      # SQ: 8- and 4-bit scalar quantizer used by HNSWIndex
 │   ├── refine_index.hpp            # exact re-ranking wrapper
+│   ├── journal.hpp                 # Journal: write-ahead log + checkpoints behind persist() / qann.open (#145)
 │   ├── vector_store.hpp            # a RefineIndex's raw vectors, in RAM or mapped from its file (issue #58)
 │   ├── sparse_index.hpp            # SparseIndex: base of the sparse indexes, SparseRows input
 │   ├── inverted_index.hpp          # InvertedIndex: exact search over sparse vectors
@@ -63,6 +64,7 @@ qann/
 │   ├── fusion.cpp
 │   ├── hybrid_index.cpp
 │   ├── vector_store.cpp
+│   ├── journal.cpp                 # log records, CRC-32C, group-commit fsync, checkpoints, replay
 │   └── index_factory.cpp
 ├── tests/
 │   ├── test_distance.cpp           # Catch2 v3 tests for every layer
@@ -77,6 +79,7 @@ qann/
 │   ├── test_metric.cpp             # cosine metric: exact ranking, normalize_rows, zero vectors, save/load, format v4 files
 │   ├── test_inner_product.cpp      # inner product: kernels, exact ranking on every index type, HNSW vs explicit L2 transform, PQ, save/load
 │   ├── test_python.py              # pytest smoke, save/load, ids and threading tests
+│   ├── test_persist.py             # persist / qann.open: replay of every write type, checkpoints, mmap, torn logs, a killed writer
 │   ├── test_sparse.cpp / .py       # InvertedIndex and SparseApproxIndex against brute-force dot products, input forms, ids, filters, compaction, save/load, corrupt files
 │   ├── test_fusion.cpp / .py       # RRF and linear scores, weights, ties, padding, batches; qann.fuse input forms and a dense + sparse hybrid
 │   ├── test_mmap.cpp               # mapped RefineIndex, IVF float / SQ lists and sparse posting lists vs read in: queries, adds, removes, compaction, saving over the mapped file, row alignment
@@ -620,6 +623,7 @@ The README keeps to what each feature does and how to call it. This section hold
 
 - **Interrupted saves:** the file is written next to the target as `<path>.tmp` and renamed into place when complete, so a failed save never leaves a partial file or destroys an existing one.
 - **Memory-mapped loading:** `qann.load(path, mmap=True)` leaves the largest parts of a file in place and reads them through the page cache as queries need them, so loading is quick and memory holds only what every query needs. It maps a RefineIndex's raw vectors (`dim * 4` bytes per vector), an IVFIndex's float and SQ lists, and the posting lists of InvertedIndex and SparseApproxIndex (8 bytes per stored term) with SparseApproxIndex's forward index; PQ codes, graphs, ids and metadata are read in. Results are identical. A sparse load still checks every posting, so it reads the file once, though without keeping it in the process's memory. A RefineIndex needs a file saved in format 10 (0.1.0a25 onward), IVF and sparse lists format 11; older files load without `mmap` (IVF and sparse lists are just read in) and can be saved again. Compacting a mapped sparse index writes its compacted lists to a temporary file next to the index, so it needs write access there and that much free disk. The file must stay in place while the index is open; saving over it is safe. Removed vectors stay in the file, and on a mapped IVF list those added after loading stay in RAM, after `compact()` until the next `save`.
+- **Durable writes** (`journal.hpp`, #145 stage 1): `index.persist(dir)` saves the index into `dir` as `index-1.qann` and attaches a `Journal`; `qann.open(dir)` loads the checkpoint and replays the log. Files: `MANIFEST` (magic `QMAN`, version, generation `g`, CRC), `index-g.qann` (an ordinary index file) and `wal-g.log` (magic `QWAL`, version, `g`, then records of `u32 length | u32 CRC-32C | u8 op | payload`, payloads in the index files' raw layout). The library itself doesn't log: the bindings apply each add, remove or metadata change and then append its record under the same exclusive lock, so the log holds exactly the writes that succeeded, in order, with an add's assigned ids (replay checks it gets the same ones). `sync()` runs outside the lock; a waiting writer becomes the leader, fsyncs everything appended so far and wakes the rest (group commit). A checkpoint, under the shared lock, saves generation `g + 1`, syncs it, creates its empty log, then renames a new `MANIFEST` into place and syncs the directory; a crash before the rename leaves `g` intact, and `qann.open` deletes the other generation's files. Replay stops at the first record that is cut short or fails its CRC and truncates the log there. Training, `enable_pq` / `enable_sq` and `compact()` aren't logged; they checkpoint. A failed append or fsync marks the store failed: the in-memory index may hold a write the log lacks, so later writes raise until it is reopened. CRC-32C uses the CPU instruction where the build enables it (SSE4.2 on x86, the ARM CRC extension on Apple arm64), slicing-by-8 tables otherwise. Measured on the M3: an add of 10 768-d vectors goes from ~10 to ~80-150 us (the fsync), 1,000 vectors from ~0.3-3 ms to ~6 ms; a checkpoint of 100k x 768 takes 0.5 s, and opening it with a 100k-vector log to replay 0.14 s.
 - **Compatibility:** files saved by 0.1.0a4, 0.1.0a6, 0.1.0a7, 0.1.0a10, 0.1.0a11 and 0.1.0a12 onward all still load (see [File Format](#file-format-srcserializehpp)). A file from a newer release than the one loading it raises `RuntimeError` rather than being misread.
 
 ---

@@ -103,6 +103,12 @@ void IndexBase::add_metadata_column(std::string name, ColumnType type, span<cons
 
 void IndexBase::drop_metadata_column(const std::string& name) { metadata_.drop_column(name); }
 
+void IndexBase::attach_journal(std::shared_ptr<Journal> journal) {
+    if (journal_) throw std::invalid_argument("index is already persisted");
+    if (wrapped()) throw std::invalid_argument("cannot persist an index wrapped by a RefineIndex or HybridIndex; persist the wrapper");
+    journal_ = std::move(journal);
+}
+
 vector<Neighbor> DenseIndex::query(span<const float> vec, size_t k) const {
     assert(vec.size() == dim());
     return std::move(query_prepared(vec, 1, k, nullptr, false)[0]);

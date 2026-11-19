@@ -98,6 +98,7 @@ add_library(vecengine_core STATIC
   src/metrics.cpp
   src/vector_store.cpp
   src/bm25.cpp
+  src/journal.cpp
 )
 
 target_include_directories(vecengine_core PUBLIC

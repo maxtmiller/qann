@@ -28,6 +28,7 @@ RefineIndex::RefineIndex(DenseIndex& base, size_t k_factor, bool custom_ids) : D
     if (k_factor == 0) throw std::invalid_argument("k_factor must be >= 1");
     if (!base.ids_are_slots()) throw std::invalid_argument("base index must not use custom ids or have been compacted");
     if (base.wrapped()) throw std::invalid_argument("base index is already wrapped by another index");
+    if (base.journal()) throw std::invalid_argument("base index is persisted; wrap an index that isn't, then persist the RefineIndex");
     // load_body() accepts only Flat, IVF and HNSW bases (so a crafted file can't nest without end); a
     // RefineIndex over a RefineIndex would save a file that never loads, and re-ranks the same vectors twice
     if (dynamic_cast<const RefineIndex*>(&base))

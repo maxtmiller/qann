@@ -24,6 +24,7 @@ HybridIndex::HybridIndex(DenseIndex& dense, SparseIndex& sparse, bool custom_ids
         if (!index->ids_are_slots())
             throw std::invalid_argument("the dense and sparse indexes must not use custom ids; give the HybridIndex custom_ids instead");
         if (index->wrapped()) throw std::invalid_argument("the dense and sparse indexes must not already be wrapped by another index");
+        if (index->journal()) throw std::invalid_argument("the dense and sparse indexes must not be persisted; persist the HybridIndex");
     }
     dense.wrapped_ = true;
     sparse.wrapped_ = true;
