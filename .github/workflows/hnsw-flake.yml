@@ -1,0 +1,33 @@
+# Temporary (branch hnsw-flake-loop, never merged): repeats the HNSW parallel-build quality
+# test on the macOS runner, where it failed once at recall 0.9045 against 0.9105.
+name: HNSW flake loop
+
+on:
+  push:
+    branches: [hnsw-flake-loop]
+
+jobs:
+  loop:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: python -m pip install numpy
+      - run: sysctl -n hw.ncpu hw.physicalcpu machdep.cpu.brand_string
+      - run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE="$(which python)"
+      - run: cmake --build build -j 4 --target vecengine_core test_vecengine
+      - run: c++ -O2 -std=c++20 -Iinclude tests/flake/hnsw_recall_probe.cpp build/libvecengine_core.a -framework Accelerate -o probe
+      - name: Recall of 400 parallel builds (8 threads), and 100 at 3 threads
+        run: ./probe 8 400 && ./probe 3 100
+      - name: The Catch2 test, 100 times
+        run: |
+          fails=0
+          for i in $(seq 1 100); do
+            if ! ./build/test_vecengine "HNSW: a parallel build matches a serial one in quality" > out.txt 2>&1; then
+              fails=$((fails+1)); grep -A1 "with expansion" out.txt | tail -1
+            fi
+          done
+          echo "failed $fails of 100"
