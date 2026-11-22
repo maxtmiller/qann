@@ -108,9 +108,10 @@ def _pq_subspaces(dim, dims_per_subspace):
 
 
 class QannIVFFastScan(_Qann):
-    def __init__(self, metric, nlist, dims_per_subspace, rotate=True):
+    def __init__(self, metric, nlist, dims_per_subspace, rotate=True, cosine_l2=False):
         super().__init__(metric)
         self.nlist, self.dims_per_subspace, self.rotate = nlist, dims_per_subspace, rotate
+        self.cosine_l2 = cosine_l2
         self.nprobe, self.k_factor = None, None
 
     def fit(self, X):
@@ -135,6 +136,12 @@ class QannIVFFastScan(_Qann):
         rng = np.random.default_rng(1)
         sample = X[rng.choice(len(X), min(len(X), 256 * self.nlist_used), replace=False)]
         self.ivf.train(sample, seed=1)
+        # train() scores a Cosine index by inner product or by L2 tables, whichever ranks its
+        # sample's top k better (#183). At ann-benchmarks' k = 10 and recall above ~0.999, L2
+        # tables rank the deep candidates better: glove-100's top build reached 0.99999 with
+        # them (0.1.0a27) and 0.99988 with the inner product train() picked (0.1.0a32).
+        if self.cosine_l2 and self.metric == qann.Metric.Cosine:
+            self.ivf.cosine_inner_product = False
         self.index = qann.RefineIndex(self.ivf, k_factor=8)
         self.index.add(X)
 
@@ -146,5 +153,5 @@ class QannIVFFastScan(_Qann):
     def __str__(self):
         return (
             f"qann.IVFFastScan(nlist={self.nlist_used}, m={self.m}, rotate={self.rotate}, "
-            f"nprobe={self.nprobe}, k_factor={self.k_factor})"
+            f"{'cosine_l2=True, ' if self.cosine_l2 else ''}nprobe={self.nprobe}, k_factor={self.k_factor})"
         )
