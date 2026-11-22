@@ -76,7 +76,7 @@ void IVFIndex::build_precomputed() {
     
     precomputed_.resize(nlist_ * list_size);
     detail::parallel_for(nlist_, [&](size_t i) {
-        pq_->compute_list_term({coarse_centroids_.data() + i * dim_, dim_}, {precomputed_.data() + i * list_size, list_size});
+        pq_->compute_list_term({residual_center(i), dim_}, {precomputed_.data() + i * list_size, list_size});
     });
 }
 
@@ -139,7 +139,7 @@ void IVFIndex::add_batch_impl(span<const float> vecs, size_t n, const int64_t* i
     } else if (use_pq) {
         detail::parallel_for(n, [&](size_t i) {
             const float* src_vec = vecs.data() + i * dim_;
-            const float* centroid = coarse_centroids_.data() + assign[i] * dim_;
+            const float* centroid = residual_center(assign[i]);
 
             vector<float> residual(dim_);
             for (size_t d = 0; d < dim_; ++d) residual[d] = src_vec[d] - centroid[d];
@@ -522,7 +522,9 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
         const Probe& probe = probes[p];
         VECENGINE_PROF_START(t_list);
         // a filtered query's probes may hold coarse_all()'s approximate distances
-        const float A = filter && coarse_all_approx()
+        // with residual centers the list's own term is the distance to its center, not its centroid
+        const float A = !residual_centers_.empty() ? exact_score(vec.data(), residual_center(probe.list), dim_)
+                        : filter && coarse_all_approx()
                             ? exact_score(vec.data(), coarse_centroids_.data() + size_t{probe.list} * dim_, dim_)
                             : probe.dist;
         auto it = data_.find(probe.list);
@@ -572,7 +574,9 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
         if (ip_pq) {
             VECENGINE_PROF_START(t_scan);
             // Cosine's A is |q - c|^2 = 1 + |c|^2 - 2 q . c; the list adds 2 - 2 q . c
-            const float base = cos_pq ? A + 1.0f - centroid_sqnorms_[probe.list] : A;
+            const float base = cos_pq ? A + 1.0f - (residual_centers_.empty() ? centroid_sqnorms_[probe.list]
+                                                                              : residual_sqnorms_[probe.list])
+                                      : A;
             if (fast_scan_) {
                 scan_fast(list, listSize, ip_scale, ip_offset + base, push);
             } else {
@@ -591,7 +595,7 @@ vector<Neighbor> IVFIndex::scan(span<const float> vec, span<Probe> probes, size_
             for (size_t j = 0; j < K; ++j) table[j] += A;
         } else if (!use_pre) {
             // calculates residuals 
-            const float* centroid_ptr = coarse_centroids_.data() + it->first * dim_;
+            const float* centroid_ptr = residual_center(it->first);
             for (size_t l = 0; l < dim_; ++l) {
                 residual[l] = vec[l] - centroid_ptr[l];
             }
@@ -757,10 +761,32 @@ void IVFIndex::train(span<const float> vectors, size_t num_vectors, size_t max_i
 
     // calculate residuals and run kmeans again on each subspace
     const vector<uint32_t>& assignments = res.assignments;
+    // Cosine picks lists by unit centroids but takes PQ residuals against each list's
+    // plain mean: the unit centroid of a spread-out cluster sits beyond its vectors,
+    // leaving larger residuals. On glove-25 (nlist 256, every list, k_factor 8) recall
+    // went from 0.930 to 0.945 (L2 on the same unit vectors: 0.941); on five VIBE sets at
+    // k = 100 it was level or better (glove-200 +0.02), at the same speed.
+    if (pq_enabled() && metric_ == Metric::Cosine) {
+        residual_centers_.assign(nlist_ * dim_, 0.0f);
+        vector<size_t> count(nlist_, 0);
+        for (size_t i = 0; i < num_vectors; ++i) {
+            float* e = residual_centers_.data() + size_t{assignments[i]} * dim_;
+            const float* x = vectors.data() + i * dim_;
+            for (size_t d = 0; d < dim_; ++d) e[d] += x[d];
+            ++count[assignments[i]];
+        }
+        residual_sqnorms_.assign(nlist_, 0.0f);
+        for (size_t l = 0; l < nlist_; ++l) {
+            float* e = residual_centers_.data() + l * dim_;
+            if (count[l] == 0) std::copy_n(coarse_centroids_.data() + l * dim_, dim_, e);
+            else for (size_t d = 0; d < dim_; ++d) e[d] /= static_cast<float>(count[l]);
+            residual_sqnorms_[l] = inner_product(e, e, dim_);
+        }
+    }
     if (pq_enabled()) {
         vector<float> residuals(num_vectors * dim_);
         for (size_t i = 0; i < num_vectors; ++i) {
-            const float* centroid_ptr = coarse_centroids_.data() + assignments[i] * dim_;
+            const float* centroid_ptr = residual_center(assignments[i]);
             const float* vec_ptr = vectors.data() + i * dim_;
             for (size_t j = 0; j < dim_; ++j) {
                 residuals[i * dim_ +j] = vec_ptr[j] - centroid_ptr[j];
@@ -797,7 +823,7 @@ bool IVFIndex::pick_cosine_inner_product(span<const float> vectors, size_t n, co
     detail::parallel_for(nd, [&](size_t i) {
         vector<float> r(dim_);
         const float* x = vectors.data() + i * dim_;
-        const float* c = coarse_centroids_.data() + size_t{assign[i]} * dim_;
+        const float* c = residual_center(assign[i]);
         for (size_t d = 0; d < dim_; ++d) r[d] = x[d] - c[d];
         pq_->encode(r, codes.data() + i * m);
     });
@@ -827,7 +853,7 @@ bool IVFIndex::pick_cosine_inner_product(span<const float> vectors, size_t n, co
         if (fast_scan_) detail::quantize_lut(table.data(), m, lut.data(), ip_scale, ip_offset);
         const vector<float> ip_table = table;
         for (uint32_t l : probed) {
-            const float* c = coarse_centroids_.data() + size_t{l} * dim_;
+            const float* c = residual_center(l);
             const float base = 2.0f - 2.0f * inner_product(q, c, dim_);
             // L2 tables: this list's own table of (q - c), rounded on its own scale
             for (size_t d = 0; d < dim_; ++d) resid[d] = q[d] - c[d];
@@ -943,6 +969,8 @@ void IVFIndex::save(std::ostream& out) const {
     metadata_.save(out);
     // version 12: how Cosine PQ is scored
     write_pod(out, static_cast<uint8_t>(cosine_ip_));
+    // version 13: Cosine PQ's residual centers (empty otherwise)
+    write_vec(out, residual_centers_);
 }
 
 std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version, const detail::LoadContext* ctx) {
@@ -1077,6 +1105,15 @@ std::unique_ptr<IVFIndex> IVFIndex::load_body(std::istream& in, uint32_t version
         const auto cosine_ip = read_pod<uint8_t>(in);
         if (cosine_ip > 1) throw std::runtime_error("corrupt file: invalid IVFIndex shape");
         index->cosine_ip_ = cosine_ip;
+    }
+    if (version >= 13) {
+        index->residual_centers_ = read_vec<float>(in, n_list * dim);
+        const bool expected = trained && index->pq_ && index->metric_ == Metric::Cosine;
+        if (index->residual_centers_.size() != (expected ? n_list * dim : 0))
+            throw std::runtime_error("corrupt file: IVFIndex residual centers length mismatch");
+        index->residual_sqnorms_.resize(index->residual_centers_.size() / dim);
+        for (size_t l = 0; l < index->residual_sqnorms_.size(); ++l)
+            index->residual_sqnorms_[l] = inner_product(index->residual_center(l), index->residual_center(l), dim);
     }
     index->build_precomputed();
     index->rebuild_slot_lookup();

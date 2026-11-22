@@ -1785,6 +1785,19 @@ def test_loads_v11_cosine_ivf_pq_with_inner_product_scoring():
     np.testing.assert_allclose(dists, np.load(DATA / "v11_ivf_cos_fs_dists.npy"), rtol=1e-5, atol=1e-5)
 
 
+def test_loads_v12_cosine_ivf_pq_without_residual_centers():
+    # Saved by 0.1.0a33 on macOS (format version 12): cosine fast-scan IVF-PQ scored with
+    # L2 tables, whose residuals were taken against the unit centroids. Format 13 adds each
+    # list's mean as the residual center; a file without them keeps the centroids, so its
+    # codes and results are unchanged.
+    index = qann.load(DATA / "v12_ivf_cos_l2.qann")
+    assert index.metric == qann.Metric.Cosine and not index.cosine_inner_product
+    assert index.precomputed_tables
+    ids, dists = index.batch_query(np.load(DATA / "v12_cos_queries.npy"), 10)
+    np.testing.assert_array_equal(ids, np.load(DATA / "v12_ivf_cos_l2_ids.npy"))
+    np.testing.assert_allclose(dists, np.load(DATA / "v12_ivf_cos_l2_dists.npy"), rtol=1e-5, atol=1e-5)
+
+
 @pytest.mark.parametrize("name", ["flat", "hnsw_sq8", "refine_ivf_fs"])
 def test_loads_inner_product_saved_on_macos(name):
     # Saved on macOS (format version 9, Metric.InnerProduct): 2000 clustered
