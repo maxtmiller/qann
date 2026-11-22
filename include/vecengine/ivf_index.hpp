@@ -270,6 +270,16 @@ private:
 
     vector<float> coarse_centroids_; // coarse centroid vectors
     vector<float> centroid_sqnorms_; // |c|^2 per coarse centroid, for the BLAS coarse steps
+    // Cosine with PQ: each list's mean of its training vectors, which PQ residuals are
+    // taken against instead of the unit centroid that picks the list; empty otherwise
+    vector<float> residual_centers_;
+    vector<float> residual_sqnorms_; // |e|^2 per residual center
+
+    // The point a list's PQ residuals are taken against: its residual center for Cosine,
+    // else its coarse centroid.
+    const float* residual_center(size_t list) const noexcept {
+        return (residual_centers_.empty() ? coarse_centroids_.data() : residual_centers_.data()) + list * dim_;
+    }
     std::unordered_map<uint16_t,InvertedList> data_; // map of coarse centroid ID to inverted list
     std::unique_ptr<PQCodebook> pq_; // pointer to PQ LUT if using PQ
     int sq_bits_ = 0; // 0 (no SQ), 4 or 8

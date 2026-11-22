@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <random>
@@ -240,6 +241,89 @@ TEST_CASE("the metric survives save/load", "[metric][serialize]") {
     }
     auto loaded_refine = metric_roundtrip(refine);
     REQUIRE(dynamic_cast<RefineIndex&>(*loaded_refine).base().metric() == Metric::Cosine);
+}
+
+TEST_CASE("cosine IVF-PQ ranks as well as L2 on the same unit vectors", "[metric]") {
+    // Wide clusters: each one's plain mean is much shorter than its unit centroid. PQ
+    // residuals taken against the unit centroid were larger, and every probe ranked worse
+    // than L2 on the same unit vectors (0.016-0.06 lower in 0.1.0a33); against each list's
+    // mean they rank as well or better.
+    const size_t n = 5000, dim = 32, nq = 100, k = 10, clusters = 20;
+    std::mt19937 rng(21);
+    std::normal_distribution<float> g(0.0f, 1.0f);
+    std::vector<float> centers(clusters * dim);
+    for (auto& x : centers) x = g(rng);
+    for (size_t c = 0; c < clusters; ++c) {
+        float norm = 0;
+        for (size_t d = 0; d < dim; ++d) norm += centers[c * dim + d] * centers[c * dim + d];
+        for (size_t d = 0; d < dim; ++d) centers[c * dim + d] /= std::sqrt(norm);
+    }
+    auto sample = [&](size_t count) {
+        std::vector<float> v(count * dim);
+        std::uniform_int_distribution<size_t> pick(0, clusters - 1);
+        for (size_t i = 0; i < count; ++i) {
+            const size_t c = pick(rng);
+            for (size_t d = 0; d < dim; ++d) v[i * dim + d] = centers[c * dim + d] + 0.35f * g(rng);
+        }
+        return v;
+    };
+    auto data = sample(n), queries = sample(nq);
+
+    FlatIndex flat(dim, 1024, false, Metric::Cosine);
+    flat.add_batch(data, n);
+    const auto truth = flat.query_batch(queries, nq, k);
+
+    // every list probed, no re-ranking: the codes' ranking alone
+    IVFIndex cosine(dim, 100, 100, false, Metric::Cosine);
+    cosine.enable_pq(8);
+    cosine.train(data, n, 10, 1);
+    cosine.set_cosine_inner_product(false);
+    cosine.add_batch(data, n);
+
+    auto unit = [&](std::vector<float> v) {
+        for (size_t i = 0; i < v.size() / dim; ++i) {
+            float norm = 0;
+            for (size_t d = 0; d < dim; ++d) norm += v[i * dim + d] * v[i * dim + d];
+            for (size_t d = 0; d < dim; ++d) v[i * dim + d] /= std::sqrt(norm);
+        }
+        return v;
+    };
+    const auto unit_data = unit(data), unit_queries = unit(queries);
+    IVFIndex l2(dim, 100, 100, false, Metric::L2);
+    l2.enable_pq(8);
+    l2.train(unit_data, n, 10, 1);
+    l2.add_batch(unit_data, n);
+
+    const double cos_recall = metric_recall(cosine.query_batch(queries, nq, k), truth);
+    const double l2_recall = metric_recall(l2.query_batch(unit_queries, nq, k), truth);
+    REQUIRE(cos_recall >= l2_recall - 0.005);
+
+    // the residual centers are saved: a loaded index ranks exactly the same
+    std::stringstream s;
+    cosine.save(s);
+    auto loaded = load_dense(s);
+    require_identical(loaded->query_batch(queries, nq, k), cosine.query_batch(queries, nq, k));
+}
+
+TEST_CASE("a cosine IVF-PQ file with the wrong number of residual centers is rejected", "[metric][serialize]") {
+    const size_t n = 500, dim = 8, nlist = 100;
+    auto data = metric_random(n, dim, 16);
+    IVFIndex ivf(dim, nlist, 10, false, Metric::Cosine);
+    ivf.enable_pq(4);
+    ivf.train(data, n, 10, 1);
+    ivf.add_batch(data, n);
+    std::stringstream s;
+    ivf.save(s);
+    std::string bytes = s.str();
+    // the body ends with the residual centers: a u64 count, then nlist * dim floats
+    const size_t count_at = bytes.size() - nlist * dim * sizeof(float) - sizeof(uint64_t);
+    uint64_t count;
+    std::memcpy(&count, bytes.data() + count_at, sizeof(count));
+    REQUIRE(count == nlist * dim);
+    count -= dim;   // one list short; the floats left over then follow the body
+    std::memcpy(bytes.data() + count_at, &count, sizeof(count));
+    std::stringstream t(bytes);
+    REQUIRE_THROWS_AS(load_dense(t), std::runtime_error);
 }
 
 TEST_CASE("an unknown metric byte is rejected on load", "[metric][serialize]") {
