@@ -245,64 +245,72 @@ TEST_CASE("the metric survives save/load", "[metric][serialize]") {
 
 TEST_CASE("cosine IVF-PQ ranks as well as L2 on the same unit vectors", "[metric]") {
     // Wide clusters: each one's plain mean is much shorter than its unit centroid. PQ
-    // residuals taken against the unit centroid were larger, and every probe ranked worse
-    // than L2 on the same unit vectors (0.016-0.06 lower in 0.1.0a33); against each list's
-    // mean they rank as well or better.
-    const size_t n = 5000, dim = 32, nq = 100, k = 10, clusters = 20;
-    std::mt19937 rng(21);
-    std::normal_distribution<float> g(0.0f, 1.0f);
-    std::vector<float> centers(clusters * dim);
-    for (auto& x : centers) x = g(rng);
-    for (size_t c = 0; c < clusters; ++c) {
-        float norm = 0;
-        for (size_t d = 0; d < dim; ++d) norm += centers[c * dim + d] * centers[c * dim + d];
-        for (size_t d = 0; d < dim; ++d) centers[c * dim + d] /= std::sqrt(norm);
+    // residuals taken against the unit centroid were larger, and the codes ranked worse
+    // than L2's on the same unit vectors; against each list's mean they rank about as
+    // well. One dataset differs by +-0.02 either way, so the gap is averaged over eight:
+    // -0.031 with unit-centroid residuals, +0.004 with the means (M3).
+    // The data comes from mt19937's raw output (Box-Muller), the same on every standard
+    // library: std::normal_distribution isn't.
+    const size_t n = 5000, dim = 32, nq = 100, k = 10, clusters = 20, datasets = 8;
+    double gap = 0;
+    for (unsigned seed = 1; seed <= datasets; ++seed) {
+        std::mt19937 rng(seed);
+        auto uniform = [&] { return (static_cast<double>(rng()) + 0.5) / 4294967296.0; };
+        auto gauss = [&] {
+            const double u = uniform(), v = uniform();
+            return static_cast<float>(std::sqrt(-2.0 * std::log(u)) * std::cos(6.283185307179586 * v));
+        };
+        auto unit_rows = [&](std::vector<float> v) {
+            for (size_t i = 0; i < v.size() / dim; ++i) {
+                float norm = 0;
+                for (size_t d = 0; d < dim; ++d) norm += v[i * dim + d] * v[i * dim + d];
+                for (size_t d = 0; d < dim; ++d) v[i * dim + d] /= std::sqrt(norm);
+            }
+            return v;
+        };
+        std::vector<float> centers(clusters * dim);
+        for (auto& x : centers) x = gauss();
+        centers = unit_rows(centers);
+        auto sample = [&](size_t count) {
+            std::vector<float> v(count * dim);
+            for (size_t i = 0; i < count; ++i) {
+                const size_t c = rng() % clusters;
+                for (size_t d = 0; d < dim; ++d) v[i * dim + d] = centers[c * dim + d] + 0.35f * gauss();
+            }
+            return v;
+        };
+        const auto data = sample(n), queries = sample(nq);
+
+        FlatIndex flat(dim, 1024, false, Metric::Cosine);
+        flat.add_batch(data, n);
+        const auto truth = flat.query_batch(queries, nq, k);
+
+        // every list probed, no re-ranking: the codes' ranking alone
+        IVFIndex cosine(dim, 100, 100, false, Metric::Cosine);
+        cosine.enable_pq(8);
+        cosine.train(data, n, 10, 1);
+        cosine.set_cosine_inner_product(false);
+        cosine.add_batch(data, n);
+
+        const auto unit_data = unit_rows(data), unit_queries = unit_rows(queries);
+        IVFIndex l2(dim, 100, 100, false, Metric::L2);
+        l2.enable_pq(8);
+        l2.train(unit_data, n, 10, 1);
+        l2.add_batch(unit_data, n);
+
+        const double cos_recall = metric_recall(cosine.query_batch(queries, nq, k), truth);
+        const double l2_recall = metric_recall(l2.query_batch(unit_queries, nq, k), truth);
+        gap += cos_recall - l2_recall;
+
+        if (seed == 1) {   // the residual centers are saved: a loaded index ranks exactly the same
+            std::stringstream s;
+            cosine.save(s);
+            auto loaded = load_dense(s);
+            require_identical(loaded->query_batch(queries, nq, k), cosine.query_batch(queries, nq, k));
+        }
     }
-    auto sample = [&](size_t count) {
-        std::vector<float> v(count * dim);
-        std::uniform_int_distribution<size_t> pick(0, clusters - 1);
-        for (size_t i = 0; i < count; ++i) {
-            const size_t c = pick(rng);
-            for (size_t d = 0; d < dim; ++d) v[i * dim + d] = centers[c * dim + d] + 0.35f * g(rng);
-        }
-        return v;
-    };
-    auto data = sample(n), queries = sample(nq);
-
-    FlatIndex flat(dim, 1024, false, Metric::Cosine);
-    flat.add_batch(data, n);
-    const auto truth = flat.query_batch(queries, nq, k);
-
-    // every list probed, no re-ranking: the codes' ranking alone
-    IVFIndex cosine(dim, 100, 100, false, Metric::Cosine);
-    cosine.enable_pq(8);
-    cosine.train(data, n, 10, 1);
-    cosine.set_cosine_inner_product(false);
-    cosine.add_batch(data, n);
-
-    auto unit = [&](std::vector<float> v) {
-        for (size_t i = 0; i < v.size() / dim; ++i) {
-            float norm = 0;
-            for (size_t d = 0; d < dim; ++d) norm += v[i * dim + d] * v[i * dim + d];
-            for (size_t d = 0; d < dim; ++d) v[i * dim + d] /= std::sqrt(norm);
-        }
-        return v;
-    };
-    const auto unit_data = unit(data), unit_queries = unit(queries);
-    IVFIndex l2(dim, 100, 100, false, Metric::L2);
-    l2.enable_pq(8);
-    l2.train(unit_data, n, 10, 1);
-    l2.add_batch(unit_data, n);
-
-    const double cos_recall = metric_recall(cosine.query_batch(queries, nq, k), truth);
-    const double l2_recall = metric_recall(l2.query_batch(unit_queries, nq, k), truth);
-    REQUIRE(cos_recall >= l2_recall - 0.005);
-
-    // the residual centers are saved: a loaded index ranks exactly the same
-    std::stringstream s;
-    cosine.save(s);
-    auto loaded = load_dense(s);
-    require_identical(loaded->query_batch(queries, nq, k), cosine.query_batch(queries, nq, k));
+    gap /= datasets;
+    REQUIRE(gap >= -0.01);
 }
 
 TEST_CASE("a cosine IVF-PQ file with the wrong number of residual centers is rejected", "[metric][serialize]") {
