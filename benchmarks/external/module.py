@@ -108,10 +108,10 @@ def _pq_subspaces(dim, dims_per_subspace):
 
 
 class QannIVFFastScan(_Qann):
-    def __init__(self, metric, nlist, dims_per_subspace, rotate=True, cosine_l2=False):
+    def __init__(self, metric, nlist, dims_per_subspace, rotate=True, spherical=True):
         super().__init__(metric)
         self.nlist, self.dims_per_subspace, self.rotate = nlist, dims_per_subspace, rotate
-        self.cosine_l2 = cosine_l2
+        self.spherical = spherical
         self.nprobe, self.k_factor = None, None
 
     def fit(self, X):
@@ -125,7 +125,13 @@ class QannIVFFastScan(_Qann):
         # more often on unit vectors than L2 centroids do: landmark-dino-768 plain IVF recall@100
         # at nprobe 16 went from 0.951 to 0.967 (#148). Ranking is the same as L2 on unit vectors;
         # _metric_for already moved datasets with zero vectors, which Cosine rejects, to InnerProduct.
-        if self.cosine_like and self.metric == qann.Metric.L2:
+        #
+        # spherical=False keeps L2 on the normalized vectors instead (same ranking, L2 centroids):
+        # on glove-25 at k = 10 unit centroids leave larger residuals for PQ, so recall at every
+        # re-rank depth is lower (nlist 256, every list, k_factor 8: 0.930 against 0.941; k_factor
+        # 64: 0.9990 against 0.9996); glove-100 topped out at 0.99985 with unit centroids (0.1.0a33)
+        # against 0.99999 with L2 ones (0.1.0a27).
+        if self.cosine_like and self.metric == qann.Metric.L2 and self.spherical:
             self.metric = qann.Metric.Cosine
         dim = X.shape[1]
         self.m = _pq_subspaces(dim, self.dims_per_subspace)
@@ -136,12 +142,6 @@ class QannIVFFastScan(_Qann):
         rng = np.random.default_rng(1)
         sample = X[rng.choice(len(X), min(len(X), 256 * self.nlist_used), replace=False)]
         self.ivf.train(sample, seed=1)
-        # train() scores a Cosine index by inner product or by L2 tables, whichever ranks its
-        # sample's top k better (#183). At ann-benchmarks' k = 10 and recall above ~0.999, L2
-        # tables rank the deep candidates better: glove-100's top build reached 0.99999 with
-        # them (0.1.0a27) and 0.99988 with the inner product train() picked (0.1.0a32).
-        if self.cosine_l2 and self.metric == qann.Metric.Cosine:
-            self.ivf.cosine_inner_product = False
         self.index = qann.RefineIndex(self.ivf, k_factor=8)
         self.index.add(X)
 
@@ -153,5 +153,5 @@ class QannIVFFastScan(_Qann):
     def __str__(self):
         return (
             f"qann.IVFFastScan(nlist={self.nlist_used}, m={self.m}, rotate={self.rotate}, "
-            f"{'cosine_l2=True, ' if self.cosine_l2 else ''}nprobe={self.nprobe}, k_factor={self.k_factor})"
+            f"{'' if self.spherical else 'spherical=False, '}nprobe={self.nprobe}, k_factor={self.k_factor})"
         )
