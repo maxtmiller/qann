@@ -510,21 +510,32 @@ void HNSWIndex::insert(uint32_t slot) {
     }
     if (level <= top_level) top.unlock();
 
-    // descend greedily to the new node's top level, then link it on each level
-    // from there down, searching with ef_construction
+    // descend greedily to the new node's top level, then pick its neighbors on
+    // each level from there down, searching with ef_construction
     vector<float> buf;
     const Probe q = probe_of(slot, buf);
     for (int l = top_level; l > level; --l) ep = greedy_closest(q, ep, l, true);
 
+    const int link_top = std::min(level, top_level);
+    vector<vector<uint32_t>> chosen(static_cast<size_t>(link_top) + 1);
     vector<uint32_t> entry_points{ep};
-    for (int l = std::min(level, top_level); l >= 0; --l) {
+    for (int l = link_top; l >= 0; --l) {
         const vector<Candidate> found = search_layer(q, entry_points, ef_construction_, l, false, true);
-        const vector<uint32_t> chosen = select_neighbors(found, M_);
-        set_own_neighbors(slot, l, chosen);
-        for (uint32_t nb : chosen) add_link(nb, slot, l);
-
+        chosen[static_cast<size_t>(l)] = select_neighbors(found, M_);
         entry_points.clear();
         for (const Candidate& c : found) entry_points.push_back(c.second);
+    }
+
+    // Link bottom-up. Another insert can reach this node on a level only once
+    // that level is linked, and then descends from it to the levels below: linked
+    // top-down, a thread paused between levels left nodes whose level-0 search
+    // started here with no neighbors and linked them to this node alone.
+    // Each level's search reads only that level's lists, so a serial build is
+    // unchanged.
+    for (int l = 0; l <= link_top; ++l) {
+        const vector<uint32_t>& nbs = chosen[static_cast<size_t>(l)];
+        set_own_neighbors(slot, l, nbs);
+        for (uint32_t nb : nbs) add_link(nb, slot, l);
     }
 
     if (level > top_level) {   // still holding top_lock_
