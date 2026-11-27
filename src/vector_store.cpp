@@ -12,6 +12,7 @@
 #include <cstring>
 #include <fstream>
 #include <istream>
+#include <new>
 #include <ostream>
 #include <stdexcept>
 #include <string>
@@ -28,7 +29,32 @@ std::runtime_error sys_error(const std::string& what, const std::filesystem::pat
     return std::runtime_error("cannot " + what + " " + path.string() + ": " + std::strerror(errno));
 }
 
+#ifdef __linux__
+constexpr size_t kHugePage = size_t{2} << 20;
+#endif
+
 } // namespace
+
+void* huge_page_alloc(size_t bytes) {
+#ifdef __linux__
+    if (bytes >= kHugePage) {
+        void* p = ::operator new(bytes, std::align_val_t{kHugePage});
+        ::madvise(p, bytes, MADV_HUGEPAGE); // advice only: without THP it fails and the pages stay 4 KB
+        return p;
+    }
+#endif
+    return ::operator new(bytes);
+}
+
+void huge_page_free(void* p, size_t bytes) noexcept {
+#ifdef __linux__
+    if (bytes >= kHugePage) {
+        ::operator delete(p, std::align_val_t{kHugePage});
+        return;
+    }
+#endif
+    ::operator delete(p);
+}
 
 MappedFile::MappedFile(const std::filesystem::path& path) : path_(path) {
     const int fd = ::open(path.c_str(), O_RDONLY);
