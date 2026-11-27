@@ -64,6 +64,27 @@ void read_pad(std::istream& in, uint64_t align);
 // multiple of align.
 const char* map_next(std::istream& in, const MappedFile& file, uint64_t bytes, size_t align);
 
+// Allocates bytes; on Linux a block of 2 MB or more is 2 MB aligned and advised
+// MADV_HUGEPAGE, since most distros only give huge pages to memory that asks.
+void* huge_page_alloc(size_t bytes);
+// Frees what huge_page_alloc(bytes) returned.
+void huge_page_free(void* p, size_t bytes) noexcept;
+
+// Allocator for large buffers read at random rows: re-ranking a 768-d set
+// touches one 3 KB row per candidate across gigabytes, and huge pages cut that
+// cost about 25% on landmark-dino (x86), mostly page walks.
+template <class T>
+struct HugePageAllocator {
+    using value_type = T;
+    HugePageAllocator() noexcept = default;
+    template <class U>
+    HugePageAllocator(const HugePageAllocator<U>&) noexcept {}
+    T* allocate(size_t n) { return static_cast<T*>(huge_page_alloc(n * sizeof(T))); }
+    void deallocate(T* p, size_t n) noexcept { huge_page_free(p, n * sizeof(T)); }
+    template <class U>
+    bool operator==(const HugePageAllocator<U>&) const noexcept { return true; }
+};
+
 // A RefineIndex's raw vectors, one row of dim floats per slot. Rows live in
 // RAM, or, for an index loaded with mmap, in the mapped file plus a RAM tail
 // for rows added since. A mapped store can't move its rows, so compact()
@@ -103,7 +124,7 @@ private:
     std::shared_ptr<const MappedFile> file_;
     const float* mapped_ = nullptr; // into file_, mapped_rows_ * dim_ floats
     size_t mapped_rows_ = 0;
-    vector<float> owned_;           // rows after the mapped ones (all rows when not mapped)
+    vector<float, HugePageAllocator<float>> owned_; // rows after the mapped ones (all rows when not mapped)
     vector<uint32_t> table_;        // slot -> row once a mapped store is compacted; empty means identity
 };
 
