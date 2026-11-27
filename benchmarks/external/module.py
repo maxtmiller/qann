@@ -135,13 +135,20 @@ class QannIVFFastScan(_Qann):
         rng = np.random.default_rng(1)
         sample = X[rng.choice(len(X), min(len(X), 256 * self.nlist_used), replace=False)]
         self.ivf.train(sample, seed=1)
-        self.index = qann.RefineIndex(self.ivf, k_factor=8)
-        self.index.add(X)
+        self.refine = qann.RefineIndex(self.ivf, k_factor=8)
+        self.refine.add(X)
+        self.index = self.refine
 
     def set_query_arguments(self, nprobe, k_factor):
         self.nprobe, self.k_factor = min(nprobe, self.nlist_used), k_factor
         self.ivf.nprobe = self.nprobe
-        self.index.k_factor = k_factor
+        # k_factor 0 returns the fast-scan order without re-ranking, as faiss-ivfpqfs's
+        # k_factor 0 does; it is the fastest point at low recall (landmark-dino 0.8)
+        if k_factor == 0:
+            self.index = self.ivf
+        else:
+            self.index = self.refine
+            self.refine.k_factor = k_factor
 
     def __str__(self):
         return (
